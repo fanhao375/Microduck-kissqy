@@ -3031,8 +3031,9 @@ mod hd1910_transport_tests {
         sequence: std::sync::atomic::AtomicU32,
         stalled: Arc<AtomicBool>,
         /// A later epoch and the orientation it reports, once the test restarts the stream.
-        restarted: Arc<Mutex<Option<(u32, [f64; 4])>>>,
+        restarted: Restart,
     }
+    type Restart = Arc<Mutex<Option<(u32, [f64; 4])>>>;
     impl FreshHost {
         fn new(kind: TrunkImuKind) -> Self {
             Self {
