@@ -42,17 +42,20 @@ port = "/dev/ttyS2"
 # Where the trunk IMU — the policy's gyro and gravity — is wired.
 #
 # "bus" is the imu_to_dxl / FT6 board answering as ID 200 on the servo bus, read in the same
-# transaction as the servos. "bno08x" is a BNO085/BNO086 module on the board's own I2C, read
-# by a thread of its own; only the Feetech backend can run it, so it needs
-# `protocol = "feetech"` under [bus], and robotd refuses to start on any other pairing.
+# transaction as the servos. "bno08x" (a BNO085/BNO086) and "lsm6dsv16x" (the bus board's own
+# chip on a breakout) are modules on the board's own I2C, read by a thread of their own; only
+# the Feetech backend can run them, so they need `protocol = "feetech"` under [bus], and
+# robotd refuses to start on any other pairing.
 #
 # Each source has its own commissioned mount in the calibration file, and motion stays
 # refused until the mount of the source in use is verified. Needs a robotd restart.
 # source = "bus"
 
 # The i2c-dev node and 7-bit address a module source is read through. /dev/i2c-4 is the Zero
-# 3W header's I2C once the i2c4 overlay is enabled; a BNO08x answers at 0x4B with its address
-# pin high and 0x4A with it low. Ignored when source = "bus".
+# 3W header's I2C once the i2c4 overlay is enabled. A BNO08x answers at 0x4B with its address
+# pin high and 0x4A with it low, which is the default below. An LSM6DSV16X answers at 0x6B or
+# 0x6A instead, so source = "lsm6dsv16x" must set i2c_address too — robotd refuses the
+# default for it rather than open whatever answers at 0x4B. Ignored when source = "bus".
 # i2c_device = "/dev/i2c-4"
 # i2c_address = 0x4B
 

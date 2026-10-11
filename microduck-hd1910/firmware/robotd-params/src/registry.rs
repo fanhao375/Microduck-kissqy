@@ -125,8 +125,8 @@ pub const REGISTRY: &[Entry] = &[
     // flipping it without commissioning the new sensor's mount leaves motion refused.
     entry(
         "trunk_imu.source",
-        Kind::Choice(&["bus", "bno08x"]),
-        "Trunk IMU: the servo-bus board, or a BNO08x module on I²C (needs bus.protocol feetech)",
+        Kind::Choice(&["bus", "bno08x", "lsm6dsv16x"]),
+        "Trunk IMU: the servo-bus board, or a BNO08x / LSM6DSV16X module on I²C (needs bus.protocol feetech)",
     ),
     entry(
         "trunk_imu.i2c_device",
@@ -136,7 +136,7 @@ pub const REGISTRY: &[Entry] = &[
     entry(
         "trunk_imu.i2c_address",
         Kind::Integer,
-        "Module address, decimal: 75 = 0x4B (address pin high), 74 = 0x4A (low)",
+        "Module address, decimal: BNO08x 75 = 0x4B / 74 = 0x4A; LSM6DSV16X 107 = 0x6B / 106 = 0x6A",
     ),
     // ── [control] ────────────────────────────────────────────────────────────
     entry("control.hz", Kind::Integer, "Control loop rate"),
