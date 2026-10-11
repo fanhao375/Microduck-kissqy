@@ -83,6 +83,9 @@ pub struct HostImuSample {
     pub epoch: u32,
     /// When that epoch began.
     pub epoch_started_at: Instant,
+    /// The chip's own estimate of the orientation's accuracy, where it makes one: a BNO08x
+    /// report's status bits, 0 unreliable … 3 high. For the operator; nothing gates on it.
+    pub accuracy: Option<u8>,
 }
 
 /// What the reader is doing, for diagnostics. Its vocabulary, not the gate's verdict.
@@ -93,16 +96,18 @@ pub struct HostImuHealth {
     pub epoch: u32,
     /// Samples published since the reader started.
     pub samples: u64,
-    /// Device errors since the reader started; each one is a reopen.
+    /// Faults since the reader started: each one a reopen of the device, or a chip set up
+    /// again in place after it reset itself or lost data.
     pub errors: u64,
     pub last_error: Option<String>,
 }
 
 /// A trunk IMU the host reads on a thread of its own.
 ///
-/// `Send` because the I/O owning it moves to the control thread. Implementations hand out a
-/// copy of the newest sample and never block: the reader thread writes a slot, this reads it.
-pub trait HostImu: Send {
+/// `Send` because the I/O owning it moves to the control thread, `Sync` because the commissioning
+/// and read-only services borrow it across their own awaits. Implementations hand out a copy of
+/// the newest sample and never block: the reader thread writes a slot, this reads it.
+pub trait HostImu: Send + Sync {
     fn kind(&self) -> TrunkImuKind;
     /// The newest sample, or `None` before the first one.
     fn latest(&self) -> Option<HostImuSample>;
@@ -209,6 +214,7 @@ mod tests {
             sequence,
             epoch: 1,
             epoch_started_at: received_at - Duration::from_secs(5),
+            accuracy: None,
         }
     }
 

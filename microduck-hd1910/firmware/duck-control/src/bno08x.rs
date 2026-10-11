@@ -359,7 +359,11 @@ impl Bno08xAssembler {
                     // `q` and `-q` are one rotation; one sign keeps consecutive samples
                     // comparable component by component.
                     let sign = if w < 0.0 { -1.0 / norm } else { 1.0 / norm };
-                    quat = Some((report[1], [w * sign, x * sign, y * sign, z * sign]));
+                    quat = Some((
+                        report[1],
+                        [w * sign, x * sign, y * sign, z * sign],
+                        report[2] & 0x03,
+                    ));
                 }
                 GYROSCOPE => {
                     let rate = [4, 6, 8].map(|at| i16_at(report, at) / GYRO_SCALE);
@@ -374,7 +378,7 @@ impl Bno08xAssembler {
             self.last_gyro_report = Some(sequence);
             self.gyro = Some((rate, now));
         }
-        let Some((sequence, orientation)) = quat else {
+        let Some((sequence, orientation, accuracy)) = quat else {
             return Ok(None);
         };
         if self.last_quat_report == Some(sequence) {
@@ -393,6 +397,7 @@ impl Bno08xAssembler {
             sequence: self.sequence,
             epoch: self.epoch,
             epoch_started_at: self.epoch_started_at,
+            accuracy: Some(accuracy),
         }))
     }
 }
@@ -598,6 +603,7 @@ mod tests {
         assert_eq!(sample.quat, [1.0, 0.0, 0.0, 0.0]);
         assert!(sample.quat[0].is_sign_positive());
         assert_eq!((sample.sequence, sample.epoch), (1, 1));
+        assert_eq!(sample.accuracy, Some(3), "status byte 3: high accuracy");
         assert_eq!(sample.epoch_started_at, now);
     }
 

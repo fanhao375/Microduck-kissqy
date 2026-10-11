@@ -3053,6 +3053,7 @@ mod hd1910_transport_tests {
                 sequence,
                 epoch: 1,
                 epoch_started_at: now - Duration::from_secs(5),
+                accuracy: None,
             })
         }
         fn health(&self) -> HostImuHealth {

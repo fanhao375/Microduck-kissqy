@@ -388,6 +388,7 @@ impl Lsm6dsv16xAssembler {
                     sequence: self.sequence,
                     epoch: self.epoch,
                     epoch_started_at: self.epoch_started_at,
+                    accuracy: None,
                 })
             }
             _ => {
