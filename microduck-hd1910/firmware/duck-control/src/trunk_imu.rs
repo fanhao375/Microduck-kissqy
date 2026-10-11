@@ -99,6 +99,9 @@ pub struct HostImuHealth {
     /// Faults since the reader started: each one a reopen of the device, or a chip set up
     /// again in place after it reset itself or lost data.
     pub errors: u64,
+    /// Transfers or packets dropped without either — a NACK, a garbled report — because one
+    /// is noise and a reopen costs a second of trunk IMU.
+    pub dropped: u64,
     pub last_error: Option<String>,
 }
 

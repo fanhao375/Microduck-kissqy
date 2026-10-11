@@ -82,8 +82,56 @@ pub(crate) enum Step {
     /// The chip started over or lost data and is being set up again in place: a fault worth
     /// counting, not one worth reopening the device for. Step again after this long.
     Restart(String, Duration),
+    /// A transfer or a packet was lost and the stream carries on: counted, not acted on.
+    /// Step again after this long.
+    Dropped(String, Duration),
     /// The device is unusable: close it, back off, reopen as a new epoch.
     Failed(String),
+}
+
+/// A fault while streaming, by what it says about the device.
+#[derive(Debug)]
+enum Fault {
+    /// A transfer failed — a NACK, a short read. One is noise on a bus that shares a supply
+    /// with fifteen servos; a run of them is a device that has gone.
+    Io(String),
+    /// A transfer arrived but its bytes made no sense — a header that lost its framing, a
+    /// packet that changed between its two reads. Dropped; the next read starts afresh.
+    Garbled(String),
+    /// Nothing usable for too long: reopen.
+    Fatal(String),
+}
+
+/// Failed transfers in a row that make a device gone. Fewer are dropped and counted: a reopen
+/// costs a reset, an identification and a second of settling — about two seconds without a
+/// trunk IMU, which mid-walk is a fall risk that one missed sample is not.
+const IO_FAILURE_LIMIT: u32 = 5;
+
+/// One streaming step's outcome, with `io_run` counting failed transfers in a row.
+fn resolve(io_run: &mut u32, result: Result<Step, Fault>, retry: Duration) -> Step {
+    match result {
+        Ok(step) => {
+            *io_run = 0;
+            step
+        }
+        Err(Fault::Io(reason)) => {
+            *io_run += 1;
+            if *io_run >= IO_FAILURE_LIMIT {
+                Step::Failed(format!(
+                    "{} transfers failed in a row; last: {reason}",
+                    *io_run
+                ))
+            } else {
+                Step::Dropped(reason, retry)
+            }
+        }
+        // The transfer itself worked.
+        Err(Fault::Garbled(reason)) => {
+            *io_run = 0;
+            Step::Dropped(reason, Duration::ZERO)
+        }
+        Err(Fault::Fatal(reason)) => Step::Failed(reason),
+    }
 }
 
 /// What a reader is doing, for `HostImuHealth::state`.
@@ -175,6 +223,7 @@ pub(crate) struct Bno08x {
     writer: Writer,
     assembler: Bno08xAssembler,
     enabled_once: bool,
+    io_run: u32,
 }
 
 impl Bno08x {
@@ -184,7 +233,73 @@ impl Bno08x {
             writer: Writer::default(),
             assembler: Bno08xAssembler::new(epoch, now),
             enabled_once: false,
+            io_run: 0,
         }
+    }
+
+    /// [`Self::next_packet`], telling a failed transfer from bytes that made no sense.
+    fn next_packet_classified(io: &mut dyn I2c) -> Result<Option<(Header, Vec<u8>)>, Fault> {
+        let mut first = [0u8; bno08x::HEADER_LEN];
+        read_exactly(io, &mut first, "SHTP header").map_err(Fault::Io)?;
+        let header = Header::parse(first).map_err(|e| Fault::Garbled(e.to_string()))?;
+        if header.length == 0 {
+            return Ok(None);
+        }
+        let mut body = vec![0u8; header.length];
+        read_exactly(io, &mut body, "SHTP packet").map_err(Fault::Io)?;
+        Packet::check(&header, &body).map_err(|e| Fault::Garbled(e.to_string()))?;
+        Ok(Some((header, body)))
+    }
+
+    /// Read until the chip has nothing more or this step's budget is spent. Only a step that
+    /// emptied the chip publishes, and only its newest sample: a report read out of a backlog
+    /// was measured before it was read, and stamping it with this step's time would pass an old
+    /// orientation off as current. A report that makes no sense is dropped and the rest read.
+    fn stream(
+        &mut self,
+        io: &mut dyn I2c,
+        now: Instant,
+        mut last_sample: Instant,
+        publish: &mut dyn FnMut(HostImuSample),
+    ) -> Result<Step, Fault> {
+        let mut newest = None;
+        let mut drained = false;
+        let mut garbled = None;
+        for _ in 0..BNO08X_PACKETS_PER_STEP {
+            let Some((header, body)) = Self::next_packet_classified(io)? else {
+                drained = true;
+                break;
+            };
+            let packet =
+                Packet::check(&header, &body).map_err(|e| Fault::Garbled(e.to_string()))?;
+            if packet.is_reset_complete() {
+                self.phase = BnoPhase::Enable;
+                return Ok(Step::Restart(
+                    "BNO08x reset itself; re-enabling its reports".into(),
+                    BNO08X_REENABLE_DELAY,
+                ));
+            }
+            match self.assembler.feed(&packet, now) {
+                Ok(Some(sample)) => newest = Some(sample),
+                Ok(None) => {}
+                Err(e) => garbled = Some(e.to_string()),
+            }
+        }
+        if drained && let Some(sample) = newest {
+            publish(sample);
+            last_sample = now;
+        }
+        self.phase = BnoPhase::Stream { last_sample };
+        if now.saturating_duration_since(last_sample) > BNO08X_STALL {
+            return Err(Fault::Fatal(
+                "BNO08x sent no new orientation for 2 s".into(),
+            ));
+        }
+        let wait = if drained { BNO08X_POLL } else { Duration::ZERO };
+        Ok(match garbled {
+            Some(reason) => Step::Dropped(reason, wait),
+            None => Step::Again(wait),
+        })
     }
 
     /// The next whole packet, or `None` when the chip has nothing to say.
@@ -286,35 +401,8 @@ impl Bno08x {
                 Step::Again(Duration::ZERO)
             }
             BnoPhase::Stream { last_sample } => {
-                let mut last_sample = last_sample;
-                let mut empty = false;
-                for _ in 0..BNO08X_PACKETS_PER_STEP {
-                    let Some((header, body)) = Self::next_packet(io)? else {
-                        empty = true;
-                        break;
-                    };
-                    let packet = Packet::check(&header, &body).map_err(|e| e.to_string())?;
-                    if packet.is_reset_complete() {
-                        self.phase = BnoPhase::Enable;
-                        return Ok(Step::Restart(
-                            "BNO08x reset itself; re-enabling its reports".into(),
-                            BNO08X_REENABLE_DELAY,
-                        ));
-                    }
-                    if let Some(sample) = self
-                        .assembler
-                        .feed(&packet, now)
-                        .map_err(|e| e.to_string())?
-                    {
-                        publish(sample);
-                        last_sample = now;
-                    }
-                }
-                self.phase = BnoPhase::Stream { last_sample };
-                if now.saturating_duration_since(last_sample) > BNO08X_STALL {
-                    return Err("BNO08x sent no new orientation for 2 s".into());
-                }
-                Step::Again(if empty { BNO08X_POLL } else { Duration::ZERO })
+                let result = self.stream(io, now, last_sample, publish);
+                resolve(&mut self.io_run, result, BNO08X_POLL)
             }
         })
     }
@@ -364,6 +452,10 @@ const LSM6DSV16X_POR_POLL: Duration = Duration::from_millis(5);
 /// FIFO words read per step. Three arrive per 120 Hz sample; a backlog is cleared over a few
 /// steps rather than in one long burst.
 const LSM6DSV16X_WORDS_PER_STEP: u16 = 32;
+/// A FIFO holding more than this — sixteen samples, about 133 ms — is history, not a stream to
+/// catch up on: it is emptied and the stream starts over as a new epoch. The bus board's
+/// firmware likewise refuses to call a backlog current (`imu.c:219-221`).
+const LSM6DSV16X_BACKLOG_WORDS: u16 = 48;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum LsmPhase {
@@ -383,6 +475,7 @@ pub(crate) struct Lsm6dsv16x {
     phase: LsmPhase,
     assembler: Lsm6dsv16xAssembler,
     brought_up: bool,
+    io_run: u32,
 }
 
 impl Lsm6dsv16x {
@@ -394,7 +487,21 @@ impl Lsm6dsv16x {
             },
             assembler: Lsm6dsv16xAssembler::new(epoch, now),
             brought_up: false,
+            io_run: 0,
         }
+    }
+
+    /// Empty the FIFO: bypass mode clears it, stream mode starts it again.
+    fn flush(io: &mut dyn I2c) -> Result<(), String> {
+        for mode in [0x00, 0x06] {
+            let current = Self::register(io, lsm6dsv16x::FIFO_CTRL4)?;
+            write_all(
+                io,
+                &[lsm6dsv16x::FIFO_CTRL4, (current & !0x07) | mode],
+                "FIFO mode",
+            )?;
+        }
+        Ok(())
     }
 
     fn register(io: &mut dyn I2c, register: u8) -> Result<u8, String> {
@@ -491,16 +598,19 @@ impl Lsm6dsv16x {
         Ok(step)
     }
 
+    /// One look at the FIFO. Only a step that reached the FIFO's head publishes, and only its
+    /// newest sample: a word read out of a backlog was measured before it was read, and
+    /// stamping it with this step's time would pass an old orientation off as current.
     fn stream(
         &mut self,
         io: &mut dyn I2c,
         now: Instant,
         mut last_sample: Instant,
         publish: &mut dyn FnMut(HostImuSample),
-    ) -> Result<Step, String> {
+    ) -> Result<Step, Fault> {
         let mut status = [0u8; 2];
         io.read_register(lsm6dsv16x::FIFO_STATUS1, &mut status)
-            .map_err(|e| format!("FIFO status: {e}"))?;
+            .map_err(|e| Fault::Io(format!("FIFO status: {e}")))?;
         let status = FifoStatus::parse(status);
         if status.lost_data() {
             self.phase = LsmPhase::BringUp {
@@ -512,24 +622,42 @@ impl Lsm6dsv16x {
                 Duration::ZERO,
             ));
         }
+        if status.unread > LSM6DSV16X_BACKLOG_WORDS {
+            Self::flush(io).map_err(Fault::Io)?;
+            self.assembler.restart(now);
+            self.phase = LsmPhase::Stream { last_sample: now };
+            return Ok(Step::Restart(
+                format!(
+                    "LSM6DSV16X FIFO held {} words, ~{} ms behind; emptied, new epoch",
+                    status.unread,
+                    u64::from(status.unread) * 1000 / 360
+                ),
+                LSM6DSV16X_POLL,
+            ));
+        }
         let words = status.unread.min(LSM6DSV16X_WORDS_PER_STEP);
+        let mut newest = None;
         for _ in 0..words {
             let mut word = [0u8; lsm6dsv16x::WORD_LEN];
             io.read_register(lsm6dsv16x::FIFO_DATA_OUT_TAG, &mut word)
-                .map_err(|e| format!("FIFO word: {e}"))?;
-            if let Some(sample) = self.assembler.feed(&word, now) {
-                publish(sample);
-                last_sample = now;
-            }
+                .map_err(|e| Fault::Io(format!("FIFO word: {e}")))?;
+            newest = self.assembler.feed(&word, now).or(newest);
+        }
+        let at_head = status.unread <= words;
+        if at_head && let Some(sample) = newest {
+            publish(sample);
+            last_sample = now;
         }
         self.phase = LsmPhase::Stream { last_sample };
         if now.saturating_duration_since(last_sample) > LSM6DSV16X_STALL {
-            return Err("LSM6DSV16X FIFO delivered no new game rotation for 1 s".into());
+            return Err(Fault::Fatal(
+                "LSM6DSV16X FIFO delivered no new game rotation for 1 s".into(),
+            ));
         }
-        Ok(Step::Again(if status.unread > words {
-            Duration::ZERO
-        } else {
+        Ok(Step::Again(if at_head {
             LSM6DSV16X_POLL
+        } else {
+            Duration::ZERO
         }))
     }
 }
@@ -541,14 +669,18 @@ impl Machine for Lsm6dsv16x {
         now: Instant,
         publish: &mut dyn FnMut(HostImuSample),
     ) -> Step {
-        let result = match self.phase {
+        match self.phase {
             LsmPhase::BringUp {
                 index,
                 poll_deadline,
-            } => self.bring_up(io, now, index, poll_deadline),
-            LsmPhase::Stream { last_sample } => self.stream(io, now, last_sample, publish),
-        };
-        result.unwrap_or_else(Step::Failed)
+            } => self
+                .bring_up(io, now, index, poll_deadline)
+                .unwrap_or_else(Step::Failed),
+            LsmPhase::Stream { last_sample } => {
+                let result = self.stream(io, now, last_sample, publish);
+                resolve(&mut self.io_run, result, LSM6DSV16X_POLL)
+            }
+        }
     }
 
     fn state(&self) -> State {
@@ -589,6 +721,7 @@ struct Shared {
     epoch: AtomicU32,
     samples: AtomicU64,
     errors: AtomicU64,
+    dropped: AtomicU64,
     last_error: ArcSwapOption<String>,
 }
 
@@ -602,6 +735,7 @@ impl Shared {
             epoch: AtomicU32::new(0),
             samples: AtomicU64::new(0),
             errors: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
             last_error: ArcSwapOption::empty(),
         }
     }
@@ -619,6 +753,16 @@ impl Shared {
     /// night is one journal line and not thousands.
     fn fault(&self, reason: &str) {
         self.errors.fetch_add(1, Ordering::Relaxed);
+        self.note(reason);
+    }
+
+    /// A transfer or packet dropped without a reopen.
+    fn dropped(&self, reason: &str) {
+        self.dropped.fetch_add(1, Ordering::Relaxed);
+        self.note(reason);
+    }
+
+    fn note(&self, reason: &str) {
         let repeated = self
             .last_error
             .load()
@@ -644,6 +788,7 @@ impl Shared {
             epoch: self.epoch.load(Ordering::Relaxed),
             samples: self.samples.load(Ordering::Relaxed),
             errors: self.errors.load(Ordering::Relaxed),
+            dropped: self.dropped.load(Ordering::Relaxed),
             last_error: self.last_error.load().as_deref().cloned(),
         }
     }
@@ -712,6 +857,10 @@ fn run(kind: TrunkImuKind, mut open: Opener, shared: &Shared, stop: &AtomicBool,
                 }
                 Step::Restart(reason, wait) => {
                     shared.fault(&reason);
+                    pause(stop, wait);
+                }
+                Step::Dropped(reason, wait) => {
+                    shared.dropped(&reason);
                     pause(stop, wait);
                 }
                 Step::Failed(reason) => {
@@ -964,10 +1113,16 @@ mod tests {
         body_next: bool,
         writes: Vec<Vec<u8>>,
         answers_id: bool,
+        /// Reads still to fail, as a NACK would.
+        fail_reads: u32,
     }
 
     impl I2c for FakeBno {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.fail_reads > 0 {
+                self.fail_reads -= 1;
+                return Err(io::Error::other("Remote I/O error"));
+            }
             if self.body_next {
                 self.body_next = false;
                 let packet = self
@@ -1024,7 +1179,7 @@ mod tests {
                 return Ok(now);
             }
             match chip.step(io, now, &mut |_| {}) {
-                Step::Again(wait) | Step::Restart(_, wait) => now += wait,
+                Step::Again(wait) | Step::Restart(_, wait) | Step::Dropped(_, wait) => now += wait,
                 Step::Failed(reason) => return Err(reason),
             }
         }
@@ -1139,25 +1294,92 @@ mod tests {
         );
     }
 
-    /// A malformed report is a fault of the transfer, closed and reopened like any other.
-    #[test]
-    fn a_malformed_bno08x_report_fails() {
-        let t = Instant::now();
+    fn streaming_bno08x(t: Instant) -> (Bno08x, FakeBno, Instant) {
         let mut io = FakeBno {
             answers_id: true,
             ..FakeBno::default()
         };
         let mut chip = Bno08x::new(1, t);
         let now = until_streaming(&mut chip, &mut io, t).unwrap();
+        (chip, io, now)
+    }
+
+    /// One malformed report is dropped and counted; the stream goes on and the next good report
+    /// is published. Reopening over it would cost two seconds of trunk IMU for one bad packet.
+    #[test]
+    fn a_malformed_bno08x_report_is_dropped_and_the_stream_goes_on() {
+        let t = Instant::now();
+        let (mut chip, mut io, now) = streaming_bno08x(t);
         io.queue.push_back(shtp(
             bno08x::channel::REPORTS,
             &report(bno08x::GAME_ROTATION_VECTOR, 0, &[0, 0, 0, 0]),
         ));
         let step = chip.step(&mut io, now, &mut |_| {});
         assert!(
-            matches!(step, Step::Failed(ref why) if why.contains("quaternion")),
+            matches!(step, Step::Dropped(ref why, _) if why.contains("quaternion")),
             "{step:?}"
         );
+        assert_eq!(chip.state(), State::Streaming);
+        let mut published = Vec::new();
+        io.queue.push_back(reports(1));
+        chip.step(&mut io, now, &mut |s| published.push(s));
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].epoch, 1, "no new epoch for a dropped packet");
+    }
+
+    /// A failed transfer is noise until it repeats: four in a row are dropped, a success
+    /// clears the run, and the fifth in a row closes the device.
+    #[test]
+    fn only_a_run_of_failed_bno08x_transfers_reopens() {
+        let t = Instant::now();
+        let (mut chip, mut io, now) = streaming_bno08x(t);
+        io.fail_reads = 4;
+        for _ in 0..4 {
+            assert!(matches!(
+                chip.step(&mut io, now, &mut |_| {}),
+                Step::Dropped(..)
+            ));
+        }
+        assert!(matches!(
+            chip.step(&mut io, now, &mut |_| {}),
+            Step::Again(_)
+        ));
+        io.fail_reads = 5;
+        for _ in 0..4 {
+            assert!(matches!(
+                chip.step(&mut io, now, &mut |_| {}),
+                Step::Dropped(..)
+            ));
+        }
+        let step = chip.step(&mut io, now, &mut |_| {});
+        assert!(
+            matches!(step, Step::Failed(ref why) if why.contains("5 transfers failed in a row")),
+            "{step:?}"
+        );
+    }
+
+    /// A step that spends its budget without emptying the chip publishes nothing: those
+    /// reports were measured before they were read, and stamping them with this step's time
+    /// would pass a backlog off as the current orientation. The step that empties it publishes
+    /// its newest report once.
+    #[test]
+    fn a_bno08x_backlog_is_not_published_as_fresh() {
+        let t = Instant::now();
+        let (mut chip, mut io, now) = streaming_bno08x(t);
+        for n in 0..12 {
+            io.queue.push_back(reports(n));
+        }
+        let mut published = Vec::new();
+        assert_eq!(
+            chip.step(&mut io, now, &mut |s| published.push(s)),
+            Step::Again(Duration::ZERO)
+        );
+        assert!(published.is_empty(), "backlog published as fresh");
+        let later = now + Duration::from_millis(1);
+        chip.step(&mut io, later, &mut |s| published.push(s));
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].sequence, 12, "the newest report, once");
+        assert_eq!(published[0].received_at, later);
     }
 
     /// On the way out the reader turns off what it turned on — and only that.
@@ -1196,6 +1418,8 @@ mod tests {
         overrun: bool,
         streaming: bool,
         resets: u32,
+        /// Register reads still to fail, as a NACK would.
+        fail_reads: u32,
     }
 
     impl FakeLsm {
@@ -1209,6 +1433,7 @@ mod tests {
                 overrun: false,
                 streaming: false,
                 resets: 0,
+                fail_reads: 0,
             }
         }
         fn bank(&mut self) -> &mut HashMap<u8, u8> {
@@ -1251,11 +1476,22 @@ mod tests {
                     }
                 }
             } else {
+                // Bypass mode empties the FIFO, as on the chip.
+                if register == lsm6dsv16x::FIFO_CTRL4
+                    && value & 0x07 == 0
+                    && self.func_cfg_access & 0x80 == 0
+                {
+                    self.fifo.clear();
+                }
                 self.bank().insert(register, value);
             }
             Ok(2)
         }
         fn read_register(&mut self, register: u8, buf: &mut [u8]) -> io::Result<()> {
+            if self.fail_reads > 0 {
+                self.fail_reads -= 1;
+                return Err(io::Error::other("Remote I/O error"));
+            }
             match register {
                 lsm6dsv16x::FUNC_CFG_ACCESS => buf[0] = self.func_cfg_access,
                 lsm6dsv16x::FIFO_STATUS1 => {
@@ -1299,13 +1535,14 @@ mod tests {
         let mut published = Vec::new();
         let step = chip.step(&mut io, now, &mut |s| published.push(s));
         assert_eq!(step, Step::Again(LSM6DSV16X_POLL));
-        assert_eq!(published.len(), 2);
-        assert_eq!(published[1].quat, [1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(published.len(), 1, "the newest of the step's samples");
+        assert_eq!(published[0].sequence, 2);
+        assert_eq!(published[0].quat, [1.0, 0.0, 0.0, 0.0]);
         assert_eq!(
-            (published[1].epoch, published[1].epoch_started_at),
+            (published[0].epoch, published[0].epoch_started_at),
             (7, now)
         );
-        assert_eq!(published[1].accuracy, None);
+        assert_eq!(published[0].accuracy, None);
     }
 
     /// Something else at the address is refused at the first read, before a reset or a single
@@ -1366,6 +1603,94 @@ mod tests {
             matches!(step, Step::Failed(ref why) if why.contains("1 s")),
             "{step:?}"
         );
+    }
+
+    fn streaming_lsm6dsv16x(t: Instant) -> (Lsm6dsv16x, FakeLsm, Instant) {
+        let mut io = FakeLsm::new();
+        let mut chip = Lsm6dsv16x::new(1, t);
+        let now = until_streaming(&mut chip, &mut io, t).unwrap();
+        (chip, io, now)
+    }
+
+    /// A FIFO that has fallen a second behind — a stalled reader — is history. It is emptied
+    /// and the stream starts over as a new epoch, so the gate holds it off; nothing from the
+    /// backlog is published as current.
+    #[test]
+    fn an_lsm6dsv16x_backlog_is_emptied_as_a_new_epoch_not_published() {
+        let t = Instant::now();
+        let (mut chip, mut io, now) = streaming_lsm6dsv16x(t);
+        for _ in 0..120 {
+            io.push_sample();
+        }
+        let mut published = Vec::new();
+        let step = chip.step(&mut io, now, &mut |s| published.push(s));
+        assert!(
+            matches!(step, Step::Restart(ref why, _) if why.contains("360 words")),
+            "{step:?}"
+        );
+        assert!(
+            published.is_empty(),
+            "a second-old sample published as fresh"
+        );
+        assert!(io.fifo.is_empty());
+        assert_eq!(
+            io.main[&lsm6dsv16x::FIFO_CTRL4] & 0x07,
+            0x06,
+            "streaming again"
+        );
+        io.push_sample();
+        let later = now + Duration::from_millis(5);
+        chip.step(&mut io, later, &mut |s| published.push(s));
+        assert_eq!(published[0].epoch, 2);
+        assert_eq!(published[0].epoch_started_at, now);
+    }
+
+    /// A FIFO longer than one step's read is caught up over steps, publishing only once the
+    /// head is reached — the newest sample, stamped with the step that reached it.
+    #[test]
+    fn an_lsm6dsv16x_publishes_only_from_the_fifo_head() {
+        let t = Instant::now();
+        let (mut chip, mut io, now) = streaming_lsm6dsv16x(t);
+        for _ in 0..12 {
+            io.push_sample();
+        }
+        let mut published = Vec::new();
+        assert_eq!(
+            chip.step(&mut io, now, &mut |s| published.push(s)),
+            Step::Again(Duration::ZERO)
+        );
+        assert!(published.is_empty());
+        let later = now + Duration::from_millis(1);
+        chip.step(&mut io, later, &mut |s| published.push(s));
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].sequence, 12);
+        assert_eq!(published[0].received_at, later);
+    }
+
+    /// The same rule as the BNO08x: four failed reads in a row are dropped, the fifth closes.
+    #[test]
+    fn only_a_run_of_failed_lsm6dsv16x_reads_reopens() {
+        let t = Instant::now();
+        let (mut chip, mut io, now) = streaming_lsm6dsv16x(t);
+        io.fail_reads = 4;
+        for _ in 0..4 {
+            assert!(matches!(
+                chip.step(&mut io, now, &mut |_| {}),
+                Step::Dropped(..)
+            ));
+        }
+        assert!(matches!(
+            chip.step(&mut io, now, &mut |_| {}),
+            Step::Again(_)
+        ));
+        io.fail_reads = 5;
+        for _ in 0..4 {
+            chip.step(&mut io, now, &mut |_| {});
+        }
+        assert!(matches!(
+            chip.step(&mut io, now, &mut |_| {}),
+            Step::Failed(_)
+        ));
     }
 
     // ── The thread ───────────────────────────────────────────────────────────
@@ -1441,6 +1766,55 @@ mod tests {
         let health = reader.health();
         assert!(health.last_error.unwrap().contains("no new game rotation"));
         assert_eq!(opens.load(Ordering::Relaxed), 2);
+    }
+
+    /// A dropped transfer is counted as dropped — not as a fault, and without a new epoch.
+    #[test]
+    fn dropped_transfers_are_counted_without_a_reopen() {
+        let flaky = Arc::new(AtomicBool::new(false));
+        let device_flaky = Arc::clone(&flaky);
+        let open: Opener = Box::new(move || {
+            struct Flaky {
+                chip: FakeLsm,
+                flaky: Arc<AtomicBool>,
+                streamed: u32,
+            }
+            impl I2c for Flaky {
+                fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                    self.chip.read(buf)
+                }
+                fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                    self.chip.write(bytes)
+                }
+                fn read_register(&mut self, register: u8, buf: &mut [u8]) -> io::Result<()> {
+                    if register == lsm6dsv16x::FIFO_STATUS1 {
+                        self.streamed += 1;
+                        // Every tenth status read fails once the test says so.
+                        if self.flaky.load(Ordering::Relaxed) && self.streamed.is_multiple_of(10) {
+                            return Err(io::Error::other("Remote I/O error"));
+                        }
+                    }
+                    self.chip.read_register(register, buf)
+                }
+            }
+            let mut chip = FakeLsm::new();
+            chip.streaming = true;
+            Ok(Box::new(Flaky {
+                chip,
+                flaky: Arc::clone(&device_flaky),
+                streamed: 0,
+            }))
+        });
+        let reader =
+            TrunkImuReader::spawn_with(TrunkImuKind::Lsm6dsv16x, open, FAST, "test".into())
+                .unwrap();
+        wait_for(&reader, "samples", |r| r.latest().is_some());
+        flaky.store(true, Ordering::Relaxed);
+        wait_for(&reader, "drops", |r| r.health().dropped >= 3);
+        let health = reader.health();
+        assert_eq!(health.errors, 0, "{health:?}");
+        assert_eq!(health.epoch, 1);
+        assert_eq!(health.state, "streaming");
     }
 
     #[test]
