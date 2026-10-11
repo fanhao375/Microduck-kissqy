@@ -151,7 +151,9 @@ class ServiceTransport:
         self.credential.forget()
 
     def call(self, command):
-        timeout = (command.get("duration_ms", 0)/1000)*(15 if command["action"] == "center" else 1)+(135 if command["action"] == "center" else 15)
+        # A module's verify-imu waits up to 20 s for the operator to tip the robot nose-down;
+        # robotd itself allows it 30 s.
+        timeout = (command.get("duration_ms", 0)/1000)*(15 if command["action"] == "center" else 1)+(135 if command["action"] == "center" else 35 if command["action"] == "verify-imu" else 15)
         method = {"relax": "robot.relax", "init": "robot.init", "home-stop": "robot.enable"}.get(command["action"], "robot.busCommand")
         if self.log: self.log.add('服务 IPC', json.dumps({'method':method,'command':command},ensure_ascii=False))
         reply = self.channel.request({"method":method, "params":command if method == "robot.busCommand" else {"on":False} if method == "robot.enable" else {},

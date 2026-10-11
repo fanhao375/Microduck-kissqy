@@ -57,6 +57,15 @@ class FirmwareTests(unittest.TestCase):
    self.assertTrue(event.wait(8));thread.join(10);self.assertFalse(thread.is_alive())
    self.assertEqual(result[0]['returncode'],0);self.assertIn('second stage',result[0]['stdout'])
   finally:channel.close()
+ def test_verify_imu_outwaits_robotd_for_the_nose_down_tip(self):
+  # A module's verify-imu answers only after the operator tips the robot nose-down (up to 20 s;
+  # robotd allows 30). Giving up at the usual 15 s would report failure while robotd still waits.
+  class Channel:
+   def request(self,request,timeout,progress=None):
+    asked.append((request['timeout'],timeout));return {'id':1,'result':{}}
+  asked=[];transport=ServiceTransport('', '/unused.sock');transport.channel=Channel()
+  transport.call({'action':'verify-imu','confirmed':True,'mount_wxyz':[1,0,0,0]})
+  relay,local=asked[0];self.assertGreater(relay,30);self.assertGreater(local,relay)
  def test_sudo_password_never_enters_progress_or_final_error(self):
   class Channel:
    def request(self,request,timeout,progress=None):

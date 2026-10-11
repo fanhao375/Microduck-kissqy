@@ -1392,6 +1392,11 @@ pub async fn run(
         if let Some(mut pending) = verifying.take() {
             let reading = if error.is_none() { host_reading } else { None };
             match pending.observe(reading, Instant::now()) {
+                // The requester stopped waiting (its RPC timed out): a mount saved now would be
+                // verified with nobody told.
+                _ if pending.reply.is_closed() => {
+                    tracing::warn!("verify-imu: the request was abandoned; nothing saved");
+                }
                 None => verifying = Some(pending),
                 Some(verdict) => {
                     let old_mount = calibration.imu_mount(source).quat;
@@ -2011,8 +2016,9 @@ mod tests {
     /// Commissioning with a module, end to end through the socket: ID 200 is neither
     /// identified nor read, every Sync Read is the fifteen servos, and the published IMU is the
     /// module's. `verify-imu` under a mount a half turn off about the vertical passes the
-    /// upright check, then refuses once the robot is tipped nose-down and saves nothing; under
-    /// the right mount the same tip verifies the module's slot.
+    /// upright check, then refuses once the robot is tipped nose-down and saves nothing; one
+    /// whose requester gave up saves nothing either; under the right mount the same tip
+    /// verifies the module's slot.
     #[cfg(target_os = "linux")]
     #[test]
     fn commissioning_with_a_module_never_addresses_id_200() {
@@ -2204,15 +2210,44 @@ mod tests {
             !saved.imu_mount(TrunkImuKind::Lsm6dsv16x).verified,
             "nothing saved"
         );
-
-        // The right mount, the same tip: verified.
-        *quat.lock().unwrap() = truth;
-        wait("upright again", &|s| {
+        let upright_again = |s: &Value| {
             s["last_sample"]["imu"]["tilt_deg"]
                 .as_f64()
                 .is_some_and(|t| t < 1.0)
                 && s["imu_verification"].is_null()
+        };
+
+        // The right mount, but the requester gives up before the tip (as an RPC that timed out
+        // does): the tip saves nothing, or a mount would be verified with nobody told.
+        *quat.lock().unwrap() = truth;
+        wait("upright again", &upright_again);
+        let (reply, abandoned) = oneshot::channel();
+        state
+            .bus_commands
+            .push(Job {
+                command: BusCommand::VerifyImu {
+                    confirmed: true,
+                    mount_wxyz: Vec::new(),
+                },
+                reply,
+            })
+            .unwrap();
+        wait("the upright check", &|s| s["imu_verification"].is_string());
+        drop(abandoned);
+        *quat.lock().unwrap() = pitched(truth, 15.0);
+        wait("the abandoned wait to end", &|s| {
+            s["imu_verification"].is_null()
         });
+        std::thread::sleep(Duration::from_millis(200));
+        let saved: Calibration = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            !saved.imu_mount(TrunkImuKind::Lsm6dsv16x).verified,
+            "an abandoned verification saves nothing"
+        );
+
+        // The right mount, the same tip: verified.
+        *quat.lock().unwrap() = truth;
+        wait("upright again", &upright_again);
         let right = verify(json!({"action":"verify-imu","confirmed":true}));
         wait("the upright check", &|s| s["imu_verification"].is_string());
         *quat.lock().unwrap() = pitched(truth, 15.0);

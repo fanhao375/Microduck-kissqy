@@ -115,6 +115,7 @@ export class ServicePanel {
             <label class="service-check"><input id="service-mount-confirmed" type="checkbox">已固定并核对坐标轴与倾斜方向</label>
             <button class="button" id="service-verify-imu">保存安装确认</button>
           </div><div id="service-imu-job" class="panel-note service-job" role="status" aria-live="polite"></div>
+          <p class="tiny muted">I²C 模块（BNO08x / LSM6DSV16X）：先让机身直立再点保存，随后 20 秒内把机身前倾 15–30° 并保持，读数确实朝前才保存。</p>
         </section>
         <section class="panel service-power">
           <div class="panel-head"><div><h2>Zero 电源</h2></div></div>

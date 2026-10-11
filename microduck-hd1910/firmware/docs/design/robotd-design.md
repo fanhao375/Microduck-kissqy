@@ -692,7 +692,9 @@ operator tips it nose-down by 15–30° and holds it, and the lean must read as 
 trunk frame gravity leans toward the low side, so toward +x, within 20° of straight ahead — for
 five readings running. Only then is the slot written; a lean that reads tail-down or sideways is
 refused with the angle it read, and `busStatus` carries `imu_verification` while the command
-waits. The reply echoes gravity, tilt and gyro from both halves. Commissioning and read-only run
+waits. Relax, or the requester giving up, cancels the wait with nothing saved; robotd allows the
+command 30 s and the console's IMU panel 35 s. The reply echoes gravity, tilt and gyro from both
+halves. Commissioning and read-only run
 on the same reader; with a module neither identifies nor reads ID 200, and the per-device
 communication counts leave it out.
 
