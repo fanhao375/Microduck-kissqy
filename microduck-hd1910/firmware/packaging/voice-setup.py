@@ -24,7 +24,12 @@ def setup(params):
     if original=='microduck_voice':original=prior.get('slave','plughw:aic3104')
     match=re.fullmatch(r'(?:plug)?hw:(?:CARD=)?([A-Za-z0-9_-]+)(?:,.*)?',original)
     if not match:raise ValueError('无法确定系统声卡：'+str(original))
-    card=match[1];selected,origin=seed();bank=BASE/'voice-bank'
+    card=match[1]
+    # A board without the official HAT has no aic3104 codec, so there is no mixer to store and
+    # `alsactl store` fails the whole upgrade. robotd walks the same with no voice: skip, change nothing.
+    if not (ROOT/'proc/asound'/card).exists():
+        print(f'没有声卡 {card}（未装官方 HAT）：跳过音频设置，不影响走路。',flush=True);return
+    selected,origin=seed();bank=BASE/'voice-bank'
     try:ready=(bank/'.seed').read_text().strip()==f'{selected}:5'
     except OSError:ready=False
     if prior.get('revision')==REVISION and prior.get('slave')==original and ready and audio.get('bank')==str(bank):

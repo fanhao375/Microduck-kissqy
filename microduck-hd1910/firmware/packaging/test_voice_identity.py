@@ -15,6 +15,7 @@ class SystemAudioTests(unittest.TestCase):
   self.setup=self.base/'voice-device.json';self.setup.write_text(json.dumps({'card':'aic3104','slave':'plughw:aic3104','preferences_uid':0,'preferences_path':'/root/.local/state/microduck-r17/voice-volume.json'}))
   self.user=SimpleNamespace(pw_name='radxa',pw_uid=1000,pw_gid=1000,pw_dir=str(self.base/'user'))
   self.current=127;self.muted=False;self.legacy=566;self.commands=[]
+  (self.system/'proc/asound/aic3104').mkdir(parents=True)
  def tearDown(self):self.temp.cleanup()
  def runner(self,argv,**kwargs):
   self.commands.append(argv)
@@ -58,6 +59,11 @@ class SystemAudioTests(unittest.TestCase):
   self.legacy=None;self.current=76;state=self.system/'var/lib/alsa/asound.state';state.parent.mkdir(parents=True);state.write_text('existing state')
   self.install();self.assertEqual(self.current,76)
   self.assertFalse(any('cset' in a for a in self.commands))
+ def test_board_without_codec_skips_audio_and_changes_nothing(self):
+  (self.system/'proc/asound/aic3104').rmdir();before=self.params.read_bytes();descriptor=self.setup.read_bytes()
+  self.install()
+  self.assertEqual(self.commands,[]);self.assertEqual(self.params.read_bytes(),before);self.assertEqual(self.setup.read_bytes(),descriptor)
+  self.assertFalse((self.system/'etc').exists());self.assertFalse((self.system/'var').exists())
  def test_mute_migrates_and_os_restore_precedes_robotd_without_startup_audio_hook(self):
   self.legacy=0;self.install();self.assertTrue(self.muted)
   import runtime
