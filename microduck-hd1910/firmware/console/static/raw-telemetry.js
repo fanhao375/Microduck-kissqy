@@ -86,7 +86,10 @@ export function adaptService(result,report,calibration,sampleElapsed){
   }
   if(commissioning){
     const imu=sample.imu||{},g=vector(imu.gravity,3);
-    Object.assign(result.imu,{gravity:g,gyro:get(imu,'gyro_rad_s'),quat:get(imu,'quaternion_wxyz'),ready:get(imu,'ready'),sequence:get(imu,'sequence'),age_ms:get(imu,'age_ms'),age_upper_bound_ms:get(imu,'age_upper_bound_ms'),firmware_status:get(imu,'status'),mount_verified:report.imu_mount_verified===true,status:fresh&&g&&imu.valid===true?'live':g?'stale':'unavailable',source:'robotd / FT6 / 当前安装变换',reason:fresh?null:'等待新鲜的整链样本',roll_deg:g?deg(Math.atan2(-g[1],-g[2])):null,pitch_deg:g?deg(Math.atan2(g[0],Math.hypot(g[1],g[2]))):null});
+    // The trunk IMU busStatus says robotd reads; an older robotd names none: it read only FT6.
+    const names={bus:'FT6',bno08x:'BNO08x',lsm6dsv16x:'LSM6DSV16X'},kind=imu.source;
+    const imuName=typeof kind!=='string'||!kind?'FT6':Object.hasOwn(names,kind)?names[kind]:kind;
+    Object.assign(result.imu,{gravity:g,gyro:get(imu,'gyro_rad_s'),quat:get(imu,'quaternion_wxyz'),ready:get(imu,'ready'),sequence:get(imu,'sequence'),age_ms:get(imu,'age_ms'),age_upper_bound_ms:get(imu,'age_upper_bound_ms'),firmware_status:get(imu,'status'),mount_verified:report.imu_mount_verified===true,status:fresh&&g&&imu.valid===true?'live':g?'stale':'unavailable',source:`robotd / ${imuName} / 当前安装变换`,reason:fresh?null:'等待新鲜的整链样本',roll_deg:g?deg(Math.atan2(-g[1],-g[2])):null,pitch_deg:g?deg(Math.atan2(g[0],Math.hypot(g[1],g[2]))):null});
   }else Object.assign(result.imu,{mount_verified:diagnostic.imu_mount_verified===true,age_upper_bound_ms:get(diagnostic,'imu_age_upper_bound_ms'),firmware_status:get(diagnostic,'imu_status')});
   const count=result.servos.filter(r=>r.calibrated).length;
   return Object.assign(result,{bus:report,calibration,service_sample_fresh:fresh,service_sample_age_ms:age,service_walk_continuable:continuable,calibrated_count:count,saved_calibrated_count:saved,pose_calibrated:count===15,read_only:false,service_compatible:supportsFeature(report,'supported')});
