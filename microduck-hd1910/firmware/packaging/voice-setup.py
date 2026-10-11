@@ -25,8 +25,9 @@ def setup(params):
     match=re.fullmatch(r'(?:plug)?hw:(?:CARD=)?([A-Za-z0-9_-]+)(?:,.*)?',original)
     if not match:raise ValueError('无法确定系统声卡：'+str(original))
     card=match[1]
-    # A board without the official HAT has no aic3104 codec, so there is no mixer to store and
-    # `alsactl store` fails the whole upgrade. robotd walks the same with no voice: skip, change nothing.
+    # No aic3104 card - no official HAT, or a HAT whose codec was never brought up (setup-board.sh's
+    # audio step) - means no mixer to store, and `alsactl store` would fail the whole upgrade.
+    # robotd walks the same with no voice: skip, change nothing.
     if not (ROOT/'proc/asound'/card).exists():
         print(f'没有声卡 {card}（未装官方 HAT）：跳过音频设置，不影响走路。',flush=True);return
     selected,origin=seed();bank=BASE/'voice-bank'
