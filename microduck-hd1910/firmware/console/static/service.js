@@ -4,6 +4,7 @@ import {ServiceManagement} from './service-management.js';
 import {showFeedback} from './feedback.js';
 import {DeviceInspection} from './inspection.js';
 import {FirmwarePanel} from './firmware.js';
+import {imuMountSlot} from './raw-telemetry.js';
 
 const finite=v=>typeof v==='number'&&Number.isFinite(v);
 const fmt=(v,n=1)=>finite(v)?v.toFixed(n):'—';
@@ -109,7 +110,7 @@ export class ServicePanel {
       </section>
       <div class="service-setup-row" id="service-setup-row">
         <section class="panel service-imu">
-          <div class="panel-head"><div><h2>IMU 安装核对</h2><span id="service-imu-state" class="badge neutral">尚未确认</span></div></div>
+          <div class="panel-head"><div><h2>IMU 安装核对</h2><span id="service-imu-source" class="tiny muted"></span><span id="service-imu-state" class="badge neutral">尚未确认</span></div></div>
           <div class="service-setup-body">
             <label class="field">安装四元数 / w x y z<input id="service-mount" placeholder="等待服务配置" spellcheck="false" title="按实际安装方向填写；直立时重力约为 [0, 0, −1]"></label>
             <label class="service-check"><input id="service-mount-confirmed" type="checkbox">已固定并核对坐标轴与倾斜方向</label>
@@ -309,11 +310,12 @@ export class ServicePanel {
     set('service-calibration-detail',cal?.calibrated?`已保存零位 ${cal.zero_raw} counts · 方向 ${cal.direction} · ${s.calibration?.calibration_path||'等待保存路径'}`:'未保存实际零位');
     }
     set('service-calibration-mode',b.mode==='motion'?'当前为运动模式；支撑机身，停止并松开后点上方“切到标定模式”。':b.mode==='commissioning'?'标定模式：确认扭矩 OFF 后可调整并保存。':'等待服务模式反馈。');
-    const saved=s.calibration?.calibration,q=saved?.imu_mount_quat,imuKey=JSON.stringify([q,saved?.imu_mount_verified]);
+    const slot=imuMountSlot(s.calibration),q=slot.quat,imuKey=JSON.stringify([q,slot.verified]);
     const imuJob=job?.action==='verify-imu'&&job.status==='completed'?`${job.at}:${job.status}`:null;
     if(imuJob&&this.imuJob!==imuJob){this.mountDirty=false;this.imuJob=imuJob;}
     if(Array.isArray(q)&&this.imuKey!==imuKey&&!this.mountDirty&&document.activeElement!==this.$('service-mount')){this.$('service-mount').value=q.join(' ');this.imuKey=imuKey;}
-    set('service-imu-state',saved?.imu_mount_verified===true?'已保存确认':saved?'尚未保存确认':'等待标定回读');
+    set('service-imu-source',slot.module?slot.name:'');
+    set('service-imu-state',slot.verified===true?'已保存确认':slot.known?'尚未保存确认':'等待标定回读');
     for(const id of ['service-center','service-move','service-minus','service-plus','service-capture','service-verify-imu'])this.$(id).disabled=!!(this.blocked||this.posting);
     this.$('service-center').disabled ||= !!(s.saved_calibrated_count??s.calibrated_count);
     if(this.$('service-quick-stop'))this.$('service-quick-stop').disabled=!!this.options.replay;

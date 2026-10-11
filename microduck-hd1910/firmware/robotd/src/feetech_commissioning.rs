@@ -318,6 +318,11 @@ fn save_calibration(path: &Path, calibration: &Calibration) -> Result<(), String
 }
 
 /// `source`: the trunk IMU this robotd reads, whose mount decides whether motion may start.
+///
+/// For a module it also carries `imu_mount`, that source's mount as robotd uses it — its own
+/// slot, or the source's default while the slot is absent — so the console's IMU panel shows and
+/// confirms the mount in use rather than the bus board's top-level keys. The bus board's own
+/// report is unchanged: its mount already is those keys.
 pub(crate) fn calibration_status(
     calibration: &Calibration,
     path: &Path,
@@ -329,10 +334,15 @@ pub(crate) fn calibration_status(
         .filter(|joint| !joint.calibrated)
         .map(|joint| joint.name.as_str())
         .collect::<Vec<_>>();
-    json!({"calibration_path":path, "calibration":calibration, "uncalibrated_joints":missing,
-        "imu_source": source.label(),
+    let mut status = json!({"calibration_path":path, "calibration":calibration,
+        "uncalibrated_joints":missing, "imu_source": source.label(),
         "motion_validation":calibration.validate_motion_for(source).err().map(|e| e.to_string()),
-        "note":"Capture uses a manually known joint angle; encoder center is not joint zero."})
+        "note":"Capture uses a manually known joint angle; encoder center is not joint zero."});
+    if source != TrunkImuKind::Bus {
+        let mount = calibration.imu_mount(source);
+        status["imu_mount"] = json!({"quat": mount.quat, "verified": mount.verified});
+    }
+    status
 }
 
 fn capture(
@@ -2129,6 +2139,33 @@ mod tests {
         let saved: Calibration = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(saved.imu_mount(TrunkImuKind::Bno08x).verified);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// The calibration report names the mount in use for a module — its slot, or its default
+    /// while uncommissioned — so the console's IMU panel shows and confirms that one, not the
+    /// bus board's top-level keys it used to read on every robot. The bus board's report has no
+    /// such field: its mount is those keys, and its report stays as it was.
+    #[test]
+    fn the_calibration_report_names_a_modules_mount_in_use() {
+        let path = Path::new("/tmp/unused-calibration.toml");
+        let mut calibration = Calibration::commissioning(JOINT_IDS);
+        let fresh = calibration_status(&calibration, path, TrunkImuKind::Bno08x);
+        assert_eq!(fresh["imu_mount"]["quat"], json!(BNO), "{fresh}");
+        assert_eq!(fresh["imu_mount"]["verified"], false);
+        calibration.set_imu_mount(
+            TrunkImuKind::Lsm6dsv16x,
+            ImuMount {
+                quat: [0.0, 0.0, 0.0, 1.0],
+                verified: true,
+            },
+        );
+        let lsm = calibration_status(&calibration, path, TrunkImuKind::Lsm6dsv16x);
+        assert_eq!(
+            lsm["imu_mount"],
+            json!({"quat": [0.0, 0.0, 0.0, 1.0], "verified": true})
+        );
+        let bus = calibration_status(&calibration, path, TrunkImuKind::Bus);
+        assert!(bus.get("imu_mount").is_none(), "{bus}");
     }
 
     /// The bus board keeps its old rule: the operator's confirmation, no reading required, the

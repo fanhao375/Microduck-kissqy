@@ -298,6 +298,33 @@ console.log('PASS production Rust bytes → Python/JS exact fields → 15 joints
             result=subprocess.run(['node',str(base/'test.mjs')],input=json.dumps({'config':config,'frames':frames,'expected':exact_js(expected)}),text=True,capture_output=True)
             self.assertEqual(result.returncode,0,result.stdout+'\n'+result.stderr)
 
+    def test_the_imu_panel_confirms_the_mount_robotd_uses(self):
+        # A module robot's panel used to prefill and badge the bus board's top-level mount, so it
+        # offered the wrong quaternion to confirm and contradicted the health badge. It reads the
+        # report's imu_mount for a module, and the bus board's keys exactly as before.
+        saved={'imu_mount_quat':[0,1,0,0],'imu_mount_verified':True,'imu_mounts':{'bno08x':{'quat':[.5,.5,.5,.5],'verified':False}}}
+        cases={'module':{'calibration':saved,'imu_source':'bno08x','imu_mount':{'quat':[.5,.5,.5,.5],'verified':False}},
+               'bus':{'calibration':saved,'imu_source':'bus'},'older':{'calibration':saved},'none':None}
+        script='''import assert from 'node:assert/strict';
+import {imuMountSlot,imuName} from './raw-telemetry.js';
+let input='';for await(const part of process.stdin)input+=part;const cases=JSON.parse(input);
+assert.deepEqual(imuMountSlot(cases.module),{module:true,name:'BNO08x',quat:[.5,.5,.5,.5],verified:false,known:true});
+for(const name of ['bus','older'])assert.deepEqual(imuMountSlot(cases[name]),{module:false,name:'FT6',quat:[0,1,0,0],verified:true,known:true},name);
+assert.deepEqual(imuMountSlot(cases.none),{module:false,name:'FT6',quat:undefined,verified:undefined,known:false});
+assert.equal(imuName('lsm6dsv16x'),'LSM6DSV16X');assert.equal(imuName(undefined),'FT6');assert.equal(imuName('constructor'),'constructor');
+console.log('PASS');
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            base=Path(directory);(base/'package.json').write_text('{"type":"module"}')
+            for name in ('raw-telemetry.js','raw-kinematics.js','service-builds.js'):
+                shutil.copyfile(ROOT/'console/static'/name,base/name)
+            (base/'test.mjs').write_text(script)
+            result=subprocess.run(['node',str(base/'test.mjs')],input=json.dumps(cases),text=True,capture_output=True)
+            self.assertEqual(result.returncode,0,result.stdout+'\n'+result.stderr)
+        service=(ROOT/'console/static/service.js').read_text(encoding='utf-8')
+        self.assertIn('imuMountSlot(s.calibration)',service)
+        self.assertNotIn('saved?.imu_mount_quat',service)
+
     def test_browser_adapter_matches_existing_python_store_for_motion_commissioning_and_stale_samples(self):
         cfg={'mode':'service','control_enabled':True,'ids':IDS,'names':NAMES,'labels':LABELS,'version':VERSION,'baseline':BASELINE}
         mapping={'calibration':{'joints':[{'id':sid,'name':name,'calibrated':True,'zero_raw':2048,'direction':1,'min_rad':-2,'max_rad':2} for sid,name in zip(IDS,NAMES)]}}

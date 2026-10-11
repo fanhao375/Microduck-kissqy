@@ -701,8 +701,10 @@ readings running that read forward write the slot; five running that read tail-d
 refuse it with the angle they read; a reading that disagrees with the run before it starts the
 count again, so a wobble through forward is never taken for the tip. `busStatus` carries
 `imu_verification` while the command waits. Relax, or the requester giving up, cancels the wait
-with nothing saved; robotd allows the command 30 s and the console's IMU panel 35 s. The reply
-echoes gravity, tilt and gyro from both halves. Commissioning and read-only run on the same
+with nothing saved; robotd allows the command 30 s and the console's IMU panel 35 s. That panel
+shows and confirms the mount of the source in use: for a module the calibration report carries it
+as `imu_mount` (its slot, or the source's default while there is none). The reply echoes
+gravity, tilt and gyro from both halves. Commissioning and read-only run on the same
 reader; with a module neither identifies nor reads ID 200, and the per-device communication
 counts leave it out.
 
