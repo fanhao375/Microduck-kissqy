@@ -1,7 +1,7 @@
 //! The robot's trunk orientation: what every trunk IMU shares, and the bus board's bytes.
 //!
-//! Two parts, because the sensor can be wired two ways ([`crate::trunk_imu::TrunkImuKind`])
-//! and only the bus board is this module's byte format:
+//! Two parts, because the sensor can be wired more than one way
+//! ([`crate::trunk_imu::TrunkImuKind`]) and only the bus board is this module's byte format:
 //!
 //! - [`TrunkFrame`] is the post-processing: the sensor→trunk mount, holding the last good
 //!   quaternion, the 25-sample ready gate and the three-point median. Every source feeds it
@@ -10,7 +10,8 @@
 //! - [`SflpDecoder`] is the `imu_to_dxl` v2 board (LSM6DSV16X) on the servo bus: its 12-byte
 //!   block parsed into such a reading, then the frame. The block is fetched in the same
 //!   `sync_read` as the servos, and the chip's SFLP ships a game-rotation quaternion and
-//!   estimates its own gyro bias, so there is no fusion to run on the host.
+//!   estimates its own gyro bias, so there is no fusion to run on the host. Its gyro and
+//!   quaternion conversions are shared with [`crate::lsm6dsv16x`], the same chip on a breakout.
 //!
 //! Block layout at address 124:
 //!
@@ -177,11 +178,7 @@ impl SflpDecoder {
 
 /// The board's 12 bytes as a reading in its own axes.
 pub fn parse_block(raw: &[u8; IMU_BLOCK_LEN]) -> SensorReading {
-    let gyro = [
-        i16::from_le_bytes([raw[0], raw[1]]) as f64 * GYRO_RAD_PER_LSB,
-        i16::from_le_bytes([raw[2], raw[3]]) as f64 * GYRO_RAD_PER_LSB,
-        i16::from_le_bytes([raw[4], raw[5]]) as f64 * GYRO_RAD_PER_LSB,
-    ];
+    let gyro = lsm6dsv16x_gyro([raw[0], raw[1], raw[2], raw[3], raw[4], raw[5]]);
 
     // All-zero quaternion bytes mean SFLP has not written its table yet — the board
     // just powered up, or its init failed. The frame keeps the last good value.
@@ -190,21 +187,44 @@ pub fn parse_block(raw: &[u8; IMU_BLOCK_LEN]) -> SensorReading {
         u16::from_le_bytes([raw[8], raw[9]]),
         u16::from_le_bytes([raw[10], raw[11]]),
     ];
-    let mut quat = None;
-    if packed != [0, 0, 0] {
-        let (x, y, z) = (half(packed[0]), half(packed[1]), half(packed[2]));
-        let norm_sq = x * x + y * y + z * z;
-        // A quaternion the chip never produced would fail this; ≤ 1.02 allows for
-        // half-precision rounding at full scale.
-        if x.is_finite() && y.is_finite() && z.is_finite() && norm_sq <= 1.02 {
-            let w = (1.0 - norm_sq).max(0.0).sqrt();
-            quat = Some([w, x, y, z]);
-        }
-    }
+    let quat = if packed != [0, 0, 0] {
+        sflp_quaternion(packed)
+    } else {
+        None
+    };
     SensorReading { gyro, quat }
 }
 
-// Single-sample spike rejection. A dropped or corrupted block shows up as one wild value;
+/// The chip's gyro words — `i16` LE x/y/z at ±500 dps — in rad/s.
+///
+/// Shared with [`crate::lsm6dsv16x`], whose FIFO carries the same chip's same words: one
+/// conversion, so the same bytes are the same rate whichever way the chip is wired.
+pub(crate) fn lsm6dsv16x_gyro(raw: [u8; 6]) -> [f64; 3] {
+    [
+        i16::from_le_bytes([raw[0], raw[1]]) as f64 * GYRO_RAD_PER_LSB,
+        i16::from_le_bytes([raw[2], raw[3]]) as f64 * GYRO_RAD_PER_LSB,
+        i16::from_le_bytes([raw[4], raw[5]]) as f64 * GYRO_RAD_PER_LSB,
+    ]
+}
+
+/// SFLP's game rotation — x/y/z as IEEE half-precision bit patterns — as a scalar-first
+/// quaternion with `w = √(1 − x² − y² − z²)`, or `None` for one the chip never produced.
+///
+/// Shared with [`crate::lsm6dsv16x`] for the reason [`lsm6dsv16x_gyro`] is.
+pub(crate) fn sflp_quaternion(packed: [u16; 3]) -> Option<[f64; 4]> {
+    let (x, y, z) = (half(packed[0]), half(packed[1]), half(packed[2]));
+    let norm_sq = x * x + y * y + z * z;
+    // A quaternion the chip never produced would fail this; ≤ 1.02 allows for
+    // half-precision rounding at full scale.
+    if x.is_finite() && y.is_finite() && z.is_finite() && norm_sq <= 1.02 {
+        let w = (1.0 - norm_sq).max(0.0).sqrt();
+        Some([w, x, y, z])
+    } else {
+        None
+    }
+}
+
+/// Single-sample spike rejection. A dropped or corrupted block shows up as one wild value;
 /// a median over three discards it without the lag of an average.
 fn median3_each(history: &[[f64; 3]; 2], now: [f64; 3]) -> [f64; 3] {
     let m = |a: f64, b: f64, c: f64| a.max(b).min(c).max(a.min(b));

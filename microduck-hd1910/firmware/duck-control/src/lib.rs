@@ -15,6 +15,7 @@ pub mod feetech_snapshot;
 pub mod hardware;
 pub mod imu;
 pub mod io;
+pub mod lsm6dsv16x;
 pub mod model;
 pub mod obs;
 pub mod policy;
