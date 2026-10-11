@@ -48,7 +48,11 @@ port = "/dev/ttyS2"
 # robotd refuses to start on any other pairing.
 #
 # Each source has its own commissioned mount in the calibration file, and motion stays
-# refused until the mount of the source in use is verified. Needs a robotd restart.
+# refused until the mount of the source in use is verified: stand the robot upright and run
+# `robotd bus verify-imu --confirmed` with this source selected. A module also needs robotd's
+# unit to allow `char-i2c` (the R17 drop-in does) and nothing else holding the node — servo-web's
+# IMU display takes the same lock. docs/design/robotd-design.md §2.6 has the whole of it.
+# Needs a robotd restart.
 # source = "bus"
 
 # The i2c-dev node and 7-bit address a module source is read through. /dev/i2c-4 is the Zero

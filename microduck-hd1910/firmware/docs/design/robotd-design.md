@@ -7,7 +7,8 @@ Implements the `robotd` row of [`architecture.md`](architecture.md) §1 and cove
 [`apirrone/microduck_runtime`](https://github.com/apirrone/microduck_runtime), referred to
 throughout as *the runtime*.
 
-**Only the alpha variant, only the Radxa, only the v2 `imu_to_dxl` board.** v1/v1.5/v1.6, the
+**Only the alpha variant, only the Radxa, only the v2 `imu_to_dxl` board** — or, on the Feetech
+backend, a BNO08x or LSM6DSV16X module on the board's I²C in its place (§2.6). v1/v1.5/v1.6, the
 four other IMUs, the three cameras and the Pi are dropped, and every shipped policy is
 `alpha_*`. The wheeled configuration survives as one params switch — `policy.mode = "roller"`
 (§4.2) — because what it selects is a policy set and a tuning preset, not a hardware variant.
@@ -41,7 +42,8 @@ second port:
 The IMU is `id 200` and is read in the *same* `sync_read` as the servos, because that is what
 the hardware does: the v2 board sits on the Dynamixel bus and serves an on-chip SFLP
 quaternion out of the same register block the servos answer at. One board, one code path, no
-IMU abstraction. It is listed first in the id vector so it answers before the servo burst.
+IMU abstraction. It is listed first in the id vector so it answers before the servo burst. That
+is still the default; a module on the board's I²C is the one alternative (§2.6).
 
 **One owner at a time; tty exclusivity alone does not enforce it.** `serialport` sets `TIOCEXCL`, which
 turns a second *unprivileged* open into `EBUSY` — but `robotd.service` runs as root, because
@@ -641,6 +643,60 @@ orders cannot be allowed to drift — a `const` assertion makes "cannot" true. A
 positions *relative* to the home pose, so a discrepancy here is a constant offset on 14
 observation slots.
 
+### 2.6 Where the trunk IMU is wired
+
+By default, and originally, the trunk IMU is the `imu_to_dxl` board: ID 200 on the servo bus,
+read in the servos' own `sync_read` (§1.1). On the Feetech backend (`bus.protocol = "feetech"`)
+`[trunk_imu] source` can name a module on the board's own I²C instead — `bno08x` (BNO085/BNO086,
+address 0x4A or 0x4B) or `lsm6dsv16x` (the board's own chip on a breakout, 0x6A or 0x6B) — at
+`i2c_device` (default `/dev/i2c-4`). Chosen, never probed: a robot whose board stopped answering
+must fail as a bus fault, not quietly start trusting whatever else is on I²C. `Params::load`
+refuses a module with the Dynamixel backend, and an address the chip cannot be strapped to.
+
+**Nothing about the bus board changes.** Its block is parsed as it always was — a golden test
+pins the decoder's output exactly — the `sync_read` is the same sixteen devices, and its mount
+stays in the calibration's top-level `imu_mount_quat` / `imu_mount_verified`.
+
+**A module is read by a thread, not by the tick.** `robotd/src/trunk_imu_i2c.rs` owns the
+i2c-dev file and runs one state machine per chip on the codecs in `duck-control`
+(`bno08x`: soft reset, product ID, game rotation vector and calibrated gyro at 100 Hz;
+`lsm6dsv16x`: the bus board firmware's own register configuration as data, then the FIFO a
+word at a time). It publishes each new sample into a lock-free slot, and the tick takes the
+newest one after the servos' `sync_read` — which is then the fifteen servos alone, and strict:
+a missing servo fails the sample, which is what the board's 50 ms age bound already made of a
+missing servo. `trunk_imu::HostImuGate` judges the sample: older than 50 ms, the same sequence
+three reads running, or less than a second into an *epoch* is refused, with the board's own
+error text. An epoch is a (re)start of the chip's reports — a reopen after a device fault
+(backing off 0.5 s doubling to 10 s), or a chip set up again in place after it reset itself
+(BNO08x) or lost FIFO data (LSM6DSV16X); the second's wait is for the fusion to settle. The
+control thread never waits on the reader: a slow, wedged or absent module is an old sample.
+
+**Same post-processing, same meaning.** Every source goes through `imu::TrunkFrame` — the mount,
+holding the last quaternion, the 25-sample ready gate, the three-point median — so `ImuData`
+means the same thing whichever chip produced it. The LSM6DSV16X's FIFO words go through the
+board's own gyro and half-precision conversions, so the same bytes are the same reading.
+
+**Each source has its own mount**, because the sensors sit in different places: the calibration
+gains `[imu_mounts.bno08x]` and `[imu_mounts.lsm6dsv16x]` (`quat`, `verified`), with the bus
+board's left where every existing file has it. An uncommissioned BNO08x starts from
+`[0.5, 0.5, 0.5, 0.5]` (sensor X left, Y up, Z forward: trunk gyro = sensor `(z, x, y)`, the
+mapping microduck-replica's policy trial ran on a robot); an LSM6DSV16X breakout has no standard
+way up and starts from identity. Motion needs the *wired* source's mount verified
+(`Calibration::validate_motion_for`). `bus verify-imu --confirmed [--mount-wxyz w,x,y,z]` writes
+the wired source's slot; for a module it refuses a mount under which the trunk standing upright
+reads more than 10° from upright (the HOME guard's limit, `home_start::MAX_TILT_DEG`) and echoes gravity, tilt and
+gyro, so a wrong axis shows as a wrong number rather than a fall. Commissioning and read-only run
+on the same reader; with a module neither identifies nor reads ID 200, and the per-device
+communication counts leave it out.
+
+**On the board.** The I²C bus must exist (its overlay enabled); robotd's unit needs
+`DeviceAllow=char-i2c rw` (the R17 drop-in carries it), or the open fails with `EPERM`. The
+reader takes the same `flock` servo-web's `imu_i2c.py` takes on the node, so the two cannot both
+configure one chip; a held lock is reported naming servo-web and retried. Nothing written to a
+chip persists: a BNO08x's report settings live in its RAM and are turned off on the way out, and
+an LSM6DSV16X has nothing to persist. Diagnostics carry `imu_source`, and for a module
+`imu_reader` — its state, epoch, samples, faults and last fault.
+
 ## 3. The API
 
 ### 3.1 Intents in
@@ -1065,7 +1121,8 @@ Each test's comment says which failure it exists to prevent, per the repo conven
 |---|---|
 | `duck-control` as a workspace crate | boundary enforced by the compiler, no second repo |
 | bus layer written fresh, constants borrowed | thin code, but the tuned numbers are not re-derived |
-| the IMU in the motors' `sync_read` | it is a device on the same bus; no IMU abstraction |
+| the IMU in the motors' `sync_read` | it is a device on the same bus — still the default |
+| ~~no IMU abstraction~~ — narrowed | the board stays in the `sync_read`; a module on I²C is the one alternative, read by a thread behind `HostImu` into the same `TrunkFrame` (§2.6) |
 | Rust consts for the model | one robot exists |
 | params file, not watched | establishes the file and its location; the watcher is later |
 | policy path in params, default = release dir | updates carry the policy; devs override it |
