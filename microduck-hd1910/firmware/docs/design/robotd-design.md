@@ -683,9 +683,16 @@ board's left where every existing file has it. An uncommissioned BNO08x starts f
 mapping microduck-replica's policy trial ran on a robot); an LSM6DSV16X breakout has no standard
 way up and starts from identity. Motion needs the *wired* source's mount verified
 (`Calibration::validate_motion_for`). `bus verify-imu --confirmed [--mount-wxyz w,x,y,z]` writes
-the wired source's slot; for a module it refuses a mount under which the trunk standing upright
-reads more than 10° from upright (the HOME guard's limit, `home_start::MAX_TILT_DEG`) and echoes gravity, tilt and
-gyro, so a wrong axis shows as a wrong number rather than a fall. Commissioning and read-only run
+the wired source's slot. For a module it is two checks, because upright alone proves only the
+vertical axis: a mount a quarter or half turn off about the vertical reads upright just as well,
+and then turns a pitch into a roll or flips its sign — the policy corrects the wrong way and the
+robot falls. First the robot standing upright must read within 10° of upright under the mount
+being confirmed (the HOME guard's limit, `home_start::MAX_TILT_DEG`). Then, within 20 s, the
+operator tips it nose-down by 15–30° and holds it, and the lean must read as nose-down — in the
+trunk frame gravity leans toward the low side, so toward +x, within 20° of straight ahead — for
+five readings running. Only then is the slot written; a lean that reads tail-down or sideways is
+refused with the angle it read, and `busStatus` carries `imu_verification` while the command
+waits. The reply echoes gravity, tilt and gyro from both halves. Commissioning and read-only run
 on the same reader; with a module neither identifies nor reads ID 200, and the per-device
 communication counts leave it out.
 

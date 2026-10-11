@@ -68,8 +68,9 @@ pub enum BusCommand {
     /// Show the persisted calibration and what still prevents full control.
     CalibrationStatus,
     /// Record that the official IMU mounting axes have been physically checked — for the
-    /// trunk IMU this robotd reads (`[trunk_imu] source`), in that source's own slot. A module
-    /// is refused unless the trunk reads upright (≤ 10°) under the mount being confirmed.
+    /// trunk IMU this robotd reads (`[trunk_imu] source`), in that source's own slot. For a
+    /// module, start with the robot upright (≤ 10° under the mount being confirmed), then tip
+    /// it nose-down by 15–30° within 20 s; the command answers once it has seen the tip.
     VerifyImu {
         #[arg(long, required = true)]
         confirmed: bool,
@@ -89,6 +90,7 @@ fn command_timeout(command: &BusCommand) -> Duration {
             Duration::from_millis((*duration_ms).min(60_000) * NUM_JOINTS as u64)
                 + Duration::from_secs(8 * NUM_JOINTS as u64 + 15)
         }
+        BusCommand::VerifyImu { .. } => NOSE_DOWN_WINDOW + Duration::from_secs(10),
         _ => Duration::from_secs(15),
     }
 }
@@ -463,40 +465,146 @@ fn under_mount(mount: [f64; 4], reading: SensorReading) -> ImuData {
     frame.push(reading)
 }
 
-fn verify_imu(
+/// The first half of a module's verification: the robot standing upright reads upright
+/// through the mount being confirmed. A module has no official orientation to take on trust.
+fn upright_check(
+    source: TrunkImuKind,
+    mount: [f64; 4],
+    reading: Option<SensorReading>,
+) -> Result<Value, String> {
+    let reading = reading.ok_or_else(|| {
+        format!(
+            "verify-imu needs a live {} sample; check busStatus last_sample.imu and the reader",
+            source.label()
+        )
+    })?;
+    let trunk = under_mount(mount, reading);
+    let tilt = super::home_start::tilt_deg(trunk.gravity);
+    let echo = json!({"imu_source": source.label(), "mount_wxyz": mount,
+        "gravity": trunk.gravity, "tilt_deg": tilt, "gyro_rad_s": trunk.gyro,
+        "tilt_limit_deg": super::home_start::MAX_TILT_DEG});
+    if tilt.is_none_or(|t| t > super::home_start::MAX_TILT_DEG) {
+        return Err(format!(
+            "under this mount the trunk reads {} from upright (limit {}°); stand the robot \
+             upright, or the mount is wrong: {echo}",
+            tilt.map_or("no valid gravity".to_owned(), |t| format!("{t:.1}°")),
+            super::home_start::MAX_TILT_DEG
+        ));
+    }
+    Ok(echo)
+}
+
+/// Lean at least this far before the nose-down half of a verification judges anything.
+const NOSE_DOWN_MIN_DEG: f64 = 12.0;
+/// How far from straight ahead the lean may point and still prove the forward axis. A mount a
+/// quarter or half turn off about the vertical reads 90° or 180° here; a hand tipping the
+/// robot is rarely more than a few degrees off.
+const NOSE_DOWN_HEADING_DEG: f64 = 20.0;
+/// Consecutive tipped readings before a verdict, so a jolt is not taken for a lean.
+const NOSE_DOWN_READINGS: u32 = 5;
+/// How long `verify-imu` waits for the nose-down tip once the upright check has passed.
+const NOSE_DOWN_WINDOW: Duration = Duration::from_secs(20);
+
+#[derive(Debug)]
+enum NoseDown {
+    /// Not leaning far enough to judge yet.
+    Level,
+    /// Leaning nose-down, as the trunk frame should read it: the echo of what it read.
+    Forward(Value),
+    /// Leaning, but the wrong way round for a nose-down tip under this mount.
+    Wrong(String),
+}
+
+/// The second half: tipping the robot nose-down proves the forward axis. Upright alone proves
+/// only the vertical one — a mount a quarter or half turn off about the vertical reads upright
+/// just as well, and then turns a pitch into a roll or flips its sign, and the policy corrects
+/// the wrong way and falls. In the trunk frame gravity leans toward the low side, so a
+/// nose-down tip reads +x: 15° is `[0.26, 0, -0.97]`, the convention the policy and
+/// `home_start` read.
+fn nose_down(mount: [f64; 4], reading: SensorReading) -> NoseDown {
+    let trunk = under_mount(mount, reading);
+    let Some(tilt) = super::home_start::tilt_deg(trunk.gravity) else {
+        return NoseDown::Level;
+    };
+    if tilt < NOSE_DOWN_MIN_DEG {
+        return NoseDown::Level;
+    }
+    let [x, y, _] = trunk.gravity;
+    // 0° nose-down, ±180° tail-down, +90° the robot's left side low, -90° its right.
+    let heading = y.atan2(x).to_degrees();
+    let echo = json!({"gravity": trunk.gravity, "tilt_deg": tilt,
+        "lean_heading_deg": heading, "gyro_rad_s": trunk.gyro});
+    if heading.abs() <= NOSE_DOWN_HEADING_DEG {
+        return NoseDown::Forward(echo);
+    }
+    let reads = if heading.abs() >= 135.0 {
+        "tail-down"
+    } else if heading > 0.0 {
+        "as the left side going down"
+    } else {
+        "as the right side going down"
+    };
+    NoseDown::Wrong(format!(
+        "tipped {tilt:.0}°, but under this mount it reads {reads} ({heading:.0}° from \
+         nose-down): the mount is about that far off about the vertical axis. If the nose did \
+         not go down, tip it nose-down and run verify-imu again. Nothing saved: {echo}"
+    ))
+}
+
+/// A module's verification between its upright check and the nose-down tip it is waiting for.
+struct PendingVerify {
+    reply: oneshot::Sender<Reply>,
+    mount: [f64; 4],
+    upright: Value,
+    deadline: Instant,
+    tipped: u32,
+}
+
+impl PendingVerify {
+    /// One tick's live reading — none on a tick whose read failed. `Some` once decided.
+    fn observe(
+        &mut self,
+        reading: Option<SensorReading>,
+        now: Instant,
+    ) -> Option<Result<Value, String>> {
+        if let Some(reading) = reading {
+            let verdict = nose_down(self.mount, reading);
+            if matches!(verdict, NoseDown::Level) {
+                self.tipped = 0;
+            } else {
+                self.tipped += 1;
+                if self.tipped >= NOSE_DOWN_READINGS {
+                    return Some(match verdict {
+                        NoseDown::Forward(echo) => {
+                            Ok(json!({"upright": self.upright, "nose_down": echo}))
+                        }
+                        NoseDown::Wrong(message) => Err(message),
+                        NoseDown::Level => Err("no verdict".into()),
+                    });
+                }
+            }
+        }
+        (now >= self.deadline).then(|| {
+            Err(format!(
+                "no nose-down tip of at least {NOSE_DOWN_MIN_DEG}° held within {} s of the \
+                 upright check; nothing saved",
+                NOSE_DOWN_WINDOW.as_secs()
+            ))
+        })
+    }
+}
+
+/// Write `source`'s mount as verified. Motion stays off until it is enabled again.
+fn save_verified(
     calibration: &Calibration,
     path: &Path,
-    imu: ImuContext,
+    source: TrunkImuKind,
     mount: [f64; 4],
+    check: Option<Value>,
 ) -> Result<(Calibration, Value), String> {
     let mut updated = calibration.clone();
-    let mut check = None;
-    if imu.source != TrunkImuKind::Bus {
-        let reading = imu.reading.ok_or_else(|| {
-            format!(
-                "verify-imu needs a live {} sample; check busStatus last_sample.imu and the reader",
-                imu.source.label()
-            )
-        })?;
-        let trunk = under_mount(mount, reading);
-        let tilt = super::home_start::tilt_deg(trunk.gravity);
-        let echo = json!({"imu_source": imu.source.label(), "mount_wxyz": mount,
-            "gravity": trunk.gravity, "tilt_deg": tilt, "gyro_rad_s": trunk.gyro,
-            "tilt_limit_deg": super::home_start::MAX_TILT_DEG});
-        // A module has no official orientation to take on trust: the robot standing upright
-        // has to read upright through the mount being confirmed, or the mount is wrong.
-        if tilt.is_none_or(|t| t > super::home_start::MAX_TILT_DEG) {
-            return Err(format!(
-                "under this mount the trunk reads {} from upright (limit {}°); stand the robot \
-                 upright, or the mount is wrong: {echo}",
-                tilt.map_or("no valid gravity".to_owned(), |t| format!("{t:.1}°")),
-                super::home_start::MAX_TILT_DEG
-            ));
-        }
-        check = Some(echo);
-    }
     updated.set_imu_mount(
-        imu.source,
+        source,
         ImuMount {
             quat: mount,
             verified: true,
@@ -504,7 +612,7 @@ fn verify_imu(
     );
     updated.motion_enabled = false;
     save_calibration(path, &updated)?;
-    let mut status = calibration_status(&updated, path, imu.source);
+    let mut status = calibration_status(&updated, path, source);
     if let Some(check) = check {
         status["imu_check"] = check;
     }
@@ -522,11 +630,17 @@ fn process_job(
     ids: &[u8],
     off_pending: &mut Option<String>,
     imu: ImuContext,
+    verifying: &mut Option<PendingVerify>,
 ) {
     if job.reply.is_closed() {
         return;
     }
     if matches!(job.command, BusCommand::Relax) {
+        if let Some(pending) = verifying.take() {
+            let _ = pending
+                .reply
+                .send(Err("verify-imu cancelled by relax; nothing saved".into()));
+        }
         let stop_error = abort_motion(bus, ids, motion, "movement interrupted by relax");
         *off_pending = stop_error.clone();
         let result =
@@ -538,6 +652,12 @@ fn process_job(
         let _ = job
             .reply
             .send(Ok(calibration_status(calibration, path, imu.source)));
+        return;
+    }
+    if verifying.is_some() {
+        let _ = job.reply.send(Err(
+            "verify-imu is waiting for the nose-down tip; relax cancels it".into(),
+        ));
         return;
     }
     if off_pending.is_some() {
@@ -675,10 +795,33 @@ fn process_job(
                         }
                     }
                 };
-                verify_imu(calibration, path, imu, mount).map(|(updated, status)| {
-                    *calibration = updated;
-                    status
-                })
+                if imu.source == TrunkImuKind::Bus {
+                    save_verified(calibration, path, imu.source, mount, None).map(
+                        |(updated, status)| {
+                            *calibration = updated;
+                            status
+                        },
+                    )
+                } else {
+                    match upright_check(imu.source, mount, imu.reading) {
+                        Ok(upright) => {
+                            tracing::warn!(
+                                source = imu.source.label(),
+                                "verify-imu: upright check passed; now tip the robot nose-down \
+                                 by 15-30 degrees"
+                            );
+                            *verifying = Some(PendingVerify {
+                                reply: job.reply,
+                                mount,
+                                upright,
+                                deadline: Instant::now() + NOSE_DOWN_WINDOW,
+                                tipped: 0,
+                            });
+                            return;
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
             } else {
                 Err(
                     "verify-imu requires --confirmed after checking the official mounting axes"
@@ -893,6 +1036,9 @@ pub struct Status {
     last_sample: Option<Sample>,
     calibrated: bool,
     imu_mount_verified: bool,
+    /// What `verify-imu` is waiting for, while it waits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    imu_verification: Option<&'static str>,
     torque_state: &'static str,
     torque_off_pending: Option<String>,
     power_pending: bool,
@@ -996,6 +1142,7 @@ pub async fn run(
     let mut imu_gate = HostImuGate::default();
     let mut imu_epoch = None;
     let mut host_reading = None;
+    let mut verifying: Option<PendingVerify> = None;
     let mut last_sample = None;
     let mut last_failure = None;
     let mut errors_by_id = BTreeMap::<u8, u64>::new();
@@ -1143,6 +1290,7 @@ pub async fn run(
                             source,
                             reading: None,
                         },
+                        &mut verifying,
                     );
                 } else {
                     let _ = job.reply.send(Err(error.clone()));
@@ -1223,6 +1371,7 @@ pub async fn run(
                         source,
                         reading: host_reading,
                     },
+                    &mut verifying,
                 );
                 if changes_calibration {
                     state
@@ -1239,6 +1388,42 @@ pub async fn run(
                 }
             }
             step_motion(&mut bus, &samples, &ids, &mut motion, &mut off_pending);
+        }
+        if let Some(mut pending) = verifying.take() {
+            let reading = if error.is_none() { host_reading } else { None };
+            match pending.observe(reading, Instant::now()) {
+                None => verifying = Some(pending),
+                Some(verdict) => {
+                    let old_mount = calibration.imu_mount(source).quat;
+                    let result = verdict
+                        .and_then(|check| {
+                            save_verified(
+                                &calibration,
+                                calibration_path,
+                                source,
+                                pending.mount,
+                                Some(check),
+                            )
+                        })
+                        .map(|(updated, status)| {
+                            calibration = updated;
+                            status
+                        });
+                    if result.is_ok() {
+                        state
+                            .bus_calibration
+                            .store(Some(Arc::new(calibration_status(
+                                &calibration,
+                                calibration_path,
+                                source,
+                            ))));
+                        if old_mount != calibration.imu_mount(source).quat {
+                            imu_frame = TrunkFrame::new(calibration.imu_mount(source).quat);
+                        }
+                    }
+                    let _ = pending.reply.send(result);
+                }
+            }
         }
         state
             .moving
@@ -1287,6 +1472,9 @@ pub async fn run(
                 last_sample: last_sample.clone(),
                 calibrated: calibration.joints.iter().all(|j| j.calibrated),
                 imu_mount_verified: calibration.imu_mount(source).verified,
+                imu_verification: verifying
+                    .as_ref()
+                    .map(|_| "verify-imu: tip the robot nose-down by 15-30 degrees and hold it"),
                 torque_state: if off_pending.is_some() {
                     "unknown"
                 } else if let Some(m) = &motion {
@@ -1318,6 +1506,11 @@ pub async fn run(
     let stop_error = abort_motion(&mut bus, &ids, &mut motion, "service stopping");
     if let Some(error) = stop_error {
         tracing::error!(%error,"shutdown torque-off not confirmed");
+    }
+    if let Some(pending) = verifying.take() {
+        let _ = pending
+            .reply
+            .send(Err("service stopping; nothing saved".into()));
     }
     state.bus_commands.cancel_all("service stopping");
 }
@@ -1363,6 +1556,7 @@ mod tests {
             last_sample: None,
             calibrated: true,
             imu_mount_verified: true,
+            imu_verification: None,
             torque_state: "off",
             torque_off_pending: None,
             power_pending: false,
@@ -1616,69 +1810,183 @@ mod tests {
         dir.join("calibration.toml")
     }
 
-    /// A reading taken with the trunk pitched `degrees` about +Y, as a module mounted in the
-    /// BNO08x default would report it (sensor = trunk · mount).
-    fn pitched_bno08x_reading(degrees: f64) -> SensorReading {
+    /// Hamilton product, scalar-first, for building sensor readings.
+    fn mul(a: [f64; 4], b: [f64; 4]) -> [f64; 4] {
+        let ([aw, ax, ay, az], [bw, bx, by, bz]) = (a, b);
+        [
+            aw * bw - ax * bx - ay * by - az * bz,
+            aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+        ]
+    }
+
+    /// The trunk pitched `degrees` nose-down (about +Y), as a sensor mounted `mount` reports it:
+    /// sensor = trunk · mount.
+    fn pitched(mount: [f64; 4], degrees: f64) -> [f64; 4] {
         let half = degrees.to_radians() / 2.0;
-        let (c, v) = (half.cos(), half.sin());
+        mul([half.cos(), 0.0, half.sin(), 0.0], mount)
+    }
+
+    fn reading(quat: [f64; 4], gyro: [f64; 3]) -> SensorReading {
         SensorReading {
-            // Sensor Y is trunk Z in this mount: a yaw rate.
-            gyro: [0.0, 0.3, 0.0],
-            quat: Some([0.5 * (c - v), 0.5 * (c + v), 0.5 * (c + v), 0.5 * (c - v)]),
+            gyro,
+            quat: Some(quat),
         }
     }
 
-    /// A module's mount is confirmed against the robot standing upright: under the mount being
-    /// verified the trunk must read within 10° of upright, and the reply echoes what it read so
-    /// the operator can see gravity and the yaw rate's sign. It lands in that module's slot;
-    /// the bus board's mount is not touched, and motion stays off until enabled again.
+    const BNO: [f64; 4] = duck_control::trunk_imu::BNO08X_DEFAULT_MOUNT;
+
+    /// The upright half: under the mount being confirmed the trunk must read within 10° of
+    /// upright, with what it read echoed back — gravity, tilt and the yaw rate's sign.
     #[test]
-    fn verify_imu_for_a_module_checks_tilt_and_writes_its_own_slot() {
-        let path = temp_calibration("verify-module");
-        let mut calibration = Calibration::commissioning(JOINT_IDS);
-        calibration.motion_enabled = false;
-        let mount = duck_control::trunk_imu::BNO08X_DEFAULT_MOUNT;
-        let upright = ImuContext {
-            source: TrunkImuKind::Bno08x,
-            reading: Some(pitched_bno08x_reading(4.0)),
+    fn the_upright_check_holds_a_module_to_ten_degrees() {
+        // Sensor Y is trunk Z in the BNO08x default mount: a yaw rate.
+        let upright = upright_check(
+            TrunkImuKind::Bno08x,
+            BNO,
+            Some(reading(pitched(BNO, 4.0), [0.0, 0.3, 0.0])),
+        )
+        .unwrap();
+        assert_eq!(upright["imu_source"], "bno08x");
+        assert!(
+            (upright["tilt_deg"].as_f64().unwrap() - 4.0).abs() < 1e-9,
+            "{upright}"
+        );
+        assert!((upright["gyro_rad_s"][2].as_f64().unwrap() - 0.3).abs() < 1e-9);
+        let error = upright_check(
+            TrunkImuKind::Bno08x,
+            BNO,
+            Some(reading(pitched(BNO, 25.0), [0.0; 3])),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("25.0°") && error.contains("gravity"),
+            "{error}"
+        );
+        assert!(!error.contains("  "), "a broken line continuation: {error}");
+        let error =
+            upright_check(TrunkImuKind::Lsm6dsv16x, [1.0, 0.0, 0.0, 0.0], None).unwrap_err();
+        assert!(error.contains("live lsm6dsv16x sample"), "{error}");
+    }
+
+    /// The reviewer's probe. A breakout mounted as identity, confirmed under a mount a half or a
+    /// quarter turn off about the vertical: both read upright, so the upright check alone took
+    /// them — and then a 15° nose-down pitch read as tail-down, or as a roll, and the policy
+    /// would correct the wrong way. The nose-down tip refuses both, naming how the lean read;
+    /// the right mount reads it as +x, gravity ≈ [0.26, 0, -0.97].
+    #[test]
+    fn a_mount_a_quarter_or_half_turn_off_about_the_vertical_is_refused() {
+        let truth = [1.0, 0.0, 0.0, 0.0];
+        let upright = reading(truth, [0.0; 3]);
+        let nose_down_15 = reading(pitched(truth, 15.0), [0.0; 3]);
+        let half = std::f64::consts::FRAC_1_SQRT_2;
+        for (mount, says) in [
+            ([0.0, 0.0, 0.0, 1.0], "tail-down"),
+            ([half, 0.0, 0.0, half], "side going down"),
+            ([half, 0.0, 0.0, -half], "side going down"),
+        ] {
+            assert!(
+                upright_check(TrunkImuKind::Lsm6dsv16x, mount, Some(upright)).is_ok(),
+                "a yaw error reads upright: {mount:?}"
+            );
+            match nose_down(mount, nose_down_15) {
+                NoseDown::Wrong(message) => {
+                    assert!(message.contains(says), "{mount:?}: {message}");
+                    assert!(!message.contains("  "), "{message}");
+                }
+                other => panic!("{mount:?} accepted: {other:?}"),
+            }
+        }
+        match nose_down(truth, nose_down_15) {
+            NoseDown::Forward(echo) => {
+                let g = &echo["gravity"];
+                assert!((g[0].as_f64().unwrap() - 15f64.to_radians().sin()).abs() < 1e-9);
+                assert!(g[1].as_f64().unwrap().abs() < 1e-9);
+                assert!((g[2].as_f64().unwrap() + 15f64.to_radians().cos()).abs() < 1e-9);
+            }
+            other => panic!("the right mount refused: {other:?}"),
+        }
+        assert!(matches!(
+            nose_down(truth, reading(pitched(truth, 5.0), [0.0; 3])),
+            NoseDown::Level
+        ));
+    }
+
+    /// The wait: a verdict needs five tipped readings in a row (a jolt is not a lean), a read
+    /// that failed contributes nothing, and with no tip inside the window nothing is saved.
+    #[test]
+    fn verification_waits_for_a_held_tip_and_gives_up() {
+        let truth = [1.0, 0.0, 0.0, 0.0];
+        let now = Instant::now();
+        let pending = || {
+            let (reply, _receive) = oneshot::channel();
+            PendingVerify {
+                reply,
+                mount: truth,
+                upright: json!({}),
+                deadline: now + NOSE_DOWN_WINDOW,
+                tipped: 0,
+            }
         };
-        let (updated, status) = verify_imu(&calibration, &path, upright, mount).unwrap();
+        let level = reading(truth, [0.0; 3]);
+        let tipped = reading(pitched(truth, 20.0), [0.0; 3]);
+        let mut held = pending();
+        for _ in 0..4 {
+            assert!(held.observe(Some(tipped), now).is_none());
+        }
+        assert!(
+            held.observe(None, now).is_none(),
+            "a failed read is not a reading"
+        );
+        assert!(held.observe(Some(tipped), now).unwrap().is_ok());
+        let mut jolted = pending();
+        for _ in 0..3 {
+            jolted.observe(Some(tipped), now);
+        }
+        jolted.observe(Some(level), now);
+        for _ in 0..4 {
+            assert!(
+                jolted.observe(Some(tipped), now).is_none(),
+                "a jolt restarts the count"
+            );
+        }
+        let mut never = pending();
+        let error = never
+            .observe(Some(level), now + NOSE_DOWN_WINDOW)
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            error.contains("nothing saved") && !error.contains("  "),
+            "{error}"
+        );
+    }
+
+    /// A verified mount lands in that module's slot; the bus board's mount is not touched, and
+    /// motion stays off until enabled again.
+    #[test]
+    fn a_verified_module_mount_lands_in_its_own_slot() {
+        let path = temp_calibration("verify-module");
+        let calibration = Calibration::commissioning(JOINT_IDS);
+        let (updated, status) = save_verified(
+            &calibration,
+            &path,
+            TrunkImuKind::Bno08x,
+            BNO,
+            Some(json!({"checked": true})),
+        )
+        .unwrap();
         assert!(updated.imu_mount(TrunkImuKind::Bno08x).verified);
         assert!(
             !updated.imu_mount_verified,
             "the bus board's slot is untouched"
         );
         assert_eq!(updated.imu_mount_quat, calibration.imu_mount_quat);
-        let check = &status["imu_check"];
-        assert_eq!(check["imu_source"], "bno08x");
-        assert!(
-            (check["tilt_deg"].as_f64().unwrap() - 4.0).abs() < 1e-9,
-            "{check}"
-        );
-        assert!(
-            (check["gyro_rad_s"][2].as_f64().unwrap() - 0.3).abs() < 1e-9,
-            "yaw rate echoed"
-        );
+        assert!(!updated.motion_enabled);
+        assert_eq!(status["imu_check"]["checked"], true);
         assert_eq!(status["imu_source"], "bno08x");
         let saved: Calibration = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(saved.imu_mount(TrunkImuKind::Bno08x).verified);
-
-        let tilted = ImuContext {
-            source: TrunkImuKind::Bno08x,
-            reading: Some(pitched_bno08x_reading(25.0)),
-        };
-        let error = verify_imu(&calibration, &path, tilted, mount).unwrap_err();
-        assert!(
-            error.contains("25.0°") && error.contains("gravity"),
-            "{error}"
-        );
-        assert!(!error.contains("  "), "a broken line continuation: {error}");
-        let none = ImuContext {
-            source: TrunkImuKind::Lsm6dsv16x,
-            reading: None,
-        };
-        let error = verify_imu(&calibration, &path, none, [1.0, 0.0, 0.0, 0.0]).unwrap_err();
-        assert!(error.contains("live lsm6dsv16x sample"), "{error}");
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
@@ -1688,12 +1996,9 @@ mod tests {
     fn verify_imu_for_the_bus_board_is_unchanged() {
         let path = temp_calibration("verify-bus");
         let calibration = Calibration::commissioning(JOINT_IDS);
-        let bus = ImuContext {
-            source: TrunkImuKind::Bus,
-            reading: None,
-        };
         let mount = [0.0, 1.0, 0.0, 0.0];
-        let (updated, status) = verify_imu(&calibration, &path, bus, mount).unwrap();
+        let (updated, status) =
+            save_verified(&calibration, &path, TrunkImuKind::Bus, mount, None).unwrap();
         assert!(updated.imu_mount_verified);
         assert_eq!(updated.imu_mount_quat, mount);
         assert!(updated.imu_mounts.bno08x.is_none());
@@ -1703,9 +2008,11 @@ mod tests {
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
-    /// Commissioning with a module: ID 200 is neither identified nor read, every Sync Read is
-    /// the fifteen servos, the published IMU is the module's (source, age, epoch, accuracy,
-    /// tilt), and `verify-imu` run through the socket confirms the module's slot.
+    /// Commissioning with a module, end to end through the socket: ID 200 is neither
+    /// identified nor read, every Sync Read is the fifteen servos, and the published IMU is the
+    /// module's. `verify-imu` under a mount a half turn off about the vertical passes the
+    /// upright check, then refuses once the robot is tipped nose-down and saves nothing; under
+    /// the right mount the same tip verifies the module's slot.
     #[cfg(target_os = "linux")]
     #[test]
     fn commissioning_with_a_module_never_addresses_id_200() {
@@ -1714,23 +2021,25 @@ mod tests {
         use std::io::{Read, Write};
         use std::os::fd::FromRawFd;
 
-        struct UprightHost {
+        /// A breakout mounted as identity, holding whatever orientation the test sets.
+        struct Breakout {
             sequence: std::sync::atomic::AtomicU32,
+            quat: Arc<Mutex<[f64; 4]>>,
         }
-        impl HostImu for UprightHost {
+        impl HostImu for Breakout {
             fn kind(&self) -> TrunkImuKind {
-                TrunkImuKind::Bno08x
+                TrunkImuKind::Lsm6dsv16x
             }
             fn latest(&self) -> Option<duck_control::trunk_imu::HostImuSample> {
                 let now = Instant::now();
                 Some(duck_control::trunk_imu::HostImuSample {
-                    quat: duck_control::trunk_imu::BNO08X_DEFAULT_MOUNT,
+                    quat: *self.quat.lock().unwrap(),
                     gyro: [0.0; 3],
                     received_at: now,
                     sequence: self.sequence.fetch_add(1, Ordering::Relaxed) + 1,
                     epoch: 1,
                     epoch_started_at: now - Duration::from_secs(5),
-                    accuracy: Some(2),
+                    accuracy: None,
                 })
             }
             fn health(&self) -> duck_control::trunk_imu::HostImuHealth {
@@ -1812,6 +2121,8 @@ mod tests {
             }
         });
 
+        let truth = [1.0, 0.0, 0.0, 0.0];
+        let quat = Arc::new(Mutex::new(truth));
         let path = temp_calibration("commission-module");
         let state = Arc::new(RobotState::new(
             &crate::Params::default(),
@@ -1820,10 +2131,12 @@ mod tests {
             false,
         ));
         state.commissioning.store(true, Ordering::Relaxed);
-        let (control_state, control_path) = (Arc::clone(&state), path.clone());
+        let (control_state, control_path, control_quat) =
+            (Arc::clone(&state), path.clone(), Arc::clone(&quat));
         let control = std::thread::spawn(move || {
-            let host = UprightHost {
+            let host = Breakout {
                 sequence: std::sync::atomic::AtomicU32::new(0),
+                quat: control_quat,
             };
             tokio::runtime::Builder::new_current_thread()
                 .enable_time()
@@ -1838,41 +2151,86 @@ mod tests {
                     Some(&host),
                 ));
         });
-        let until = Instant::now() + Duration::from_secs(5);
-        let imu = loop {
-            assert!(Instant::now() < until, "{:?}", state.bus_status.load_full());
-            let sample = state
+        let snapshot = || {
+            state
                 .bus_snapshot
                 .load_full()
                 .and_then(|status| serde_json::to_value(status.as_ref()).ok())
-                .map(|status| status["last_sample"]["imu"].clone());
-            if let Some(imu) = sample.filter(|imu| imu["valid"] == true) {
-                break imu;
-            }
-            std::thread::sleep(Duration::from_millis(10));
+                .unwrap_or_default()
         };
-        assert_eq!(imu["source"], "bno08x");
+        let wait = |what: &str, done: &dyn Fn(&Value) -> bool| {
+            let until = Instant::now() + Duration::from_secs(5);
+            loop {
+                let status = snapshot();
+                if done(&status) {
+                    return status;
+                }
+                assert!(Instant::now() < until, "{what}: {status}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let imu = wait("a valid sample", &|s| {
+            s["last_sample"]["imu"]["valid"] == true
+        })["last_sample"]["imu"]
+            .clone();
+        assert_eq!(imu["source"], "lsm6dsv16x");
         assert!(imu.get("id").is_none(), "{imu}");
-        assert_eq!(imu["accuracy"], 2);
         assert!(imu["tilt_deg"].as_f64().unwrap() < 1e-6);
-        let reply = tokio::runtime::Runtime::new().unwrap().block_on(dispatch(
-            &state,
-            proto::Id::Number(1),
-            json!({"action":"verify-imu","confirmed":true}),
-        ));
-        let reply = serde_json::to_value(reply).unwrap();
-        assert_eq!(
-            reply["result"]["imu_check"]["imu_source"], "bno08x",
-            "{reply}"
+
+        let verify = |params: Value| {
+            let state = Arc::clone(&state);
+            std::thread::spawn(move || {
+                let reply = tokio::runtime::Runtime::new().unwrap().block_on(dispatch(
+                    &state,
+                    proto::Id::Number(1),
+                    params,
+                ));
+                serde_json::to_value(reply).unwrap()
+            })
+        };
+        // A half turn off about the vertical: upright passes, the nose-down tip refuses.
+        let wrong =
+            verify(json!({"action":"verify-imu","confirmed":true,"mount_wxyz":[0.0,0.0,0.0,1.0]}));
+        wait("the upright check", &|s| s["imu_verification"].is_string());
+        *quat.lock().unwrap() = pitched(truth, 15.0);
+        let reply = wrong.join().unwrap();
+        let error = reply["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(error.contains("tail-down"), "{reply}");
+        let saved: Calibration = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            !saved.imu_mount(TrunkImuKind::Lsm6dsv16x).verified,
+            "nothing saved"
         );
+
+        // The right mount, the same tip: verified.
+        *quat.lock().unwrap() = truth;
+        wait("upright again", &|s| {
+            s["last_sample"]["imu"]["tilt_deg"]
+                .as_f64()
+                .is_some_and(|t| t < 1.0)
+                && s["imu_verification"].is_null()
+        });
+        let right = verify(json!({"action":"verify-imu","confirmed":true}));
+        wait("the upright check", &|s| s["imu_verification"].is_string());
+        *quat.lock().unwrap() = pitched(truth, 15.0);
+        let reply = right.join().unwrap();
+        let nose = &reply["result"]["imu_check"]["nose_down"];
+        assert!(nose["gravity"][0].as_f64().unwrap() > 0.25, "{reply}");
         assert!(reply["result"]["motion_validation"].is_string());
         state.shutdown.store(true, Ordering::Relaxed);
         control.join().unwrap();
         stop.store(true, Ordering::Relaxed);
         device.join().unwrap();
         let saved: Calibration = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(saved.imu_mount(TrunkImuKind::Bno08x).verified);
-        assert!(!saved.imu_mount_verified);
+        assert!(saved.imu_mount(TrunkImuKind::Lsm6dsv16x).verified);
+        assert_eq!(saved.imu_mount(TrunkImuKind::Lsm6dsv16x).quat, truth);
+        assert!(
+            !saved.imu_mount_verified,
+            "the bus board's slot is untouched"
+        );
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }
