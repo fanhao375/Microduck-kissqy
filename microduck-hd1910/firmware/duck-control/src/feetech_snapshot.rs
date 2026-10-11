@@ -20,6 +20,8 @@ pub struct Metadata {
     pub motion_enabled: bool,
     pub calibration_complete: bool,
     pub imu_mount_verified: bool,
+    /// See [`crate::feetech::FeetechDiagnostics::imu_source`].
+    pub imu_source: &'static str,
     pub velocity_source: &'static str,
     pub velocity_rad_s_per_count: Option<f64>,
     pub current_available: bool,
@@ -117,6 +119,8 @@ pub struct Dynamic {
     pub imu_age_ms: Option<u16>,
     pub imu_age_upper_bound_ms: Option<u16>,
     pub imu_status: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub imu_reader: Option<crate::trunk_imu::HostImuHealth>,
     pub command_clamps_total: u64,
     pub partial_samples_total: u64,
     pub all_joints_fresh: bool,

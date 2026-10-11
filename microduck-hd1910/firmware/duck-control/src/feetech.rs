@@ -1,7 +1,8 @@
 //! Native Feetech TTL packets. No Dynamixel packets or address translation.
 //!
 //! HD1910 telemetry uses only the 15-byte feedback block at 56..=70.
-//! FT6 shares that 15-byte block length; all 16 devices use one Sync Read.
+//! FT6 shares that 15-byte block length; all 16 devices use one Sync Read. With the trunk
+//! IMU on the board's I2C instead ([`crate::trunk_imu`]) that Sync Read is the 15 servos alone.
 //! Full IMU age/sequence diagnostics remain at 124 and are not polled per tick.
 //! The verified bench surface also includes
 //! torque at 40, and the 6-byte position command at 42 (41 is preserved). Model-specific
@@ -14,10 +15,10 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::imu::SflpDecoder;
+use crate::imu::{SensorReading, SflpDecoder, TrunkFrame};
 use crate::io::{ImuStale, IoError, JointTargets, Result, RobotIo, Sensors, SlowSensors};
 use crate::model::{JOINT_NAMES, NUM_JOINTS};
-use crate::trunk_imu::TrunkImuKind;
+use crate::trunk_imu::{HostImu, HostImuGate, HostImuHealth, TrunkImuKind};
 
 pub const BAUD: u32 = 1_000_000;
 pub const IMU_ID: u8 = 200;
@@ -493,6 +494,20 @@ impl Bus {
         let mut ids = [IMU_ID; NUM_JOINTS + 1];
         ids[1..].copy_from_slice(servo_ids);
         self.sync_read(SYNC_ADDRESS, SYNC_LENGTH, &ids)
+    }
+
+    /// The fifteen joints alone, for a robot whose trunk IMU is not on the bus: ID 200 is
+    /// neither asked for nor expected. Strict — every servo answers or the sample fails. The
+    /// board's reply is the condition `telemetry_partial` accepts a short frame on, so without
+    /// it there is no short frame to accept; and on the bus a missing servo already costs the
+    /// whole 20 ms budget, which fails the board's IMU age anyway.
+    pub fn joint_telemetry(&mut self, servo_ids: &[u8]) -> Result<BTreeMap<u8, Vec<u8>>> {
+        if servo_ids.len() != NUM_JOINTS || servo_ids.contains(&IMU_ID) {
+            return Err(error(
+                "joint telemetry requires all 15 joints and no IMU 200",
+            ));
+        }
+        self.sync_read(SYNC_ADDRESS, SYNC_LENGTH, servo_ids)
     }
 
     fn telemetry_partial(&mut self, servo_ids: &[u8]) -> Result<BTreeMap<u8, Vec<u8>>> {
@@ -1176,6 +1191,12 @@ pub struct FeetechDiagnostics {
     pub imu_age_ms: Option<u16>,
     pub imu_age_upper_bound_ms: Option<u16>,
     pub imu_status: Option<u8>,
+    /// Which trunk IMU this is: a [`TrunkImuKind`] label. `imu_mount_verified`, `imu_ready`
+    /// and the `imu_*` figures above are that source's.
+    pub imu_source: &'static str,
+    /// A host-read IMU's reader, in its own words. Absent for the bus board.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub imu_reader: Option<HostImuHealth>,
     pub command_clamps_total: u64,
     pub partial_samples_total: u64,
     pub all_joints_fresh: bool,
@@ -1224,14 +1245,84 @@ struct JointFeedback {
     velocity: f64,
 }
 
+/// Where a [`FeetechIo`]'s trunk IMU comes from, and what it keeps to judge it.
+enum TrunkImu {
+    /// The FT6 board, ID 200, answering in the servos' own Sync Read. Exactly the state
+    /// `FeetechIo` kept before there was any other source.
+    Bus {
+        decoder: SflpDecoder,
+        last_sequence: Option<u32>,
+        stale: ImuStale,
+        latest_age_ms: Option<u16>,
+        latest_age_upper_bound_ms: Option<u16>,
+        latest_status: Option<u8>,
+    },
+    /// A module the host reads on a thread of its own; this side only takes its newest sample.
+    Host {
+        reader: Box<dyn HostImu>,
+        gate: HostImuGate,
+        frame: TrunkFrame,
+        /// Age of the last sample a tick accepted, as the bus board's age is.
+        latest_age_ms: Option<u16>,
+    },
+}
+
+impl TrunkImu {
+    fn kind(&self) -> TrunkImuKind {
+        match self {
+            Self::Bus { .. } => TrunkImuKind::Bus,
+            Self::Host { reader, .. } => reader.kind(),
+        }
+    }
+    fn ready(&self) -> bool {
+        match self {
+            Self::Bus { decoder, .. } => decoder.ready(),
+            Self::Host { frame, .. } => frame.ready(),
+        }
+    }
+    fn stale(&self) -> ImuStale {
+        match self {
+            Self::Bus { stale, .. } => *stale,
+            Self::Host { gate, .. } => gate.stale(),
+        }
+    }
+    fn sequence(&self) -> Option<u32> {
+        match self {
+            Self::Bus { last_sequence, .. } => *last_sequence,
+            Self::Host { gate, .. } => gate.sequence(),
+        }
+    }
+    /// Age, age bound and FT6 status of the last accepted sample. A host sample's age is
+    /// measured, so it is its own bound; it has no FT6 status byte.
+    fn latest(&self) -> (Option<u16>, Option<u16>, Option<u8>) {
+        match self {
+            Self::Bus {
+                latest_age_ms,
+                latest_age_upper_bound_ms,
+                latest_status,
+                ..
+            } => (*latest_age_ms, *latest_age_upper_bound_ms, *latest_status),
+            Self::Host { latest_age_ms, .. } => (*latest_age_ms, *latest_age_ms, None),
+        }
+    }
+    fn reader_health(&self) -> Option<HostImuHealth> {
+        match self {
+            Self::Bus { .. } => None,
+            Self::Host { reader, .. } => Some(reader.health()),
+        }
+    }
+}
+
 /// Official RobotIo with native FT6 reads and HD1910 position writes. Startup
 /// is read-only; an explicit bring-up enables motion.
+///
+/// The trunk IMU is the FT6 board on the same bus ([`Self::open`], [`Self::from_bus`]) or a
+/// module the host reads ([`Self::open_with_imu`], [`Self::from_bus_with_imu`]); which one
+/// is fixed when it opens.
 pub struct FeetechIo {
     pub bus: Bus,
     calibration: Calibration,
-    decoder: SflpDecoder,
-    last_sequence: Option<u32>,
-    stale: ImuStale,
+    imu: TrunkImu,
     latest_ready: bool,
     latest_slow: Option<SlowSensors>,
     latest_sample_at: Option<Instant>,
@@ -1242,9 +1333,6 @@ pub struct FeetechIo {
     latest_partial: bool,
     latest_native_positions: Option<[i32; NUM_JOINTS]>,
     latest_joints: Vec<FeetechJointDiagnostic>,
-    latest_imu_age_ms: Option<u16>,
-    latest_imu_age_upper_bound_ms: Option<u16>,
-    latest_imu_status: Option<u8>,
     torque_enabled: bool,
     command_enabled: bool,
     torque_state_confirmed: Option<bool>,
@@ -1260,6 +1348,15 @@ impl FeetechIo {
         calibration.validate()?;
         Self::from_bus(Bus::open(path)?, calibration)
     }
+    /// [`Self::open`], with the trunk IMU read by the host through `reader`.
+    pub fn open_with_imu(
+        path: &str,
+        calibration: Calibration,
+        reader: Box<dyn HostImu>,
+    ) -> Result<Self> {
+        calibration.validate()?;
+        Self::from_bus_with_imu(Bus::open(path)?, calibration, reader)
+    }
     pub fn from_bus(mut bus: Bus, calibration: Calibration) -> Result<Self> {
         calibration.validate()?;
         if bus.read(IMU_ID, 0, 5)? != IMU_IDENTITY {
@@ -1267,13 +1364,44 @@ impl FeetechIo {
                 "ID 200 requires FT6 firmware (06 00 00 00 f2); flash FT6 before enabling IMU",
             ));
         }
-        let decoder = SflpDecoder::new(calibration.imu_mount_quat);
+        let imu = TrunkImu::Bus {
+            decoder: SflpDecoder::new(calibration.imu_mount_quat),
+            last_sequence: None,
+            stale: ImuStale::default(),
+            latest_age_ms: None,
+            latest_age_upper_bound_ms: None,
+            latest_status: None,
+        };
+        Self::with_trunk_imu(bus, calibration, imu)
+    }
+    /// The servos on `bus`; the trunk IMU from `reader`, under that source's own mount. ID 200
+    /// is never addressed — not identified, not read — so a robot without the board needs
+    /// none, and one that still has it is left alone.
+    pub fn from_bus_with_imu(
+        bus: Bus,
+        calibration: Calibration,
+        reader: Box<dyn HostImu>,
+    ) -> Result<Self> {
+        calibration.validate()?;
+        let kind = reader.kind();
+        if kind == TrunkImuKind::Bus {
+            return Err(error(
+                "the bus IMU board is read in the servos' Sync Read, not through a host reader",
+            ));
+        }
+        let imu = TrunkImu::Host {
+            frame: TrunkFrame::new(calibration.imu_mount(kind).quat),
+            gate: HostImuGate::default(),
+            reader,
+            latest_age_ms: None,
+        };
+        Self::with_trunk_imu(bus, calibration, imu)
+    }
+    fn with_trunk_imu(bus: Bus, calibration: Calibration, imu: TrunkImu) -> Result<Self> {
         let mut io = Self {
             bus,
             calibration,
-            decoder,
-            last_sequence: None,
-            stale: ImuStale::default(),
+            imu,
             latest_ready: false,
             latest_slow: None,
             latest_sample_at: None,
@@ -1284,9 +1412,6 @@ impl FeetechIo {
             latest_partial: false,
             latest_native_positions: None,
             latest_joints: Vec::new(),
-            latest_imu_age_ms: None,
-            latest_imu_age_upper_bound_ms: None,
-            latest_imu_status: None,
             torque_enabled: false,
             command_enabled: false,
             torque_state_confirmed: None,
@@ -1352,7 +1477,9 @@ impl FeetechIo {
 
     fn read_sample(&mut self, allow_partial: bool) -> Result<Sensors> {
         let started = Instant::now();
-        let result = if allow_partial {
+        let result = if matches!(self.imu, TrunkImu::Host { .. }) {
+            self.bus.joint_telemetry(&self.ids())
+        } else if allow_partial {
             self.bus.telemetry_partial(&self.ids())
         } else {
             self.bus.telemetry(&self.ids())
@@ -1373,25 +1500,49 @@ impl FeetechIo {
             }
         }
         let mut blocks = result?;
-        let raw_imu = ImuSample::decode(
-            &blocks
-                .remove(&IMU_ID)
-                .ok_or_else(|| error("Feetech Sync Read omitted IMU ID 200"))?,
-        )?;
-        if self.last_sequence == Some(raw_imu.sequence) {
-            self.stale.total = self.stale.total.saturating_add(1);
-            self.stale.run = self.stale.run.saturating_add(1);
-        } else {
-            self.stale.run = 0;
-        }
-        self.last_sequence = Some(raw_imu.sequence);
-        if !raw_imu.is_fresh(self.bus.last_sync.elapsed_us) || self.stale.run >= 3 {
-            return Err(error(
-                "Feetech IMU not ready or stale (>50 ms / 3 repeated reads)",
-            ));
-        }
+        let (imu, raw_imu, host_age) = match &mut self.imu {
+            TrunkImu::Bus {
+                decoder,
+                last_sequence,
+                stale,
+                ..
+            } => {
+                let raw_imu = ImuSample::decode(
+                    &blocks
+                        .remove(&IMU_ID)
+                        .ok_or_else(|| error("Feetech Sync Read omitted IMU ID 200"))?,
+                )?;
+                if *last_sequence == Some(raw_imu.sequence) {
+                    stale.total = stale.total.saturating_add(1);
+                    stale.run = stale.run.saturating_add(1);
+                } else {
+                    stale.run = 0;
+                }
+                *last_sequence = Some(raw_imu.sequence);
+                if !raw_imu.is_fresh(self.bus.last_sync.elapsed_us) || stale.run >= 3 {
+                    return Err(error(
+                        "Feetech IMU not ready or stale (>50 ms / 3 repeated reads)",
+                    ));
+                }
+                (decoder.decode(&raw_imu.block), Some(raw_imu), None)
+            }
+            // Taken after the servos' transaction, so it is as fresh as this tick can have.
+            TrunkImu::Host {
+                reader,
+                gate,
+                frame,
+                ..
+            } => {
+                let sample = gate.check(reader.latest(), Instant::now())?;
+                let reading = SensorReading {
+                    gyro: sample.gyro,
+                    quat: Some(sample.quat),
+                };
+                (frame.push(reading), None, gate.last_age())
+            }
+        };
         let mut out = Sensors {
-            imu: self.decoder.decode(&raw_imu.block),
+            imu,
             ..Sensors::default()
         };
         let mut fresh = [false; NUM_JOINTS];
@@ -1477,7 +1628,9 @@ impl FeetechIo {
         if !blocks.is_empty() {
             return Err(error("unexpected Feetech Sync Read reply IDs"));
         }
-        if !raw_imu.is_fresh(started.elapsed().as_micros() as u64) {
+        if let Some(raw_imu) = &raw_imu
+            && !raw_imu.is_fresh(started.elapsed().as_micros() as u64)
+        {
             return Err(error(
                 "Feetech telemetry cycle too slow; IMU sample now older than 50 ms",
             ));
@@ -1503,9 +1656,23 @@ impl FeetechIo {
         self.latest_sample_at = Some(started); // current IMU/control sample, not every joint
         self.latest_native_positions = Some(raws);
         self.latest_joints = joints;
-        self.latest_imu_age_ms = raw_imu.age_ms;
-        self.latest_imu_age_upper_bound_ms = raw_imu.age_upper_bound_ms;
-        self.latest_imu_status = Some(raw_imu.status);
+        match &mut self.imu {
+            TrunkImu::Bus {
+                latest_age_ms,
+                latest_age_upper_bound_ms,
+                latest_status,
+                ..
+            } => {
+                if let Some(raw_imu) = raw_imu {
+                    *latest_age_ms = raw_imu.age_ms;
+                    *latest_age_upper_bound_ms = raw_imu.age_upper_bound_ms;
+                    *latest_status = Some(raw_imu.status);
+                }
+            }
+            TrunkImu::Host { latest_age_ms, .. } => {
+                *latest_age_ms = host_age.map(|age| age.as_millis().min(u16::MAX.into()) as u16);
+            }
+        }
         self.latest_slow = Some(SlowSensors {
             volts: volts / NUM_JOINTS as f64,
             temps_c: temps,
@@ -1589,7 +1756,7 @@ impl RobotIo for FeetechIo {
         let ids = self.ids();
         let previously_off = self.torque_state_confirmed == Some(false);
         if on {
-            self.calibration.validate_motion()?;
+            self.calibration.validate_motion_for(self.imu.kind())?;
             self.require_fresh_sample()?;
             if !self.imu_ready() {
                 return Err(error("Feetech torque-on requires a fresh converged IMU"));
@@ -1663,10 +1830,10 @@ impl RobotIo for FeetechIo {
             .ok_or_else(|| error("no completed Feetech Sync Read sample yet"))
     }
     fn imu_stale(&self) -> ImuStale {
-        self.stale
+        self.imu.stale()
     }
     fn imu_ready(&self) -> bool {
-        self.latest_ready && self.decoder.ready()
+        self.latest_ready && self.imu.ready()
     }
     fn feetech_control_status(&self) -> Option<FeetechControlStatus> {
         let now = Instant::now();
@@ -1678,7 +1845,7 @@ impl RobotIo for FeetechIo {
                             .as_ref()
                             .is_some_and(|old| Some(old.at) == self.latest_sample_at)
                 }),
-            imu_mount_verified: self.calibration.imu_mount_verified,
+            imu_mount_verified: self.calibration.imu_mount(self.imu.kind()).verified,
             imu_ready: self.imu_ready(),
             torque_state_confirmed: self.torque_state_confirmed,
             joints_held: (0..self.latest_joints.len()).any(|i| self.joint_holding(i, now)),
@@ -1706,12 +1873,13 @@ impl RobotIo for FeetechIo {
                 diagnostic.read_recovery = "coasting";
             }
         }
+        let (imu_age_ms, imu_age_upper_bound_ms, imu_status) = self.imu.latest();
         Some(FeetechDiagnostics {
             backend: "feetech_ft6",
             read_timing_revision: READ_TIMING_REVISION,
             motion_enabled: self.calibration.motion_enabled,
             calibration_complete: self.calibration.joints.iter().all(|j| j.calibrated),
-            imu_mount_verified: self.calibration.imu_mount_verified,
+            imu_mount_verified: self.calibration.imu_mount(self.imu.kind()).verified,
             torque_enabled: self.torque_enabled,
             torque_state_confirmed: self.torque_state_confirmed,
             gain_mode: if self.hd1910.test_parameters.is_some() {
@@ -1726,10 +1894,12 @@ impl RobotIo for FeetechIo {
                 .latest_sample_at
                 .map(|time| time.elapsed().as_millis() as u64),
             imu_ready: self.imu_ready(),
-            imu_sequence: self.last_sequence,
-            imu_age_ms: self.latest_imu_age_ms,
-            imu_age_upper_bound_ms: self.latest_imu_age_upper_bound_ms,
-            imu_status: self.latest_imu_status,
+            imu_sequence: self.imu.sequence(),
+            imu_age_ms,
+            imu_age_upper_bound_ms,
+            imu_status,
+            imu_source: self.imu.kind().label(),
+            imu_reader: self.imu.reader_health(),
             command_clamps_total: self.command_clamps_total,
             partial_samples_total: self.partial_samples_total,
             all_joints_fresh: stale_joint_ids.is_empty() && !joints.is_empty(),
@@ -1756,7 +1926,8 @@ impl RobotIo for FeetechIo {
                     read_timing_revision: READ_TIMING_REVISION,
                     motion_enabled: self.calibration.motion_enabled,
                     calibration_complete: self.calibration.joints.iter().all(|j| j.calibrated),
-                    imu_mount_verified: self.calibration.imu_mount_verified,
+                    imu_mount_verified: self.calibration.imu_mount(self.imu.kind()).verified,
+                    imu_source: self.imu.kind().label(),
                     velocity_source: crate::hd1910::VELOCITY_SOURCE,
                     velocity_rad_s_per_count: self.calibration.feedback_speed_scale(),
                     current_available: self.calibration.units_verified,
@@ -1817,6 +1988,7 @@ impl RobotIo for FeetechIo {
             joints.len += 1;
         }
         let hd1910 = self.hd1910.diagnostics();
+        let (imu_age_ms, imu_age_upper_bound_ms, imu_status) = self.imu.latest();
         Some(snapshot::Snapshot {
             metadata: metadata.clone(),
             dynamic: snapshot::Dynamic {
@@ -1831,10 +2003,11 @@ impl RobotIo for FeetechIo {
                     .latest_sample_at
                     .map(|at| now.saturating_duration_since(at).as_millis() as u64),
                 imu_ready: self.imu_ready(),
-                imu_sequence: self.last_sequence,
-                imu_age_ms: self.latest_imu_age_ms,
-                imu_age_upper_bound_ms: self.latest_imu_age_upper_bound_ms,
-                imu_status: self.latest_imu_status,
+                imu_sequence: self.imu.sequence(),
+                imu_age_ms,
+                imu_age_upper_bound_ms,
+                imu_status,
+                imu_reader: self.imu.reader_health(),
                 command_clamps_total: self.command_clamps_total,
                 partial_samples_total: self.partial_samples_total,
                 all_joints_fresh: stale_joint_ids.len == 0 && joints.len != 0,
@@ -2703,11 +2876,14 @@ mod hd1910_transport_tests {
         status_id: Option<u8>,
         imu_stale: bool,
     }
+    type Requests = Arc<Mutex<Vec<(u8, u8, Vec<u8>)>>>;
     struct Emulator {
         faults: Arc<Mutex<Faults>>,
         done: Arc<AtomicBool>,
         regs: Arc<Mutex<Vec<[u8; 96]>>>,
         writes: Arc<Mutex<Vec<(u8, u8, Vec<u8>)>>>,
+        /// Every request that is not a write: instruction, address, the IDs it addressed.
+        requests: Requests,
         thread: Option<std::thread::JoinHandle<()>>,
     }
     impl Drop for Emulator {
@@ -2738,7 +2914,8 @@ mod hd1910_transport_tests {
         let fault_source = faults.clone();
         let done = Arc::new(AtomicBool::new(false));
         let writes = Arc::new(Mutex::new(Vec::new()));
-        let (d, r, w) = (done.clone(), regs.clone(), writes.clone());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (d, r, w, q) = (done.clone(), regs.clone(), writes.clone(), requests.clone());
         let thread = std::thread::spawn(move || {
             let mut seq = 0u8;
             while !d.load(Ordering::Relaxed) {
@@ -2770,6 +2947,7 @@ mod hd1910_transport_tests {
                 } else {
                     vec![header[2]]
                 };
+                q.lock().unwrap().push((body[0], addr, ids.clone()));
                 seq = seq.wrapping_add(1);
                 let mut replies = Vec::new();
                 let fault = fault_source.lock().unwrap().clone();
@@ -2818,6 +2996,7 @@ mod hd1910_transport_tests {
                 done,
                 regs,
                 writes,
+                requests,
                 thread: Some(thread),
             },
         )
@@ -2832,6 +3011,216 @@ mod hd1910_transport_tests {
         c.motion_enabled = true;
         c.imu_mount_verified = true;
         c
+    }
+
+    /// A module read by the host that always has a fresh, settled sample: a new sequence on
+    /// every look, stamped now, in an epoch that began long ago, held upright in its default
+    /// mount. `stalled` freezes it: same sequence, 200 ms old.
+    struct FreshHost {
+        kind: TrunkImuKind,
+        sequence: std::sync::atomic::AtomicU32,
+        stalled: Arc<AtomicBool>,
+    }
+    impl FreshHost {
+        fn new(kind: TrunkImuKind) -> Self {
+            Self {
+                kind,
+                sequence: std::sync::atomic::AtomicU32::new(0),
+                stalled: Arc::new(AtomicBool::new(false)),
+            }
+        }
+    }
+    impl HostImu for FreshHost {
+        fn kind(&self) -> TrunkImuKind {
+            self.kind
+        }
+        fn latest(&self) -> Option<crate::trunk_imu::HostImuSample> {
+            let now = Instant::now();
+            let stalled = self.stalled.load(Ordering::Relaxed);
+            let sequence = if stalled {
+                self.sequence.load(Ordering::Relaxed)
+            } else {
+                self.sequence.fetch_add(1, Ordering::Relaxed) + 1
+            };
+            Some(crate::trunk_imu::HostImuSample {
+                quat: self.kind.default_mount(),
+                gyro: [0.0; 3],
+                received_at: if stalled {
+                    now - Duration::from_millis(200)
+                } else {
+                    now
+                },
+                sequence,
+                epoch: 1,
+                epoch_started_at: now - Duration::from_secs(5),
+            })
+        }
+        fn health(&self) -> HostImuHealth {
+            HostImuHealth {
+                state: "streaming",
+                epoch: 1,
+                samples: u64::from(self.sequence.load(Ordering::Relaxed)),
+                ..HostImuHealth::default()
+            }
+        }
+    }
+    /// [`calibration`], with `kind`'s own mount commissioned as well as the board's.
+    fn calibration_for(kind: TrunkImuKind) -> Calibration {
+        let mut c = calibration();
+        c.set_imu_mount(
+            kind,
+            ImuMount {
+                quat: kind.default_mount(),
+                verified: true,
+            },
+        );
+        c
+    }
+
+    /// A module source puts nothing on the bus but the servos. Every request is a Sync Read of
+    /// exactly the fifteen joints — telemetry, the torque checks, the HD1910 register
+    /// inspection — and ID 200 is never addressed, not even to identify it, so a robot without
+    /// the board works. The module's samples go through the same frame and ready gate as the
+    /// board's, and motion comes up on it like on the board.
+    #[test]
+    fn a_host_imu_puts_only_the_fifteen_servos_on_the_bus() {
+        for kind in [TrunkImuKind::Bno08x, TrunkImuKind::Lsm6dsv16x] {
+            let (bus, device) = emulator(false);
+            let mut io = FeetechIo::from_bus_with_imu(
+                bus,
+                calibration_for(kind),
+                Box::new(FreshHost::new(kind)),
+            )
+            .unwrap();
+            for _ in 0..24 {
+                io.read().unwrap();
+            }
+            assert!(!io.imu_ready(), "24 samples is not converged");
+            let sensors = io.read().unwrap();
+            assert!(io.imu_ready());
+            let g = sensors.imu.gravity;
+            assert!(
+                g[0].abs() < 1e-12 && g[1].abs() < 1e-12 && (g[2] + 1.0).abs() < 1e-12,
+                "upright in its own mount reads upright: {g:?}"
+            );
+            io.set_torque(true).unwrap();
+            io.write(&JointTargets::new(crate::model::DEFAULT_POSITION))
+                .unwrap();
+            io.read().unwrap();
+            io.set_torque(false).unwrap();
+
+            let requests = device.requests.lock().unwrap().clone();
+            assert!(
+                requests
+                    .iter()
+                    .any(|(_, address, _)| *address == SYNC_ADDRESS)
+            );
+            for (instruction, address, ids) in &requests {
+                assert_eq!(*instruction, SYNC_READ, "{kind:?}: request at {address}");
+                assert_eq!(
+                    ids,
+                    &crate::model::JOINT_IDS.to_vec(),
+                    "{kind:?}: {address}"
+                );
+            }
+            assert!(
+                device
+                    .writes
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|(id, _, _)| *id != IMU_ID)
+            );
+
+            let diagnostics = io.feetech_diagnostics().unwrap();
+            assert_eq!(diagnostics.imu_source, kind.label());
+            assert!(diagnostics.imu_mount_verified);
+            assert_eq!(diagnostics.imu_status, None);
+            assert_eq!(diagnostics.telemetry.failed_reads, 0);
+            assert_eq!(diagnostics.partial_samples_total, 0);
+            let wire = serde_json::to_value(&diagnostics).unwrap();
+            assert_eq!(wire["imu_source"], kind.label());
+            assert_eq!(wire["imu_reader"]["state"], "streaming");
+            let snapshot = io.feetech_snapshot().unwrap();
+            assert_eq!(snapshot.metadata.imu_source, kind.label());
+            assert_eq!(
+                snapshot.dynamic.imu_reader.unwrap().state,
+                "streaming",
+                "the reporter sees the reader too"
+            );
+        }
+    }
+
+    /// With the board, a missing servo still leaves a frame the control loop could coast on
+    /// (`telemetry_partial`) — in practice it waits out the 20 ms and fails the board's age.
+    /// With a module there is no board reply to accept a short frame on: the whole sample
+    /// fails, the missing ID is counted against that servo, nothing is retimestamped, and
+    /// torque cannot come on over it.
+    #[test]
+    fn a_host_imu_sample_fails_whole_when_one_servo_is_missing() {
+        let (bus, device) = emulator(false);
+        let mut io = FeetechIo::from_bus_with_imu(
+            bus,
+            calibration_for(TrunkImuKind::Bno08x),
+            Box::new(FreshHost::new(TrunkImuKind::Bno08x)),
+        )
+        .unwrap();
+        for _ in 0..30 {
+            io.read().unwrap();
+        }
+        device.faults.lock().unwrap().missing = vec![22];
+        let before = io.latest_sample_at;
+        let error = io.read().unwrap_err().to_string();
+        assert!(error.contains("missing IDs [22]"), "{error}");
+        assert_eq!(io.latest_sample_at, before);
+        let diagnostics = io.feetech_diagnostics().unwrap();
+        assert_eq!(diagnostics.sync.missing_ids, vec![22]);
+        assert_eq!(diagnostics.telemetry.missing_by_id[&22], 1);
+        assert_eq!(diagnostics.partial_samples_total, 0);
+        assert!(io.set_torque(true).is_err());
+        device.faults.lock().unwrap().missing.clear();
+        io.read().unwrap();
+        assert!(io.latest_sample_at > before);
+    }
+
+    /// A reader that stops refreshing is refused with the board's own words, and the tick's
+    /// data is not retimestamped. Motion on a module needs that module's mount: the board's
+    /// verified mount, which this calibration has, does not stand in for it.
+    #[test]
+    fn a_stalled_host_imu_is_refused_and_motion_needs_its_own_mount() {
+        let (bus, _device) = emulator(false);
+        let host = FreshHost::new(TrunkImuKind::Bno08x);
+        let stalled = host.stalled.clone();
+        let mut io = FeetechIo::from_bus_with_imu(bus, calibration(), Box::new(host)).unwrap();
+        for _ in 0..30 {
+            io.read().unwrap();
+        }
+        let error = io.set_torque(true).unwrap_err().to_string();
+        assert!(error.contains("bno08x"), "{error}");
+        assert!(!io.feetech_diagnostics().unwrap().imu_mount_verified);
+
+        stalled.store(true, Ordering::Relaxed);
+        let before = io.latest_sample_at;
+        let error = io.read().unwrap_err().to_string();
+        assert!(error.contains("Feetech IMU not ready or stale"), "{error}");
+        assert_eq!(io.latest_sample_at, before);
+        assert!(io.imu_ready(), "a stale tick is not a convergence reset");
+    }
+
+    /// The board is read in the servos' Sync Read; handing it in as a host reader would skip
+    /// its identity check and read nothing.
+    #[test]
+    fn the_bus_board_cannot_be_a_host_reader() {
+        let (bus, _device) = emulator(false);
+        let error = FeetechIo::from_bus_with_imu(
+            bus,
+            calibration(),
+            Box::new(FreshHost::new(TrunkImuKind::Bus)),
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(error.contains("host reader"), "{error}");
     }
 
     #[test]

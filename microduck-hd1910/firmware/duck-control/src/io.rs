@@ -6,7 +6,9 @@
 //! [`Sensors`] carries joints *and* IMU together because that is what the hardware does:
 //! the IMU board sits on the same physical bus. The Dynamixel backend combines its reads;
 //! the native Feetech backend reads the custom IMU and all HD1910s in one native 0x82
-//! transaction. Feetech motion can retain missing servo feedback individually;
+//! transaction — or, with the trunk IMU on the board's I2C, the HD1910s alone and the IMU's
+//! newest sample from a host thread ([`crate::trunk_imu`]). Feetech motion can retain missing
+//! servo feedback individually;
 //! its native diagnostics carry each joint's actual age and recovery state.
 //! The IMU is still required for every accepted control sample.
 
