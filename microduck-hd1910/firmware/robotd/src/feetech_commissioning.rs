@@ -2016,9 +2016,9 @@ mod tests {
     /// Commissioning with a module, end to end through the socket: ID 200 is neither
     /// identified nor read, every Sync Read is the fifteen servos, and the published IMU is the
     /// module's. `verify-imu` under a mount a half turn off about the vertical passes the
-    /// upright check, then refuses once the robot is tipped nose-down and saves nothing; one
-    /// whose requester gave up saves nothing either; under the right mount the same tip
-    /// verifies the module's slot.
+    /// upright check, then refuses once the robot is tipped nose-down and saves nothing; while
+    /// one waits other commands are refused and relax cancels it; one whose requester gave up
+    /// saves nothing either; under the right mount the same tip verifies the module's slot.
     #[cfg(target_os = "linux")]
     #[test]
     fn commissioning_with_a_module_never_addresses_id_200() {
@@ -2216,6 +2216,31 @@ mod tests {
                 .is_some_and(|t| t < 1.0)
                 && s["imu_verification"].is_null()
         };
+
+        // While it waits, other commands are refused (a capture or a move would run with the
+        // operator holding the robot tipped), and relax cancels it with nothing saved.
+        *quat.lock().unwrap() = truth;
+        wait("upright again", &upright_again);
+        let relaxed = verify(json!({"action":"verify-imu","confirmed":true}));
+        wait("the upright check", &|s| s["imu_verification"].is_string());
+        let refused = verify(json!({"action":"verify-imu","confirmed":true}))
+            .join()
+            .unwrap();
+        assert!(
+            refused["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("waiting for the nose-down tip")),
+            "{refused}"
+        );
+        let relax = verify(json!({"action":"relax"})).join().unwrap();
+        assert!(relax["result"].is_object(), "{relax}");
+        let reply = relaxed.join().unwrap();
+        assert!(
+            reply["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("cancelled by relax")),
+            "{reply}"
+        );
 
         // The right mount, but the requester gives up before the tip (as an RPC that timed out
         // does): the tip saves nothing, or a mount would be verified with nobody told.
