@@ -6,7 +6,7 @@
 //!   servos' own Sync Read and [`crate::feetech`] judges its freshness from the board's status.
 //! - [`TrunkImuKind::Bno08x`]: a BNO085/BNO086 module on the board's own I²C. Something outside
 //!   this crate (robotd's reader thread, Linux only) owns the device, speaks SH-2 to it with
-//!   the `bno08x` codec, and publishes the newest [`HostImuSample`] behind [`HostImu`]. The
+//!   the [`crate::bno08x`] codec, and publishes the newest [`HostImuSample`] behind [`HostImu`]. The
 //!   control thread takes one per tick and [`HostImuGate`] decides whether it is fit to use.
 //!
 //! Both end in the same [`crate::imu::TrunkFrame`], so the policy cannot tell them apart

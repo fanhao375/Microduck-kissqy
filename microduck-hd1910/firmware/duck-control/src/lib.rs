@@ -7,6 +7,7 @@
 //! The control path it holds — model, bus, [`io::RobotIo`], observations, policy, safety — is
 //! designed in `docs/design/robotd-design.md` §2.
 
+pub mod bno08x;
 pub mod bus;
 pub mod fall;
 pub mod feetech;
