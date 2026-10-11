@@ -64,6 +64,7 @@ pub const DEFAULT_PATH: &str = "/etc/robot/robotd.toml";
 #[serde(deny_unknown_fields, default)]
 pub struct Params {
     pub bus: Bus,
+    pub trunk_imu: TrunkImuParams,
     pub control: Control,
     pub update_gate: UpdateGate,
     pub policy: PolicyParams,
@@ -1921,6 +1922,76 @@ impl Default for Bus {
     }
 }
 
+/// Where the trunk IMU is wired. Chosen, never probed: a robot whose bus board stopped
+/// answering must fail as a bus fault, not quietly start trusting whatever else is on I²C.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TrunkImuSource {
+    /// The FT6 / `imu_to_dxl` board, ID 200 on the servo bus, read in the servos' own Sync
+    /// Read. What the kit ships, and what every robot ran before this setting existed.
+    #[default]
+    Bus,
+    /// A BNO085/BNO086 module on the board's I²C, read by a thread of its own.
+    Bno08x,
+}
+
+/// `[trunk_imu]`: which sensor the policy's gyro and gravity come from.
+///
+/// A section of its own rather than more `[bus]` keys, because the second source is precisely
+/// the one that is *not* on the bus. Only the Feetech backend can read a module source;
+/// [`Params::load`] refuses the pairing it cannot run rather than letting the daemon find out
+/// at the first tick.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct TrunkImuParams {
+    pub source: TrunkImuSource,
+    /// The i2c-dev node a module source is read through. `/dev/i2c-4` is the Zero 3W header's
+    /// I²C once the `i2c4` overlay is enabled.
+    pub i2c_device: String,
+    /// 7-bit address. A BNO08x answers at 0x4B with its address pin high, 0x4A with it low.
+    pub i2c_address: u8,
+}
+
+impl Default for TrunkImuParams {
+    fn default() -> Self {
+        Self {
+            source: TrunkImuSource::Bus,
+            i2c_device: "/dev/i2c-4".into(),
+            i2c_address: 0x4B,
+        }
+    }
+}
+
+/// The two addresses a BNO08x can be strapped to.
+pub const BNO08X_ADDRESSES: [u8; 2] = [0x4A, 0x4B];
+
+impl TrunkImuParams {
+    /// Why this section cannot run with this bus, if it cannot. `None` for a bus source
+    /// whatever the I²C keys say: they are inert there, and an inert key does not stop a robot.
+    fn problem(&self, protocol: BusProtocol) -> Option<String> {
+        if self.source == TrunkImuSource::Bus {
+            return None;
+        }
+        if protocol != BusProtocol::Feetech {
+            return Some(
+                "a module source needs bus.protocol = \"feetech\"; the Dynamixel backend reads \
+                 its IMU from the bus only"
+                    .to_owned(),
+            );
+        }
+        if self.i2c_device.trim().is_empty() {
+            return Some("i2c_device is empty".to_owned());
+        }
+        if self.source == TrunkImuSource::Bno08x && !BNO08X_ADDRESSES.contains(&self.i2c_address) {
+            return Some(format!(
+                "a BNO08x answers at 0x4A or 0x4B, not {:#04X}",
+                self.i2c_address
+            ));
+        }
+        None
+    }
+}
+
 impl Default for Control {
     fn default() -> Self {
         Self {
@@ -1973,6 +2044,8 @@ pub enum ParamsError {
         min: u32,
         max: u32,
     },
+    #[error("{path}: trunk_imu: {reason}")]
+    TrunkImu { path: String, reason: String },
 }
 
 /// The band `media.bitrate` is accepted in, bits per second.
@@ -2059,6 +2132,14 @@ impl Params {
                 got: bitrate,
                 min: BITRATE_MIN,
                 max: BITRATE_MAX,
+            });
+        }
+        // Here rather than as serde constraints because the rule spans two sections, and
+        // because this is the gate `robotctl configure` saves through.
+        if let Some(reason) = self.trunk_imu.problem(self.bus.protocol) {
+            return Err(ParamsError::TrunkImu {
+                path: path.display().to_string(),
+                reason,
             });
         }
         Ok(())
@@ -3427,6 +3508,90 @@ mod tests {
             let path = write(dir.path(), &format!("[control]\nhz = {hz}\n"));
             assert!(Params::load(&path, true).is_err(), "hz = {hz} was accepted");
         }
+    }
+
+    /// Every robot built before `[trunk_imu]` existed has no such section, and must go on
+    /// reading the bus board — the module source is opt-in, never a guess.
+    #[test]
+    fn a_robot_without_the_section_reads_the_bus_board() {
+        let p: Params = toml::from_str("").unwrap();
+        assert_eq!(p.trunk_imu.source, TrunkImuSource::Bus);
+        assert_eq!(p.trunk_imu.i2c_device, "/dev/i2c-4");
+        assert_eq!(p.trunk_imu.i2c_address, 0x4B);
+        let p: Params =
+            toml::from_str("[trunk_imu]\nsource = \"bno08x\"\ni2c_address = 0x4A\n").unwrap();
+        assert_eq!(p.trunk_imu.source, TrunkImuSource::Bno08x);
+        assert_eq!(
+            p.trunk_imu.i2c_address, 0x4A,
+            "hex is how the strap is written"
+        );
+    }
+
+    /// Only the Feetech backend can read a module. Refused at load, which is also the gate the
+    /// editor saves through, so the pairing never reaches a robot as a daemon that starts and
+    /// then has no IMU.
+    #[test]
+    fn a_module_source_needs_the_feetech_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "[trunk_imu]\nsource = \"bno08x\"\n");
+        let err = Params::load(&path, true).unwrap_err().to_string();
+        assert!(
+            err.contains("trunk_imu") && err.contains("feetech"),
+            "{err}"
+        );
+
+        let path = write(
+            dir.path(),
+            "[bus]\nprotocol = \"feetech\"\n\n[trunk_imu]\nsource = \"bno08x\"\n",
+        );
+        assert_eq!(
+            Params::load(&path, true).unwrap().trunk_imu.source,
+            TrunkImuSource::Bno08x
+        );
+    }
+
+    /// A BNO08x has two strap addresses. Anything else is another chip or a typo, and opening
+    /// it would read garbage as orientation; an empty device is a path that cannot open.
+    #[test]
+    fn a_bno08x_is_read_at_one_of_its_two_addresses() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = |address: &str, device: &str| {
+            write(
+                dir.path(),
+                &format!(
+                    "[bus]\nprotocol = \"feetech\"\n\n[trunk_imu]\nsource = \"bno08x\"\n\
+                     i2c_device = \"{device}\"\ni2c_address = {address}\n"
+                ),
+            )
+        };
+        for address in ["0x4A", "0x4B"] {
+            assert!(Params::load(&file(address, "/dev/i2c-4"), true).is_ok());
+        }
+        for address in ["0x28", "0"] {
+            let err = Params::load(&file(address, "/dev/i2c-4"), true)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("0x4A or 0x4B"), "{address}: {err}");
+        }
+        let err = Params::load(&file("0x4B", " "), true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("i2c_device"), "{err}");
+    }
+
+    /// The I²C keys mean nothing to a bus robot, and an inert key does not stop one — the same
+    /// rule as an unknown section (see [`without_unknown_keys`]).
+    #[test]
+    fn the_i2c_keys_do_not_stop_a_bus_robot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            "[trunk_imu]\nsource = \"bus\"\ni2c_device = \"\"\ni2c_address = 0x28\n",
+        );
+        assert_eq!(
+            Params::load(&path, true).unwrap().trunk_imu.source,
+            TrunkImuSource::Bus
+        );
     }
 }
 
