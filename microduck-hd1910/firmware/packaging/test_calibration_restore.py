@@ -115,6 +115,33 @@ class CalibrationTests(unittest.TestCase):
         restore.saved_path(self.path).unlink();self.write(template)
         self.assertNotIn('imu_mounts',restore.prepare_calibration(self.path,self.base))
 
+    def test_a_module_robot_never_gets_a_bus_mount_it_did_not_verify(self):
+        # The snapshot's mount is a bus board's. Backfilling it as verified on a module robot
+        # would let motion run on a never-checked board the day the source goes back to bus.
+        data=copy.deepcopy(self.seed);data['imu_mount_verified']=False;data['imu_mount_quat']=[1.,0.,0.,0.]
+        data['imu_mounts']={'bno08x':{'quat':[.5,.5,.5,.5],'verified':True}};data['motion_enabled']=True
+        self.write(data)
+        result=restore.prepare_calibration(self.path,self.base,'bno08x')
+        self.assertFalse(result['imu_mount_verified'])
+        self.assertEqual(result['imu_mount_quat'],[1.,0.,0.,0.])
+        self.assertTrue(result['motion_enabled'],'the wired mount is verified; nothing to stop')
+        data['imu_mounts']['bno08x']['verified']=False;self.write(data)
+        self.assertFalse(restore.prepare_calibration(self.path,self.base,'bno08x')['motion_enabled'])
+        # The same file on a bus robot is still restored from the snapshot, as before.
+        self.assertTrue(restore.prepare_calibration(self.path,self.base)['imu_mount_verified'])
+
+    def test_prepare_reads_the_source_from_the_staged_params(self):
+        profile=tomllib.loads((ROOT/'robotd-profile.toml').read_text())
+        profile['trunk_imu']={'source':'lsm6dsv16x','i2c_address':0x6A}
+        params=self.base/'robotd.toml';params.write_text(dumps(profile))
+        data=copy.deepcopy(self.seed);data['imu_mount_verified']=False
+        data['imu_mounts']={'lsm6dsv16x':{'quat':[1.,0.,0.,0.],'verified':True}};self.write(data)
+        staged=self.base/'staged';staged.mkdir()
+        restore.prepare(staged,params,self.path,self.base)
+        result=tomllib.loads((staged/'hd1910-calibration.toml').read_text())
+        self.assertFalse(result['imu_mount_verified'])
+        self.assertTrue(result['imu_mounts']['lsm6dsv16x']['verified'])
+
     def test_runtime_checks_module_mounts_against_the_saved_file(self):
         data=copy.deepcopy(self.seed);data['imu_mounts']={'bno08x':{'quat':[.5,.5,.5,.5],'verified':True}}
         self.write(data)
