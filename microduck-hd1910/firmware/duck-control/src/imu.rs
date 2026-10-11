@@ -1,7 +1,7 @@
 //! The robot's trunk orientation: what every trunk IMU shares, and the bus board's bytes.
 //!
-//! Two parts, because the sensor can be wired two ways — on the servo bus, or as a module on
-//! the board's own I²C — and only the first is this module's byte format:
+//! Two parts, because the sensor can be wired two ways ([`crate::trunk_imu::TrunkImuKind`])
+//! and only the bus board is this module's byte format:
 //!
 //! - [`TrunkFrame`] is the post-processing: the sensor→trunk mount, holding the last good
 //!   quaternion, the 25-sample ready gate and the three-point median. Every source feeds it

@@ -20,6 +20,7 @@ pub mod policy;
 pub mod safety;
 /// A robot in MuJoCo, over TCP — the backend `robotd-design.md` §9 deferred.
 pub mod sim;
+pub mod trunk_imu;
 
 pub use imu::ImuData;
 pub use io::{FakeIo, IoError, JointTargets, RobotIo, Sensors, SlowSensors};
