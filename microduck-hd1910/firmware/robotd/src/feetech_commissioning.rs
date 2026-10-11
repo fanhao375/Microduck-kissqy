@@ -465,13 +465,27 @@ fn under_mount(mount: [f64; 4], reading: SensorReading) -> ImuData {
     frame.push(reading)
 }
 
+/// How far from upright a module may read, under the mount being confirmed, when its
+/// verification starts. Whatever it reads here stays in every later reading as a tilt bias the
+/// policy sees, so it is held to half the HOME guard's 10° (`home_start::MAX_TILT_DEG`) and
+/// echoed as `residual_tilt_deg`.
+const MODULE_UPRIGHT_DEG: f64 = 5.0;
+
+/// What the upright half read: its echo, and the gravity the nose-down half measures from.
+#[derive(Debug, Clone)]
+struct Upright {
+    echo: Value,
+    gravity: [f64; 3],
+    tilt_deg: f64,
+}
+
 /// The first half of a module's verification: the robot standing upright reads upright
 /// through the mount being confirmed. A module has no official orientation to take on trust.
 fn upright_check(
     source: TrunkImuKind,
     mount: [f64; 4],
     reading: Option<SensorReading>,
-) -> Result<Value, String> {
+) -> Result<Upright, String> {
     let reading = reading.ok_or_else(|| {
         format!(
             "verify-imu needs a live {} sample; check busStatus last_sample.imu and the reader",
@@ -482,16 +496,19 @@ fn upright_check(
     let tilt = super::home_start::tilt_deg(trunk.gravity);
     let echo = json!({"imu_source": source.label(), "mount_wxyz": mount,
         "gravity": trunk.gravity, "tilt_deg": tilt, "gyro_rad_s": trunk.gyro,
-        "tilt_limit_deg": super::home_start::MAX_TILT_DEG});
-    if tilt.is_none_or(|t| t > super::home_start::MAX_TILT_DEG) {
-        return Err(format!(
-            "under this mount the trunk reads {} from upright (limit {}°); stand the robot \
-             upright, or the mount is wrong: {echo}",
+        "tilt_limit_deg": MODULE_UPRIGHT_DEG});
+    match tilt {
+        Some(tilt_deg) if tilt_deg <= MODULE_UPRIGHT_DEG => Ok(Upright {
+            echo,
+            gravity: trunk.gravity,
+            tilt_deg,
+        }),
+        _ => Err(format!(
+            "under this mount the trunk reads {} from upright (limit {MODULE_UPRIGHT_DEG}°); \
+             stand the robot upright, or the mount is wrong: {echo}",
             tilt.map_or("no valid gravity".to_owned(), |t| format!("{t:.1}°")),
-            super::home_start::MAX_TILT_DEG
-        ));
+        )),
     }
-    Ok(echo)
 }
 
 /// Lean at least this far before the nose-down half of a verification judges anything.
@@ -500,7 +517,9 @@ const NOSE_DOWN_MIN_DEG: f64 = 12.0;
 /// quarter or half turn off about the vertical reads 90° or 180° here; a hand tipping the
 /// robot is rarely more than a few degrees off.
 const NOSE_DOWN_HEADING_DEG: f64 = 20.0;
-/// Consecutive tipped readings before a verdict, so a jolt is not taken for a lean.
+/// Readings running that agree before a verdict: five forward to accept, five the wrong way to
+/// refuse. A reading the other way, or not tipped, starts the count again, so a jolt or a wobble
+/// through forward is never taken for the tip.
 const NOSE_DOWN_READINGS: u32 = 5;
 /// How long `verify-imu` waits for the nose-down tip once the upright check has passed.
 const NOSE_DOWN_WINDOW: Duration = Duration::from_secs(20);
@@ -519,20 +538,31 @@ enum NoseDown {
 /// only the vertical one — a mount a quarter or half turn off about the vertical reads upright
 /// just as well, and then turns a pitch into a roll or flips its sign, and the policy corrects
 /// the wrong way and falls. In the trunk frame gravity leans toward the low side, so a
-/// nose-down tip reads +x: 15° is `[0.26, 0, -0.97]`, the convention the policy and
-/// `home_start` read.
-fn nose_down(mount: [f64; 4], reading: SensorReading) -> NoseDown {
+/// nose-down tip moves it toward +x: from upright, 15° is `[0.26, 0, -0.97]`, the convention
+/// the policy and `home_start` read.
+///
+/// Judged from where the robot stood (`upright`), not from vertical: the tip is the change in
+/// gravity, so the few degrees of bias the upright half allowed neither swing the heading nor
+/// count toward the lean.
+fn nose_down(mount: [f64; 4], reading: SensorReading, upright: [f64; 3]) -> NoseDown {
     let trunk = under_mount(mount, reading);
-    let Some(tilt) = super::home_start::tilt_deg(trunk.gravity) else {
+    let unit = |v: [f64; 3]| {
+        let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        (n.is_finite() && n > 0.0).then(|| v.map(|c| c / n))
+    };
+    let (Some(g), Some(u)) = (unit(trunk.gravity), unit(upright)) else {
         return NoseDown::Level;
     };
+    let tilt = (g[0] * u[0] + g[1] * u[1] + g[2] * u[2])
+        .clamp(-1.0, 1.0)
+        .acos()
+        .to_degrees();
     if tilt < NOSE_DOWN_MIN_DEG {
         return NoseDown::Level;
     }
-    let [x, y, _] = trunk.gravity;
     // 0° nose-down, ±180° tail-down, +90° the robot's left side low, -90° its right.
-    let heading = y.atan2(x).to_degrees();
-    let echo = json!({"gravity": trunk.gravity, "tilt_deg": tilt,
+    let heading = (g[1] - u[1]).atan2(g[0] - u[0]).to_degrees();
+    let echo = json!({"gravity": trunk.gravity, "tilt_from_upright_deg": tilt,
         "lean_heading_deg": heading, "gyro_rad_s": trunk.gyro});
     if heading.abs() <= NOSE_DOWN_HEADING_DEG {
         return NoseDown::Forward(echo);
@@ -555,12 +585,25 @@ fn nose_down(mount: [f64; 4], reading: SensorReading) -> NoseDown {
 struct PendingVerify {
     reply: oneshot::Sender<Reply>,
     mount: [f64; 4],
-    upright: Value,
+    upright: Upright,
     deadline: Instant,
-    tipped: u32,
+    /// Readings running that read nose-down, and that read the wrong way.
+    forward: u32,
+    wrong: u32,
 }
 
 impl PendingVerify {
+    fn new(reply: oneshot::Sender<Reply>, mount: [f64; 4], upright: Upright, now: Instant) -> Self {
+        Self {
+            reply,
+            mount,
+            upright,
+            deadline: now + NOSE_DOWN_WINDOW,
+            forward: 0,
+            wrong: 0,
+        }
+    }
+
     /// One tick's live reading — none on a tick whose read failed. `Some` once decided.
     fn observe(
         &mut self,
@@ -568,19 +611,20 @@ impl PendingVerify {
         now: Instant,
     ) -> Option<Result<Value, String>> {
         if let Some(reading) = reading {
-            let verdict = nose_down(self.mount, reading);
-            if matches!(verdict, NoseDown::Level) {
-                self.tipped = 0;
-            } else {
-                self.tipped += 1;
-                if self.tipped >= NOSE_DOWN_READINGS {
-                    return Some(match verdict {
-                        NoseDown::Forward(echo) => {
-                            Ok(json!({"upright": self.upright, "nose_down": echo}))
-                        }
-                        NoseDown::Wrong(message) => Err(message),
-                        NoseDown::Level => Err("no verdict".into()),
-                    });
+            match nose_down(self.mount, reading, self.upright.gravity) {
+                NoseDown::Level => (self.forward, self.wrong) = (0, 0),
+                NoseDown::Forward(echo) => {
+                    (self.forward, self.wrong) = (self.forward + 1, 0);
+                    if self.forward >= NOSE_DOWN_READINGS {
+                        return Some(Ok(json!({"upright": self.upright.echo,
+                            "nose_down": echo, "residual_tilt_deg": self.upright.tilt_deg})));
+                    }
+                }
+                NoseDown::Wrong(message) => {
+                    (self.forward, self.wrong) = (0, self.wrong + 1);
+                    if self.wrong >= NOSE_DOWN_READINGS {
+                        return Some(Err(message));
+                    }
                 }
             }
         }
@@ -810,13 +854,12 @@ fn process_job(
                                 "verify-imu: upright check passed; now tip the robot nose-down \
                                  by 15-30 degrees"
                             );
-                            *verifying = Some(PendingVerify {
-                                reply: job.reply,
+                            *verifying = Some(PendingVerify::new(
+                                job.reply,
                                 mount,
                                 upright,
-                                deadline: Instant::now() + NOSE_DOWN_WINDOW,
-                                tipped: 0,
-                            });
+                                Instant::now(),
+                            ));
                             return;
                         }
                         Err(error) => Err(error),
@@ -1842,10 +1885,11 @@ mod tests {
 
     const BNO: [f64; 4] = duck_control::trunk_imu::BNO08X_DEFAULT_MOUNT;
 
-    /// The upright half: under the mount being confirmed the trunk must read within 10° of
-    /// upright, with what it read echoed back — gravity, tilt and the yaw rate's sign.
+    /// The upright half: under the mount being confirmed the trunk must read within 5° of
+    /// upright — whatever it reads here stays as a tilt bias, so half the HOME guard's 10° —
+    /// with what it read echoed back: gravity, tilt and the yaw rate's sign.
     #[test]
-    fn the_upright_check_holds_a_module_to_ten_degrees() {
+    fn the_upright_check_holds_a_module_to_five_degrees() {
         // Sensor Y is trunk Z in the BNO08x default mount: a yaw rate.
         let upright = upright_check(
             TrunkImuKind::Bno08x,
@@ -1853,20 +1897,22 @@ mod tests {
             Some(reading(pitched(BNO, 4.0), [0.0, 0.3, 0.0])),
         )
         .unwrap();
-        assert_eq!(upright["imu_source"], "bno08x");
+        assert!((upright.tilt_deg - 4.0).abs() < 1e-9);
+        let echo = &upright.echo;
+        assert_eq!(echo["imu_source"], "bno08x");
         assert!(
-            (upright["tilt_deg"].as_f64().unwrap() - 4.0).abs() < 1e-9,
-            "{upright}"
+            (echo["tilt_deg"].as_f64().unwrap() - 4.0).abs() < 1e-9,
+            "{echo}"
         );
-        assert!((upright["gyro_rad_s"][2].as_f64().unwrap() - 0.3).abs() < 1e-9);
+        assert!((echo["gyro_rad_s"][2].as_f64().unwrap() - 0.3).abs() < 1e-9);
         let error = upright_check(
             TrunkImuKind::Bno08x,
             BNO,
-            Some(reading(pitched(BNO, 25.0), [0.0; 3])),
+            Some(reading(pitched(BNO, 7.0), [0.0; 3])),
         )
         .unwrap_err();
         assert!(
-            error.contains("25.0°") && error.contains("gravity"),
+            error.contains("7.0°") && error.contains("limit 5°") && error.contains("gravity"),
             "{error}"
         );
         assert!(!error.contains("  "), "a broken line continuation: {error}");
@@ -1884,6 +1930,7 @@ mod tests {
     fn a_mount_a_quarter_or_half_turn_off_about_the_vertical_is_refused() {
         let truth = [1.0, 0.0, 0.0, 0.0];
         let upright = reading(truth, [0.0; 3]);
+        let level = [0.0, 0.0, -1.0];
         let nose_down_15 = reading(pitched(truth, 15.0), [0.0; 3]);
         let half = std::f64::consts::FRAC_1_SQRT_2;
         for (mount, says) in [
@@ -1895,7 +1942,7 @@ mod tests {
                 upright_check(TrunkImuKind::Lsm6dsv16x, mount, Some(upright)).is_ok(),
                 "a yaw error reads upright: {mount:?}"
             );
-            match nose_down(mount, nose_down_15) {
+            match nose_down(mount, nose_down_15, level) {
                 NoseDown::Wrong(message) => {
                     assert!(message.contains(says), "{mount:?}: {message}");
                     assert!(!message.contains("  "), "{message}");
@@ -1903,7 +1950,7 @@ mod tests {
                 other => panic!("{mount:?} accepted: {other:?}"),
             }
         }
-        match nose_down(truth, nose_down_15) {
+        match nose_down(truth, nose_down_15, level) {
             NoseDown::Forward(echo) => {
                 let g = &echo["gravity"];
                 assert!((g[0].as_f64().unwrap() - 15f64.to_radians().sin()).abs() < 1e-9);
@@ -1913,9 +1960,62 @@ mod tests {
             other => panic!("the right mount refused: {other:?}"),
         }
         assert!(matches!(
-            nose_down(truth, reading(pitched(truth, 5.0), [0.0; 3])),
+            nose_down(truth, reading(pitched(truth, 5.0), [0.0; 3]), level),
             NoseDown::Level
         ));
+    }
+
+    /// The tip is judged from where the robot stood. Standing 4.9° rolled (inside the upright
+    /// limit) and tipped 12.5° nose-down, gravity from vertical points 22° off straight ahead
+    /// and was refused as the right side going down; measured from the upright reading it is
+    /// straight ahead. The lean is from upright too: the same 12.5° counts, a 9° one does not.
+    #[test]
+    fn the_tip_is_judged_from_where_the_robot_stood() {
+        let truth = [1.0, 0.0, 0.0, 0.0];
+        let rolled = |degrees: f64| {
+            let half = degrees.to_radians() / 2.0;
+            [half.cos(), half.sin(), 0.0, 0.0]
+        };
+        let stood = rolled(4.9);
+        let upright = upright_check(
+            TrunkImuKind::Lsm6dsv16x,
+            truth,
+            Some(reading(stood, [0.0; 3])),
+        )
+        .unwrap();
+        assert!((upright.tilt_deg - 4.9).abs() < 1e-9);
+        // Tipped about the robot's own pitch axis: stood · pitch.
+        let tipped = |degrees: f64| {
+            let half = degrees.to_radians() / 2.0;
+            reading(mul(stood, [half.cos(), 0.0, half.sin(), 0.0]), [0.0; 3])
+        };
+        match nose_down(truth, tipped(12.5), upright.gravity) {
+            NoseDown::Forward(echo) => {
+                assert!(
+                    echo["lean_heading_deg"].as_f64().unwrap().abs() < 1.0,
+                    "{echo}"
+                );
+                // A shade under 12.5°: the pitch axis is itself tilted by the roll.
+                let tilt = echo["tilt_from_upright_deg"].as_f64().unwrap();
+                assert!((tilt - 12.5).abs() < 0.1, "{echo}");
+            }
+            other => panic!("a straight tip from a slightly rolled stance refused: {other:?}"),
+        }
+        assert!(matches!(
+            nose_down(truth, tipped(9.0), upright.gravity),
+            NoseDown::Level
+        ));
+    }
+
+    fn pending_for(mount: [f64; 4], now: Instant) -> PendingVerify {
+        let (reply, _receive) = oneshot::channel();
+        let upright = upright_check(
+            TrunkImuKind::Lsm6dsv16x,
+            mount,
+            Some(reading(mount, [0.0; 3])),
+        )
+        .unwrap();
+        PendingVerify::new(reply, mount, upright, now)
     }
 
     /// The wait: a verdict needs five tipped readings in a row (a jolt is not a lean), a read
@@ -1924,16 +2024,7 @@ mod tests {
     fn verification_waits_for_a_held_tip_and_gives_up() {
         let truth = [1.0, 0.0, 0.0, 0.0];
         let now = Instant::now();
-        let pending = || {
-            let (reply, _receive) = oneshot::channel();
-            PendingVerify {
-                reply,
-                mount: truth,
-                upright: json!({}),
-                deadline: now + NOSE_DOWN_WINDOW,
-                tipped: 0,
-            }
-        };
+        let pending = || pending_for(truth, now);
         let level = reading(truth, [0.0; 3]);
         let tipped = reading(pitched(truth, 20.0), [0.0; 3]);
         let mut held = pending();
@@ -1956,6 +2047,15 @@ mod tests {
                 "a jolt restarts the count"
             );
         }
+        let mut held = pending();
+        for _ in 0..4 {
+            held.observe(Some(tipped), now);
+        }
+        let check = held.observe(Some(tipped), now).unwrap().unwrap();
+        assert!(
+            check["residual_tilt_deg"].as_f64().unwrap().abs() < 1e-9,
+            "{check}"
+        );
         let mut never = pending();
         let error = never
             .observe(Some(level), now + NOSE_DOWN_WINDOW)
@@ -1965,6 +2065,42 @@ mod tests {
             error.contains("nothing saved") && !error.contains("  "),
             "{error}"
         );
+    }
+
+    /// The reviewer's probe: tipped throughout, four readings read sideways and the fifth
+    /// forward. Counting every tipped reading took the fifth as the verdict and saved a mount a
+    /// quarter turn off; only readings running that agree decide — five forward accept, five
+    /// the wrong way refuse, and a change of mind starts the count again.
+    #[test]
+    fn only_readings_running_that_agree_decide_the_tip() {
+        let truth = [1.0, 0.0, 0.0, 0.0];
+        let now = Instant::now();
+        let sideways = {
+            let half = 15f64.to_radians() / 2.0;
+            reading([half.cos(), half.sin(), 0.0, 0.0], [0.0; 3])
+        };
+        let forward = reading(pitched(truth, 15.0), [0.0; 3]);
+        let mut wobbly = pending_for(truth, now);
+        for _ in 0..4 {
+            assert!(wobbly.observe(Some(sideways), now).is_none());
+        }
+        assert!(
+            wobbly.observe(Some(forward), now).is_none(),
+            "one forward reading accepted"
+        );
+        for _ in 0..3 {
+            assert!(wobbly.observe(Some(forward), now).is_none());
+        }
+        assert!(
+            wobbly.observe(Some(forward), now).unwrap().is_ok(),
+            "five forward running"
+        );
+        let mut wrong = pending_for(truth, now);
+        for _ in 0..4 {
+            assert!(wrong.observe(Some(sideways), now).is_none());
+        }
+        let error = wrong.observe(Some(sideways), now).unwrap().unwrap_err();
+        assert!(error.contains("side going down"), "{error}");
     }
 
     /// A verified mount lands in that module's slot; the bus board's mount is not touched, and

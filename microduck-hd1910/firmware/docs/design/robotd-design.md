@@ -690,17 +690,21 @@ way up and starts from identity. Motion needs the *wired* source's mount verifie
 the wired source's slot. For a module it is two checks, because upright alone proves only the
 vertical axis: a mount a quarter or half turn off about the vertical reads upright just as well,
 and then turns a pitch into a roll or flips its sign — the policy corrects the wrong way and the
-robot falls. First the robot standing upright must read within 10° of upright under the mount
-being confirmed (the HOME guard's limit, `home_start::MAX_TILT_DEG`). Then, within 20 s, the
-operator tips it nose-down by 15–30° and holds it, and the lean must read as nose-down — in the
-trunk frame gravity leans toward the low side, so toward +x, within 20° of straight ahead — for
-five readings running. Only then is the slot written; a lean that reads tail-down or sideways is
-refused with the angle it read, and `busStatus` carries `imu_verification` while the command
-waits. Relax, or the requester giving up, cancels the wait with nothing saved; robotd allows the
-command 30 s and the console's IMU panel 35 s. The reply echoes gravity, tilt and gyro from both
-halves. Commissioning and read-only run
-on the same reader; with a module neither identifies nor reads ID 200, and the per-device
-communication counts leave it out.
+robot falls. First the robot standing upright must read within 5° of upright under the mount
+being confirmed — half the HOME guard's 10° (`home_start::MAX_TILT_DEG`), because whatever it
+reads here stays in every later reading as a tilt bias; the reply echoes it as
+`residual_tilt_deg`. Then, within 20 s, the operator tips it nose-down by 15–30° and holds it.
+The tip is measured from that upright reading, not from vertical, so the bias neither swings its
+direction nor counts toward it: it must be at least 12°, and gravity's change must point toward
++x (in the trunk frame gravity moves toward the low side) within 20° of straight ahead. Five
+readings running that read forward write the slot; five running that read tail-down or sideways
+refuse it with the angle they read; a reading that disagrees with the run before it starts the
+count again, so a wobble through forward is never taken for the tip. `busStatus` carries
+`imu_verification` while the command waits. Relax, or the requester giving up, cancels the wait
+with nothing saved; robotd allows the command 30 s and the console's IMU panel 35 s. The reply
+echoes gravity, tilt and gyro from both halves. Commissioning and read-only run on the same
+reader; with a module neither identifies nor reads ID 200, and the per-device communication
+counts leave it out.
 
 **On the board.** The I²C bus must exist (its overlay enabled); robotd's unit needs
 `DeviceAllow=char-i2c rw` (the R17 drop-in carries it), or the open fails with `EPERM`. The

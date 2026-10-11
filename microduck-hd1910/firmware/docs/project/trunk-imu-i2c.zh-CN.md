@@ -25,7 +25,7 @@ R17 的 robotd 只认一种躯干 IMU：舵机总线上的 FT6 / imu_to_dxl 小�
 6. `FeetechIo` 内部 `TrunkImu { Bus, Host }`；模块源只 Sync Read 15 颗舵机，严格模式。
 7. `robotd/src/trunk_imu_i2c.rs`：读取线程与两个状态机，假总线测试。
 8. `robotd/src/main.rs`：读取器只建一次，所有启动路径共用；按源 `validate_motion_for`；模块源统计不含 200。
-9. 调试与只读模式的模块分支；`verify-imu` 写当前源槽位。模块源分两步：直立时倾角 ≤ 10°，再在 20 秒内把机身前倾 15–30° 并保持，重力须读成朝 +x（偏离正前 ≤ 20°，连续 5 帧）才写，并回显两步的重力、倾角、陀螺。
+9. 调试与只读模式的模块分支；`verify-imu` 写当前源槽位。模块源分两步：直立时倾角 ≤ 5°（残余倾角作为 `residual_tilt_deg` 回显），再在 20 秒内把机身前倾 15–30° 并保持；前倾从直立读数算起，须 ≥ 12°、重力变化朝 +x（偏离正前 ≤ 20°），连续 5 帧读成前倾才写，连续 5 帧读成别的方向就拒绝，中途方向变了从头数。回显两步的重力、倾角、陀螺。
 10. `packaging`：drop-in 加 `DeviceAllow=char-i2c rw`；`calibration-config.py` 按 robotd.toml 的源检查；重装保留 `imu_mounts`；运行回读核对模块 mount。
 
 ## 与计划的出入
