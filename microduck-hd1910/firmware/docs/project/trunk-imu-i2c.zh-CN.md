@@ -25,7 +25,7 @@ R17 的 robotd 只认一种躯干 IMU：舵机总线上的 FT6 / imu_to_dxl 小�
 6. `FeetechIo` 内部 `TrunkImu { Bus, Host }`；模块源只 Sync Read 15 颗舵机，严格模式。
 7. `robotd/src/trunk_imu_i2c.rs`：读取线程与两个状态机，假总线测试。
 8. `robotd/src/main.rs`：读取器只建一次，所有启动路径共用；按源 `validate_motion_for`；模块源统计不含 200。
-9. 调试与只读模式的模块分支；`verify-imu` 写当前源槽位，模块源倾角 ≤ 10° 才写，并回显重力、倾角、陀螺。
+9. 调试与只读模式的模块分支；`verify-imu` 写当前源槽位。模块源分两步：直立时倾角 ≤ 10°，再在 20 秒内把机身前倾 15–30° 并保持，重力须读成朝 +x（偏离正前 ≤ 20°，连续 5 帧）才写，并回显两步的重力、倾角、陀螺。
 10. `packaging`：drop-in 加 `DeviceAllow=char-i2c rw`；`calibration-config.py` 按 robotd.toml 的源检查；重装保留 `imu_mounts`；运行回读核对模块 mount。
 
 ## 与计划的出入
@@ -35,6 +35,15 @@ R17 的 robotd 只认一种躯干 IMU：舵机总线上的 FT6 / imu_to_dxl 小�
 - epoch 变化只重置 gate，不清 `TrunkFrame` 的就绪计数，与 A“读丢不算重新收敛”一致；重新收敛由 1 秒稳定期兜住。
 - C 的 FIFO 字原样传递（不再归一化），与 A 一致，由 `TrunkFrame` 统一归一化。
 - 计划原文放在 `design/` 下，按仓库“一页一机制”的规则改为本页（`project/` 下的记录），机制写进 `robotd-design.md` §2.6。
+
+## 评审后的修正（2026-10-12）
+
+- 只验直立证明不了水平轴：绕竖直轴转 90°/180° 的 mount 照样“直立”，上机后俯仰被读成横滚或反号。`verify-imu` 加了前倾一步（见上第 9 步）。
+- FIFO / 报告积压不再当成新数据发布：只有读到队头的那一拍才发布最新样本；LSM 积压超过 48 字（约 133 ms）清空并开新 epoch。
+- 单次 I²C 失败或一个坏包只丢弃计数（`dropped`），连续 5 次传输失败或无新数据看门狗才重开。
+- 新 epoch 的第一帧不再与断开前的两帧取中值。
+- 两处错误文本的续行反斜杠丢失已修；重装时模块源不再把总线槽位从快照补成已确认。
+- 控制台调试页的 IMU 来源按 busStatus 报的源显示（FT6 / BNO08x / LSM6DSV16X），不再写死 FT6。
 
 ## 尚未在真机验证
 
