@@ -2,11 +2,13 @@
 //! the sole UART owner; raw positions never masquerade as calibrated joint angles.
 use super::{Ordering, RobotState};
 use clap::Subcommand;
+use duck_control::feetech::ImuMount;
 use duck_control::feetech::{
     Bus, Calibration, IMU_ID, IMU_IDENTITY, ImuSample, ServoSample, signed_position_word,
 };
-use duck_control::imu::SflpDecoder;
+use duck_control::imu::{ImuData, SensorReading, SflpDecoder, TrunkFrame};
 use duck_control::model::{JOINT_IDS, NUM_JOINTS};
+use duck_control::trunk_imu::{HostImu, HostImuGate, TrunkImuKind};
 use duck_ipc_proto as proto;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -65,7 +67,9 @@ pub enum BusCommand {
     },
     /// Show the persisted calibration and what still prevents full control.
     CalibrationStatus,
-    /// Record that the official IMU mounting axes have been physically checked.
+    /// Record that the official IMU mounting axes have been physically checked — for the
+    /// trunk IMU this robotd reads (`[trunk_imu] source`), in that source's own slot. A module
+    /// is refused unless the trunk reads upright (≤ 10°) under the mount being confirmed.
     VerifyImu {
         #[arg(long, required = true)]
         confirmed: bool,
@@ -311,7 +315,12 @@ fn save_calibration(path: &Path, calibration: &Calibration) -> Result<(), String
     Ok(())
 }
 
-pub(crate) fn calibration_status(calibration: &Calibration, path: &Path) -> Value {
+/// `source`: the trunk IMU this robotd reads, whose mount decides whether motion may start.
+pub(crate) fn calibration_status(
+    calibration: &Calibration,
+    path: &Path,
+    source: TrunkImuKind,
+) -> Value {
     let missing = calibration
         .joints
         .iter()
@@ -319,7 +328,8 @@ pub(crate) fn calibration_status(calibration: &Calibration, path: &Path) -> Valu
         .map(|joint| joint.name.as_str())
         .collect::<Vec<_>>();
     json!({"calibration_path":path, "calibration":calibration, "uncalibrated_joints":missing,
-        "motion_validation":calibration.validate_motion().err().map(|e| e.to_string()),
+        "imu_source": source.label(),
+        "motion_validation":calibration.validate_motion_for(source).err().map(|e| e.to_string()),
         "note":"Capture uses a manually known joint angle; encoder center is not joint zero."})
 }
 
@@ -435,6 +445,72 @@ fn center_partition(ids: &[u8], samples: &BTreeMap<u8, ServoSample>) -> (Vec<u8>
     (done, pending.into())
 }
 
+/// Which trunk IMU this commissioning run reads, and its newest accepted reading in the
+/// sensor's own axes — what `verify-imu` checks a candidate mount against. No reading for the
+/// bus board, whose verification is the operator's word as it always was.
+#[derive(Clone, Copy)]
+struct ImuContext {
+    source: TrunkImuKind,
+    reading: Option<SensorReading>,
+}
+
+/// The reading under `mount`, settled: three pushes through a fresh frame, so the median sees
+/// three equal samples rather than two defaults and this one.
+fn under_mount(mount: [f64; 4], reading: SensorReading) -> ImuData {
+    let mut frame = TrunkFrame::new(mount);
+    frame.push(reading);
+    frame.push(reading);
+    frame.push(reading)
+}
+
+fn verify_imu(
+    calibration: &Calibration,
+    path: &Path,
+    imu: ImuContext,
+    mount: [f64; 4],
+) -> Result<(Calibration, Value), String> {
+    let mut updated = calibration.clone();
+    let mut check = None;
+    if imu.source != TrunkImuKind::Bus {
+        let reading = imu.reading.ok_or_else(|| {
+            format!(
+                "verify-imu needs a live {} sample; check busStatus last_sample.imu and the reader",
+                imu.source.label()
+            )
+        })?;
+        let trunk = under_mount(mount, reading);
+        let tilt = super::home_start::tilt_deg(trunk.gravity);
+        let echo = json!({"imu_source": imu.source.label(), "mount_wxyz": mount,
+            "gravity": trunk.gravity, "tilt_deg": tilt, "gyro_rad_s": trunk.gyro,
+            "tilt_limit_deg": super::home_start::MAX_TILT_DEG});
+        // A module has no official orientation to take on trust: the robot standing upright
+        // has to read upright through the mount being confirmed, or the mount is wrong.
+        if tilt.is_none_or(|t| t > super::home_start::MAX_TILT_DEG) {
+            return Err(format!(
+                "under this mount the trunk reads {} from upright (limit {}°); stand the robot                  upright, or the mount is wrong: {echo}",
+                tilt.map_or("no valid gravity".to_owned(), |t| format!("{t:.1}°")),
+                super::home_start::MAX_TILT_DEG
+            ));
+        }
+        check = Some(echo);
+    }
+    updated.set_imu_mount(
+        imu.source,
+        ImuMount {
+            quat: mount,
+            verified: true,
+        },
+    );
+    updated.motion_enabled = false;
+    save_calibration(path, &updated)?;
+    let mut status = calibration_status(&updated, path, imu.source);
+    if let Some(check) = check {
+        status["imu_check"] = check;
+    }
+    Ok((updated, status))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn process_job(
     job: Job,
     bus: &mut Bus,
@@ -444,6 +520,7 @@ fn process_job(
     motion: &mut Option<Motion>,
     ids: &[u8],
     off_pending: &mut Option<String>,
+    imu: ImuContext,
 ) {
     if job.reply.is_closed() {
         return;
@@ -457,7 +534,9 @@ fn process_job(
         return;
     }
     if matches!(job.command, BusCommand::CalibrationStatus) {
-        let _ = job.reply.send(Ok(calibration_status(calibration, path)));
+        let _ = job
+            .reply
+            .send(Ok(calibration_status(calibration, path, imu.source)));
         return;
     }
     if off_pending.is_some() {
@@ -573,7 +652,7 @@ fn process_job(
                 save_calibration(path, &updated)?;
                 *calibration = updated;
                 Ok(json!({"saved":true,"id":id,"position_raw":samples[&id].feedback.position_raw,
-                    "known_angle_deg":angle_deg,"calibration":calibration_status(calibration,path)}))
+                    "known_angle_deg":angle_deg,"calibration":calibration_status(calibration,path,imu.source)}))
             });
             let _ = job.reply.send(result);
         }
@@ -582,10 +661,11 @@ fn process_job(
             mount_wxyz,
         } => {
             let result = if confirmed {
-                let mut updated = calibration.clone();
-                if !mount_wxyz.is_empty() {
+                let mount = if mount_wxyz.is_empty() {
+                    calibration.imu_mount(imu.source).quat
+                } else {
                     match mount_wxyz.try_into() {
-                        Ok(mount) => updated.imu_mount_quat = mount,
+                        Ok(mount) => mount,
                         Err(_) => {
                             let _ = job
                                 .reply
@@ -593,12 +673,10 @@ fn process_job(
                             return;
                         }
                     }
-                }
-                updated.imu_mount_verified = true;
-                updated.motion_enabled = false;
-                save_calibration(path, &updated).map(|()| {
+                };
+                verify_imu(calibration, path, imu, mount).map(|(updated, status)| {
                     *calibration = updated;
-                    calibration_status(calibration, path)
+                    status
                 })
             } else {
                 Err(
@@ -750,7 +828,11 @@ pub struct ServoStatus {
 }
 #[derive(Clone, Serialize)]
 pub struct ImuStatus {
-    id: u8,
+    /// The bus board's ID; absent for a module.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<u8>,
+    /// Which trunk IMU: a `TrunkImuKind` label.
+    source: &'static str,
     sequence: u32,
     ready: bool,
     valid: bool,
@@ -758,6 +840,17 @@ pub struct ImuStatus {
     gyro_rad_s: [f64; 3],
     quaternion_wxyz: [f64; 4],
     mount_verified: bool,
+    /// A module's sample age when this tick took it, measured on the host.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    age_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    epoch: Option<u32>,
+    /// A BNO08x's own accuracy estimate, 0 unreliable … 3 high.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    accuracy: Option<u8>,
+    /// Lean from upright under the current mount, what `verify-imu` holds a module to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tilt_deg: Option<f64>,
 }
 #[derive(Clone, Serialize)]
 pub struct Sample {
@@ -824,13 +917,18 @@ pub async fn await_uart_setup(state: &RobotState, port: &str, mode: &str) -> Res
     Ok(())
 }
 
+/// `host_imu`: the trunk IMU module's reader when `[trunk_imu]` names one. The bus then
+/// carries the servos alone, ID 200 is neither identified nor read, and `verify-imu` writes
+/// that module's mount.
 pub async fn run(
     port: &str,
     state: &RobotState,
     period: Duration,
     calibration_path: &Path,
     uart_setup: bool,
+    host_imu: Option<&dyn HostImu>,
 ) {
+    let source = host_imu.map_or(TrunkImuKind::Bus, |host| host.kind());
     state.imu_ready.store(false, Ordering::Relaxed);
     let mut calibration = match read_calibration(calibration_path) {
         Ok(c) => c,
@@ -852,6 +950,7 @@ pub async fn run(
         .store(Some(Arc::new(calibration_status(
             &calibration,
             calibration_path,
+            source,
         ))));
     let ids = calibration.joints.iter().map(|j| j.id).collect::<Vec<_>>();
     let connect = async {
@@ -859,7 +958,8 @@ pub async fn run(
         if uart_setup {
             await_uart_setup(state, port, "commissioning").await?;
         }
-        if bus.read(IMU_ID, 0, 5).map_err(|e| e.to_string())? != IMU_IDENTITY {
+        if host_imu.is_none() && bus.read(IMU_ID, 0, 5).map_err(|e| e.to_string())? != IMU_IDENTITY
+        {
             return Err("IMU200 requires FT6 firmware (06 00 00 00 f2)".into());
         }
         torque_off(&mut bus, &ids)?;
@@ -891,11 +991,17 @@ pub async fn run(
     let mut motion: Option<Motion> = None;
     let mut off_pending = None;
     let mut imu_decoder = SflpDecoder::new(calibration.imu_mount_quat);
+    let mut imu_frame = TrunkFrame::new(calibration.imu_mount(source).quat);
+    let mut imu_gate = HostImuGate::default();
+    let mut host_reading = None;
     let mut last_sample = None;
     let mut last_failure = None;
     let mut errors_by_id = BTreeMap::<u8, u64>::new();
-    let mut communication_stats =
-        super::communication_stats::CommunicationStats::new(ids.iter().copied().chain([IMU_ID]));
+    let mut communication_stats = super::communication_stats::CommunicationStats::new(
+        ids.iter()
+            .copied()
+            .chain((host_imu.is_none()).then_some(IMU_ID)),
+    );
     let mut next_publish = Instant::now();
     while !state.shutdown.load(Ordering::Relaxed) {
         ticker.tick().await;
@@ -908,13 +1014,58 @@ pub async fn run(
         let mut samples = BTreeMap::new();
         let mut imu_status = None;
         let result = (|| -> Result<(), String> {
-            let acquisition = bus.telemetry(&ids);
+            let acquisition = if host_imu.is_some() {
+                bus.joint_telemetry(&ids)
+            } else {
+                bus.telemetry(&ids)
+            };
             communication_stats.observe(&bus.last_sync);
             let blocks = acquisition.map_err(|e| e.to_string())?;
             for id in &ids {
                 let sample =
                     ServoSample::decode(&blocks[id]).map_err(|e| format!("ID {id}: {e}"))?;
                 samples.insert(*id, sample);
+            }
+            if let Some(host) = host_imu {
+                let now = Instant::now();
+                let before = imu_gate.stale();
+                let checked = imu_gate.check(host.latest(), now);
+                let after = imu_gate.stale();
+                state
+                    .imu_stale_blocks
+                    .fetch_add(after.total - before.total, Ordering::Relaxed);
+                state.imu_stale_run.store(after.run, Ordering::Relaxed);
+                let sample = checked.map_err(|e| format!("IMU {}: {e}", source.label()))?;
+                let reading = SensorReading {
+                    gyro: sample.gyro,
+                    quat: Some(sample.quat),
+                };
+                host_reading = Some(reading);
+                let decoded = imu_frame.push(reading);
+                let valid = imu_frame.ready();
+                state.imu_ready.store(valid, Ordering::Relaxed);
+                if publish {
+                    imu_status = Some(ImuStatus {
+                        id: None,
+                        source: source.label(),
+                        sequence: sample.sequence,
+                        ready: true,
+                        valid,
+                        gravity: decoded.gravity,
+                        gyro_rad_s: decoded.gyro,
+                        quaternion_wxyz: decoded.quat,
+                        mount_verified: calibration.imu_mount(source).verified,
+                        age_ms: Some(
+                            now.saturating_duration_since(sample.received_at)
+                                .as_secs_f64()
+                                * 1000.0,
+                        ),
+                        epoch: Some(sample.epoch),
+                        accuracy: sample.accuracy,
+                        tilt_deg: super::home_start::tilt_deg(decoded.gravity),
+                    });
+                }
+                return Ok(());
             }
             let imu = ImuSample::decode(&blocks[&IMU_ID]).map_err(|e| format!("IMU200: {e}"))?;
             let duplicate = last_sequence == Some(imu.sequence);
@@ -932,7 +1083,8 @@ pub async fn run(
             state.imu_ready.store(valid, Ordering::Relaxed);
             if publish {
                 imu_status = Some(ImuStatus {
-                    id: IMU_ID,
+                    id: Some(IMU_ID),
+                    source: source.label(),
                     sequence: imu.sequence,
                     ready: imu.ready,
                     valid,
@@ -940,6 +1092,10 @@ pub async fn run(
                     gyro_rad_s: decoded.gyro,
                     quaternion_wxyz: decoded.quat,
                     mount_verified: calibration.imu_mount_verified,
+                    age_ms: None,
+                    epoch: None,
+                    accuracy: None,
+                    tilt_deg: None,
                 });
             }
             Ok(())
@@ -977,6 +1133,10 @@ pub async fn run(
                         &mut motion,
                         &ids,
                         &mut off_pending,
+                        ImuContext {
+                            source,
+                            reading: None,
+                        },
                     );
                 } else {
                     let _ = job.reply.send(Err(error.clone()));
@@ -1043,7 +1203,7 @@ pub async fn run(
                     job.command,
                     BusCommand::Capture { .. } | BusCommand::VerifyImu { .. }
                 );
-                let old_mount = calibration.imu_mount_quat;
+                let old_mount = calibration.imu_mount(source).quat;
                 process_job(
                     job,
                     &mut bus,
@@ -1053,6 +1213,10 @@ pub async fn run(
                     &mut motion,
                     &ids,
                     &mut off_pending,
+                    ImuContext {
+                        source,
+                        reading: host_reading,
+                    },
                 );
                 if changes_calibration {
                     state
@@ -1060,10 +1224,12 @@ pub async fn run(
                         .store(Some(Arc::new(calibration_status(
                             &calibration,
                             calibration_path,
+                            source,
                         ))));
                 }
-                if old_mount != calibration.imu_mount_quat {
+                if old_mount != calibration.imu_mount(source).quat {
                     imu_decoder = SflpDecoder::new(calibration.imu_mount_quat);
+                    imu_frame = TrunkFrame::new(calibration.imu_mount(source).quat);
                 }
             }
             step_motion(&mut bus, &samples, &ids, &mut motion, &mut off_pending);
@@ -1114,7 +1280,7 @@ pub async fn run(
                 last_failure: last_failure.clone(),
                 last_sample: last_sample.clone(),
                 calibrated: calibration.joints.iter().all(|j| j.calibrated),
-                imu_mount_verified: calibration.imu_mount_verified,
+                imu_mount_verified: calibration.imu_mount(source).verified,
                 torque_state: if off_pending.is_some() {
                     "unknown"
                 } else if let Some(m) = &motion {
@@ -1436,5 +1602,270 @@ mod tests {
             .unwrap();
         assert!(matches!(commands.pop().unwrap().command, BusCommand::Relax));
         assert!(cancelled.try_recv().unwrap().is_err());
+    }
+
+    fn temp_calibration(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("microduck-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("calibration.toml")
+    }
+
+    /// A reading taken with the trunk pitched `degrees` about +Y, as a module mounted in the
+    /// BNO08x default would report it (sensor = trunk · mount).
+    fn pitched_bno08x_reading(degrees: f64) -> SensorReading {
+        let half = degrees.to_radians() / 2.0;
+        let (c, v) = (half.cos(), half.sin());
+        SensorReading {
+            // Sensor Y is trunk Z in this mount: a yaw rate.
+            gyro: [0.0, 0.3, 0.0],
+            quat: Some([0.5 * (c - v), 0.5 * (c + v), 0.5 * (c + v), 0.5 * (c - v)]),
+        }
+    }
+
+    /// A module's mount is confirmed against the robot standing upright: under the mount being
+    /// verified the trunk must read within 10° of upright, and the reply echoes what it read so
+    /// the operator can see gravity and the yaw rate's sign. It lands in that module's slot;
+    /// the bus board's mount is not touched, and motion stays off until enabled again.
+    #[test]
+    fn verify_imu_for_a_module_checks_tilt_and_writes_its_own_slot() {
+        let path = temp_calibration("verify-module");
+        let mut calibration = Calibration::commissioning(JOINT_IDS);
+        calibration.motion_enabled = false;
+        let mount = duck_control::trunk_imu::BNO08X_DEFAULT_MOUNT;
+        let upright = ImuContext {
+            source: TrunkImuKind::Bno08x,
+            reading: Some(pitched_bno08x_reading(4.0)),
+        };
+        let (updated, status) = verify_imu(&calibration, &path, upright, mount).unwrap();
+        assert!(updated.imu_mount(TrunkImuKind::Bno08x).verified);
+        assert!(
+            !updated.imu_mount_verified,
+            "the bus board's slot is untouched"
+        );
+        assert_eq!(updated.imu_mount_quat, calibration.imu_mount_quat);
+        let check = &status["imu_check"];
+        assert_eq!(check["imu_source"], "bno08x");
+        assert!(
+            (check["tilt_deg"].as_f64().unwrap() - 4.0).abs() < 1e-9,
+            "{check}"
+        );
+        assert!(
+            (check["gyro_rad_s"][2].as_f64().unwrap() - 0.3).abs() < 1e-9,
+            "yaw rate echoed"
+        );
+        assert_eq!(status["imu_source"], "bno08x");
+        let saved: Calibration = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(saved.imu_mount(TrunkImuKind::Bno08x).verified);
+
+        let tilted = ImuContext {
+            source: TrunkImuKind::Bno08x,
+            reading: Some(pitched_bno08x_reading(25.0)),
+        };
+        let error = verify_imu(&calibration, &path, tilted, mount).unwrap_err();
+        assert!(
+            error.contains("25.0°") && error.contains("gravity"),
+            "{error}"
+        );
+        let none = ImuContext {
+            source: TrunkImuKind::Lsm6dsv16x,
+            reading: None,
+        };
+        let error = verify_imu(&calibration, &path, none, [1.0, 0.0, 0.0, 0.0]).unwrap_err();
+        assert!(error.contains("live lsm6dsv16x sample"), "{error}");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// The bus board keeps its old rule: the operator's confirmation, no reading required, the
+    /// mount in the top-level keys where every existing file has it.
+    #[test]
+    fn verify_imu_for_the_bus_board_is_unchanged() {
+        let path = temp_calibration("verify-bus");
+        let calibration = Calibration::commissioning(JOINT_IDS);
+        let bus = ImuContext {
+            source: TrunkImuKind::Bus,
+            reading: None,
+        };
+        let mount = [0.0, 1.0, 0.0, 0.0];
+        let (updated, status) = verify_imu(&calibration, &path, bus, mount).unwrap();
+        assert!(updated.imu_mount_verified);
+        assert_eq!(updated.imu_mount_quat, mount);
+        assert!(updated.imu_mounts.bno08x.is_none());
+        assert!(status.get("imu_check").is_none());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("imu_mounts"), "{text}");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// Commissioning with a module: ID 200 is neither identified nor read, every Sync Read is
+    /// the fifteen servos, the published IMU is the module's (source, age, epoch, accuracy,
+    /// tilt), and `verify-imu` run through the socket confirms the module's slot.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn commissioning_with_a_module_never_addresses_id_200() {
+        use duck_control::feetech::{READ, SYNC_ADDRESS, SYNC_LENGTH, SYNC_WRITE, packet};
+        use std::fs::File;
+        use std::io::{Read, Write};
+        use std::os::fd::FromRawFd;
+
+        struct UprightHost {
+            sequence: std::sync::atomic::AtomicU32,
+        }
+        impl HostImu for UprightHost {
+            fn kind(&self) -> TrunkImuKind {
+                TrunkImuKind::Bno08x
+            }
+            fn latest(&self) -> Option<duck_control::trunk_imu::HostImuSample> {
+                let now = Instant::now();
+                Some(duck_control::trunk_imu::HostImuSample {
+                    quat: duck_control::trunk_imu::BNO08X_DEFAULT_MOUNT,
+                    gyro: [0.0; 3],
+                    received_at: now,
+                    sequence: self.sequence.fetch_add(1, Ordering::Relaxed) + 1,
+                    epoch: 1,
+                    epoch_started_at: now - Duration::from_secs(5),
+                    accuracy: Some(2),
+                })
+            }
+            fn health(&self) -> duck_control::trunk_imu::HostImuHealth {
+                duck_control::trunk_imu::HostImuHealth::default()
+            }
+        }
+
+        let (mut master, mut slave) = (0, 0);
+        let mut name = [0 as libc::c_char; 128];
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    name.as_mut_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        let port = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let _slave_file = unsafe { File::from_raw_fd(slave) };
+        let mut wire = unsafe { File::from_raw_fd(master) };
+        assert_ne!(
+            unsafe { libc::fcntl(master, libc::F_SETFL, libc::O_NONBLOCK) },
+            -1
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let device_stop = Arc::clone(&stop);
+        let device = std::thread::spawn(move || {
+            let mut pending = Vec::new();
+            let mut torque = [0u8; 256];
+            let mut bytes = [0u8; 512];
+            while !device_stop.load(Ordering::Relaxed) {
+                match wire.read(&mut bytes) {
+                    Ok(n) => pending.extend_from_slice(&bytes[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    other => panic!("PTY read: {other:?}"),
+                }
+                while pending.len() >= 4 && pending.len() >= usize::from(pending[3]) + 4 {
+                    let len = usize::from(pending[3]) + 4;
+                    let frame: Vec<u8> = pending.drain(..len).collect();
+                    let (address, width) = (frame[5], usize::from(frame[6]));
+                    match frame[4] {
+                        SYNC_WRITE => {
+                            assert_eq!(address, 40, "only torque is written here");
+                            for row in frame[7..len - 1].chunks_exact(width + 1) {
+                                assert_ne!(row[0], IMU_ID);
+                                torque[usize::from(row[0])] = row[1];
+                            }
+                        }
+                        READ => panic!("unicast read of ID {}", frame[2]),
+                        _ => {
+                            let ids = &frame[7..len - 1];
+                            assert_eq!(ids, JOINT_IDS, "only the servos, at {address}");
+                            let mut replies = Vec::new();
+                            for id in ids {
+                                let mut data = vec![0u8; width];
+                                if address == 40 {
+                                    data[0] = torque[usize::from(*id)];
+                                } else {
+                                    assert_eq!(
+                                        (address, width),
+                                        (SYNC_ADDRESS, usize::from(SYNC_LENGTH))
+                                    );
+                                    data[..2].copy_from_slice(&2048u16.to_le_bytes());
+                                }
+                                replies.extend(packet(*id, 0, &data).unwrap());
+                            }
+                            wire.write_all(&replies).unwrap();
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_micros(200));
+            }
+        });
+
+        let path = temp_calibration("commission-module");
+        let state = Arc::new(RobotState::new(
+            &crate::Params::default(),
+            Path::new("/tmp/unused-robotd.toml"),
+            false,
+            false,
+        ));
+        state.commissioning.store(true, Ordering::Relaxed);
+        let (control_state, control_path) = (Arc::clone(&state), path.clone());
+        let control = std::thread::spawn(move || {
+            let host = UprightHost {
+                sequence: std::sync::atomic::AtomicU32::new(0),
+            };
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap()
+                .block_on(run(
+                    &port,
+                    &control_state,
+                    Duration::from_millis(20),
+                    &control_path,
+                    false,
+                    Some(&host),
+                ));
+        });
+        let until = Instant::now() + Duration::from_secs(5);
+        let imu = loop {
+            assert!(Instant::now() < until, "{:?}", state.bus_status.load_full());
+            let sample = state
+                .bus_snapshot
+                .load_full()
+                .and_then(|status| serde_json::to_value(status.as_ref()).ok())
+                .map(|status| status["last_sample"]["imu"].clone());
+            if let Some(imu) = sample.filter(|imu| imu["valid"] == true) {
+                break imu;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(imu["source"], "bno08x");
+        assert!(imu.get("id").is_none(), "{imu}");
+        assert_eq!(imu["accuracy"], 2);
+        assert!(imu["tilt_deg"].as_f64().unwrap() < 1e-6);
+        let reply = tokio::runtime::Runtime::new().unwrap().block_on(dispatch(
+            &state,
+            proto::Id::Number(1),
+            json!({"action":"verify-imu","confirmed":true}),
+        ));
+        let reply = serde_json::to_value(reply).unwrap();
+        assert_eq!(
+            reply["result"]["imu_check"]["imu_source"], "bno08x",
+            "{reply}"
+        );
+        assert!(reply["result"]["motion_validation"].is_string());
+        state.shutdown.store(true, Ordering::Relaxed);
+        control.join().unwrap();
+        stop.store(true, Ordering::Relaxed);
+        device.join().unwrap();
+        let saved: Calibration = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(saved.imu_mount(TrunkImuKind::Bno08x).verified);
+        assert!(!saved.imu_mount_verified);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }

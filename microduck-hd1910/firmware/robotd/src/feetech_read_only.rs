@@ -5,6 +5,7 @@ use duck_control::feetech::{
     Bus, IMU_ID, IMU_IDENTITY, ImuSample, SYNC_ADDRESS, SYNC_LENGTH, ServoSample, SyncTrace,
 };
 use duck_control::model::{JOINT_IDS, JOINT_NAMES};
+use duck_control::trunk_imu::{HostImu, HostImuGate};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -79,13 +80,17 @@ fn publish(state: &RobotState, report: Value) {
     state.bus_status.store(Some(Arc::new(report)));
 }
 
-fn connect(port: &str) -> Result<(Bus, Vec<Value>), String> {
+/// `host`: the trunk IMU is a module the host reads, so ID 200 is never addressed — a robot
+/// without the board has nothing there to identify.
+fn connect(port: &str, host: bool) -> Result<(Bus, Vec<Value>), String> {
     let mut bus = Bus::open_read_only(port).map_err(|e| e.to_string())?;
-    let identity = bus.read(IMU_ID, 0, 5).map_err(|e| e.to_string())?;
-    if identity != IMU_IDENTITY {
-        return Err(format!(
-            "expected FT6 IMU200 identity 06 00 00 00 f2, received {identity:02x?}"
-        ));
+    if !host {
+        let identity = bus.read(IMU_ID, 0, 5).map_err(|e| e.to_string())?;
+        if identity != IMU_IDENTITY {
+            return Err(format!(
+                "expected FT6 IMU200 identity 06 00 00 00 f2, received {identity:02x?}"
+            ));
+        }
     }
     let mut torque = Vec::new();
     for id in JOINT_IDS {
@@ -95,15 +100,49 @@ fn connect(port: &str) -> Result<(Bus, Vec<Value>), String> {
     Ok((bus, torque))
 }
 
-pub async fn run(port: &str, state: &RobotState, period: Duration) {
-    let mut ids = vec![IMU_ID];
+/// The newest module sample through the same gate the control loop uses, as the raw
+/// sensor-frame values this service reports: whether the tick could use it, how old it is,
+/// and what the reader says about itself. No mount is applied — nothing here is calibrated.
+fn host_imu_report(
+    host: &dyn HostImu,
+    gate: &mut HostImuGate,
+    now: Instant,
+) -> (Value, Option<String>) {
+    let latest = host.latest();
+    let checked = gate.check(latest, now);
+    let mut report = json!({"source": host.kind().label(), "valid": checked.is_ok(),
+        "reader": host.health()});
+    if let Some(sample) = latest {
+        report["sequence"] = json!(sample.sequence);
+        report["epoch"] = json!(sample.epoch);
+        report["age_ms"] = json!(
+            now.saturating_duration_since(sample.received_at)
+                .as_secs_f64()
+                * 1000.0
+        );
+        report["quaternion_wxyz"] = json!(sample.quat);
+        report["gyro_rad_s"] = json!(sample.gyro);
+        report["accuracy"] = json!(sample.accuracy);
+    }
+    (report, checked.err().map(|e| e.to_string()))
+}
+
+/// `host_imu`: the trunk IMU module's reader when `[trunk_imu]` names one; the Sync Read is then
+/// the fifteen servos alone.
+pub async fn run(port: &str, state: &RobotState, period: Duration, host_imu: Option<&dyn HostImu>) {
+    let mut ids = if host_imu.is_some() {
+        Vec::new()
+    } else {
+        vec![IMU_ID]
+    };
     ids.extend(JOINT_IDS);
+    let mut gate = HostImuGate::default();
     let mut attempt = 0u32;
     let (mut bus, torque_at_start) = loop {
         if state.shutdown.load(Ordering::Relaxed) {
             return;
         }
-        match connect(port) {
+        match connect(port, host_imu.is_some()) {
             Ok(connected) => break connected,
             Err(error) => {
                 attempt += 1;
@@ -175,32 +214,44 @@ pub async fn run(port: &str, state: &RobotState, period: Duration) {
                 total_success += 1;
                 window.success += 1;
                 state.consecutive_errors.store(0, Ordering::Relaxed);
-                let imu = ImuSample::decode(&blocks[&IMU_ID]);
                 let mut imu_json = Value::Null;
                 let mut imu_fault = None;
-                match imu {
-                    Ok(imu) => {
-                        let duplicate = previous_sequence == Some(imu.sequence);
-                        window.duplicate_imu += u64::from(duplicate);
-                        stale_run = if duplicate { stale_run + 1 } else { 0 };
-                        previous_sequence = Some(imu.sequence);
-                        if duplicate {
-                            state.imu_stale_blocks.fetch_add(1, Ordering::Relaxed);
-                        }
-                        state.imu_stale_run.store(stale_run, Ordering::Relaxed);
-                        let valid = imu.is_fresh(read_us) && stale_run < 3;
-                        state.imu_ready.store(valid, Ordering::Relaxed);
-                        if !valid {
-                            imu_fault = Some("IMU not ready/stale".to_owned());
-                        }
-                        imu_json = json!({"id": IMU_ID, "sequence": imu.sequence,
+                if let Some(host) = host_imu {
+                    let before = gate.stale();
+                    (imu_json, imu_fault) = host_imu_report(host, &mut gate, Instant::now());
+                    let after = gate.stale();
+                    state
+                        .imu_stale_blocks
+                        .fetch_add(after.total - before.total, Ordering::Relaxed);
+                    state.imu_stale_run.store(after.run, Ordering::Relaxed);
+                    state
+                        .imu_ready
+                        .store(imu_fault.is_none(), Ordering::Relaxed);
+                } else {
+                    match ImuSample::decode(&blocks[&IMU_ID]) {
+                        Ok(imu) => {
+                            let duplicate = previous_sequence == Some(imu.sequence);
+                            window.duplicate_imu += u64::from(duplicate);
+                            stale_run = if duplicate { stale_run + 1 } else { 0 };
+                            previous_sequence = Some(imu.sequence);
+                            if duplicate {
+                                state.imu_stale_blocks.fetch_add(1, Ordering::Relaxed);
+                            }
+                            state.imu_stale_run.store(stale_run, Ordering::Relaxed);
+                            let valid = imu.is_fresh(read_us) && stale_run < 3;
+                            state.imu_ready.store(valid, Ordering::Relaxed);
+                            if !valid {
+                                imu_fault = Some("IMU not ready/stale".to_owned());
+                            }
+                            imu_json = json!({"id": IMU_ID, "sequence": imu.sequence,
                             "age_ms": imu.age_ms, "age_upper_bound_ms":imu.age_upper_bound_ms,
                             "status":imu.status, "sequence_bits":8, "ready": imu.ready, "valid": valid,
                             "payload_12_hex": imu.block.iter().map(|b| format!("{b:02x}")).collect::<String>()});
-                    }
-                    Err(error) => {
-                        state.imu_ready.store(false, Ordering::Relaxed);
-                        imu_fault = Some(error.to_string());
+                        }
+                        Err(error) => {
+                            state.imu_ready.store(false, Ordering::Relaxed);
+                            imu_fault = Some(error.to_string());
+                        }
                     }
                 }
                 if imu_fault.is_some() {
@@ -483,7 +534,7 @@ mod tests {
         }
         let worker_state = Arc::clone(&state);
         let daemon = tokio::spawn(async move {
-            run(&path, &worker_state, Duration::from_millis(5)).await;
+            run(&path, &worker_state, Duration::from_millis(5), None).await;
         });
         let result = tokio::time::timeout(Duration::from_secs(35), async {
             loop {
@@ -521,5 +572,143 @@ mod tests {
                 .iter()
                 .all(|op| matches!(op, 2 | 0x82))
         );
+    }
+
+    /// A host-read trunk IMU that always has a fresh, settled sample: a new sequence on every
+    /// look, stamped now, from an epoch that began long ago.
+    struct FreshHost {
+        sequence: std::sync::atomic::AtomicU32,
+    }
+    impl HostImu for FreshHost {
+        fn kind(&self) -> duck_control::trunk_imu::TrunkImuKind {
+            duck_control::trunk_imu::TrunkImuKind::Bno08x
+        }
+        fn latest(&self) -> Option<duck_control::trunk_imu::HostImuSample> {
+            let now = Instant::now();
+            Some(duck_control::trunk_imu::HostImuSample {
+                quat: [0.5; 4],
+                gyro: [0.0, 0.0, 1.0],
+                received_at: now,
+                sequence: self.sequence.fetch_add(1, Ordering::Relaxed) + 1,
+                epoch: 1,
+                epoch_started_at: now - Duration::from_secs(5),
+                accuracy: Some(3),
+            })
+        }
+        fn health(&self) -> duck_control::trunk_imu::HostImuHealth {
+            duck_control::trunk_imu::HostImuHealth {
+                state: "streaming",
+                epoch: 1,
+                ..Default::default()
+            }
+        }
+    }
+
+    /// With a module as the trunk IMU, the service identifies nothing at ID 200 and reads
+    /// nothing there: every Sync Read is the fifteen servos, and the IMU it reports is the
+    /// module's — source, sequence, age, the raw quaternion and rate, the BNO08x's accuracy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_host_imu_service_never_addresses_id_200() {
+        let (mut master, mut slave) = (0, 0);
+        let mut name = [0 as libc::c_char; 128];
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    name.as_mut_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        let path = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let slave_file = unsafe { File::from_raw_fd(slave) };
+        let mut master_file = unsafe { File::from_raw_fd(master) };
+        assert_ne!(
+            unsafe { libc::fcntl(master, libc::F_SETFL, libc::O_NONBLOCK) },
+            -1
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let firmware = std::thread::spawn(move || {
+            let mut pending = Vec::new();
+            let mut bytes = [0u8; 512];
+            while !worker_stop.load(Ordering::Relaxed) {
+                match master_file.read(&mut bytes) {
+                    Ok(n) => pending.extend_from_slice(&bytes[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    other => panic!("PTY read: {other:?}"),
+                }
+                while pending.len() >= 4 && pending.len() >= usize::from(pending[3]) + 4 {
+                    let len = usize::from(pending[3]) + 4;
+                    let frame: Vec<u8> = pending.drain(..len).collect();
+                    let (id, inst) = (frame[2], frame[4]);
+                    assert!(matches!(inst, 2 | 0x82), "motor WRITE observed");
+                    if inst == 2 {
+                        assert_ne!(id, IMU_ID, "ID 200 addressed");
+                        master_file.write_all(&reply(id, &[0])).unwrap();
+                    } else {
+                        let mut expected = vec![SYNC_ADDRESS, SYNC_LENGTH];
+                        expected.extend(JOINT_IDS);
+                        assert_eq!(&frame[5..frame.len() - 1], expected, "only the servos");
+                        let mut response = Vec::new();
+                        for id in JOINT_IDS {
+                            let mut data = [0u8; 15];
+                            data[0..2].copy_from_slice(&2048u16.to_le_bytes());
+                            response.extend(reply(id, &data));
+                        }
+                        master_file.write_all(&response).unwrap();
+                    }
+                }
+                std::thread::sleep(Duration::from_micros(200));
+            }
+        });
+        let state = Arc::new(RobotState::new(
+            &super::super::Params::default(),
+            std::path::Path::new("/tmp/unused-robotd.toml"),
+            false,
+            false,
+        ));
+        state.read_only.store(true, Ordering::Relaxed);
+        let worker_state = Arc::clone(&state);
+        let daemon = tokio::spawn(async move {
+            let host = FreshHost {
+                sequence: std::sync::atomic::AtomicU32::new(0),
+            };
+            run(&path, &worker_state, Duration::from_millis(5), Some(&host)).await;
+        });
+        let report = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(report) = state.bus_status.load_full()
+                    && report["last_sample"]["cycle"]
+                        .as_u64()
+                        .is_some_and(|c| c >= 50)
+                {
+                    break report;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        state.shutdown.store(true, Ordering::Relaxed);
+        daemon.await.unwrap();
+        stop.store(true, Ordering::Relaxed);
+        firmware.join().unwrap();
+        drop(slave_file);
+        let report = report.expect("service did not run 50 cycles");
+        assert_eq!(report["ids"], json!(JOINT_IDS));
+        assert_eq!(report["total_imu_faults"], 0, "{report}");
+        let imu = &report["last_sample"]["imu"];
+        assert_eq!(imu["source"], "bno08x");
+        assert_eq!(imu["valid"], true);
+        assert_eq!(imu["accuracy"], 3);
+        assert_eq!(imu["quaternion_wxyz"], json!([0.5, 0.5, 0.5, 0.5]));
+        assert_eq!(imu["reader"]["state"], "streaming");
+        assert!(state.imu_ready.load(Ordering::Relaxed));
     }
 }
