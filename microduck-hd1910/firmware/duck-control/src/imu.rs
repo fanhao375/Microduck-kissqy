@@ -1,9 +1,16 @@
-//! The `imu_to_dxl` v2 board (LSM6DSV16X), decoded.
+//! The robot's trunk orientation: what every trunk IMU shares, and the bus board's bytes.
 //!
-//! One IMU, one code path. The board rides the Dynamixel bus and its 12-byte block is
-//! fetched in the same `sync_read` as the servos, so there is no separate sensor to poll
-//! and no fusion to run on the host — the chip's SFLP block ships a game-rotation
-//! quaternion and estimates its own gyro bias.
+//! Two parts, because the sensor can be wired two ways — on the servo bus, or as a module on
+//! the board's own I²C — and only the first is this module's byte format:
+//!
+//! - [`TrunkFrame`] is the post-processing: the sensor→trunk mount, holding the last good
+//!   quaternion, the 25-sample ready gate and the three-point median. Every source feeds it
+//!   a reading in the sensor's own axes, so [`ImuData`] means the same thing whichever chip
+//!   produced it.
+//! - [`SflpDecoder`] is the `imu_to_dxl` v2 board (LSM6DSV16X) on the servo bus: its 12-byte
+//!   block parsed into such a reading, then the frame. The block is fetched in the same
+//!   `sync_read` as the servos, and the chip's SFLP ships a game-rotation quaternion and
+//!   estimates its own gyro bias, so there is no fusion to run on the host.
 //!
 //! Block layout at address 124:
 //!
@@ -47,41 +54,36 @@ impl Default for ImuData {
 /// ±500 dps at 17.5 mdps/LSB, in rad/s.
 const GYRO_RAD_PER_LSB: f64 = 0.0175 * std::f64::consts::PI / 180.0;
 
-/// Decodes the board's block into [`ImuData`].
+/// One IMU reading in the sensor's own axes, before the mount is applied.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SensorReading {
+    /// Angular velocity, rad/s.
+    pub gyro: [f64; 3],
+    /// Fused orientation, sensor→world, scalar-first. `None` when this reading carries no
+    /// quaternion the chip actually produced; [`TrunkFrame`] then holds the last one.
+    pub quat: Option<[f64; 4]>,
+}
+
+/// Sensor readings, expressed in the trunk frame.
 ///
 /// Stateful only for spike rejection and for holding the last good quaternion — there is
 /// no filter here. Keeping the state explicit means [`crate::io::FakeIo`] can drive the
 /// same decoder in tests.
-pub struct SflpDecoder {
+pub struct TrunkFrame {
     /// Sensor→trunk mounting rotation, scalar-first.
     mount: [f64; 4],
-    /// Last quaternion the board actually produced. Held across blocks that arrive before
-    /// SFLP has written its table — snapping to identity would report a robot as upright
-    /// when its orientation is simply unknown, which is the worst possible lie to tell
-    /// fall detection.
+    /// Last quaternion the sensor actually produced. Held across readings that arrive before
+    /// the fusion has output anything — snapping to identity would report a robot as upright
+    /// when its orientation is simply unknown, which is the worst possible lie to tell fall
+    /// detection.
     last_quat: [f64; 4],
-    /// Blocks carrying a live quaternion. Gates [`SflpDecoder::ready`].
+    /// Readings carrying a live quaternion. Gates [`TrunkFrame::ready`].
     quat_samples: u32,
     gyro_history: [[f64; 3]; 2],
     gravity_history: [[f64; 3]; 2],
 }
 
-impl Default for SflpDecoder {
-    fn default() -> Self {
-        Self::new(Self::DEFAULT_MOUNT)
-    }
-}
-
-impl SflpDecoder {
-    /// The board is mounted so that trunk = `[+raw_z, +raw_y, −raw_x]`, a +90° rotation
-    /// about Y.
-    pub const DEFAULT_MOUNT: [f64; 4] = [
-        std::f64::consts::FRAC_1_SQRT_2,
-        0.0,
-        std::f64::consts::FRAC_1_SQRT_2,
-        0.0,
-    ];
-
+impl TrunkFrame {
     pub fn new(mount: [f64; 4]) -> Self {
         Self {
             mount,
@@ -100,40 +102,20 @@ impl SflpDecoder {
         self.quat_samples >= 25
     }
 
-    pub fn decode(&mut self, raw: &[u8; IMU_BLOCK_LEN]) -> ImuData {
-        let gyro_sensor = [
-            i16::from_le_bytes([raw[0], raw[1]]) as f64 * GYRO_RAD_PER_LSB,
-            i16::from_le_bytes([raw[2], raw[3]]) as f64 * GYRO_RAD_PER_LSB,
-            i16::from_le_bytes([raw[4], raw[5]]) as f64 * GYRO_RAD_PER_LSB,
-        ];
-        let gyro = rotate(self.mount, gyro_sensor);
-
-        // All-zero quaternion bytes mean SFLP has not written its table yet — the board
-        // just powered up, or its init failed. Keep the last good value.
-        let packed = [
-            u16::from_le_bytes([raw[6], raw[7]]),
-            u16::from_le_bytes([raw[8], raw[9]]),
-            u16::from_le_bytes([raw[10], raw[11]]),
-        ];
-        if packed != [0, 0, 0] {
-            let (x, y, z) = (half(packed[0]), half(packed[1]), half(packed[2]));
-            let norm_sq = x * x + y * y + z * z;
-            // A quaternion the chip never produced would fail this; ≤ 1.02 allows for
-            // half-precision rounding at full scale.
-            if x.is_finite() && y.is_finite() && z.is_finite() && norm_sq <= 1.02 {
-                let w = (1.0 - norm_sq).max(0.0).sqrt();
-                let mount_inv = [
-                    self.mount[0],
-                    -self.mount[1],
-                    -self.mount[2],
-                    -self.mount[3],
-                ];
-                let q = mul([w, x, y, z], mount_inv);
-                let norm = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
-                if norm > 0.5 {
-                    self.last_quat = [q[0] / norm, q[1] / norm, q[2] / norm, q[3] / norm];
-                    self.quat_samples = self.quat_samples.saturating_add(1);
-                }
+    pub fn push(&mut self, reading: SensorReading) -> ImuData {
+        let gyro = rotate(self.mount, reading.gyro);
+        if let Some(sensor_quat) = reading.quat {
+            let mount_inv = [
+                self.mount[0],
+                -self.mount[1],
+                -self.mount[2],
+                -self.mount[3],
+            ];
+            let q = mul(sensor_quat, mount_inv);
+            let norm = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+            if norm > 0.5 {
+                self.last_quat = [q[0] / norm, q[1] / norm, q[2] / norm, q[3] / norm];
+                self.quat_samples = self.quat_samples.saturating_add(1);
             }
         }
 
@@ -156,7 +138,73 @@ impl SflpDecoder {
     }
 }
 
-/// Single-sample spike rejection. A dropped or corrupted block shows up as one wild value;
+/// Decodes the bus board's block into [`ImuData`]: [`parse_block`], then a [`TrunkFrame`].
+pub struct SflpDecoder {
+    frame: TrunkFrame,
+}
+
+impl Default for SflpDecoder {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_MOUNT)
+    }
+}
+
+impl SflpDecoder {
+    /// The board is mounted so that trunk = `[+raw_z, +raw_y, −raw_x]`, a +90° rotation
+    /// about Y.
+    pub const DEFAULT_MOUNT: [f64; 4] = [
+        std::f64::consts::FRAC_1_SQRT_2,
+        0.0,
+        std::f64::consts::FRAC_1_SQRT_2,
+        0.0,
+    ];
+
+    pub fn new(mount: [f64; 4]) -> Self {
+        Self {
+            frame: TrunkFrame::new(mount),
+        }
+    }
+
+    /// See [`TrunkFrame::ready`].
+    pub fn ready(&self) -> bool {
+        self.frame.ready()
+    }
+
+    pub fn decode(&mut self, raw: &[u8; IMU_BLOCK_LEN]) -> ImuData {
+        self.frame.push(parse_block(raw))
+    }
+}
+
+/// The board's 12 bytes as a reading in its own axes.
+pub fn parse_block(raw: &[u8; IMU_BLOCK_LEN]) -> SensorReading {
+    let gyro = [
+        i16::from_le_bytes([raw[0], raw[1]]) as f64 * GYRO_RAD_PER_LSB,
+        i16::from_le_bytes([raw[2], raw[3]]) as f64 * GYRO_RAD_PER_LSB,
+        i16::from_le_bytes([raw[4], raw[5]]) as f64 * GYRO_RAD_PER_LSB,
+    ];
+
+    // All-zero quaternion bytes mean SFLP has not written its table yet — the board
+    // just powered up, or its init failed. The frame keeps the last good value.
+    let packed = [
+        u16::from_le_bytes([raw[6], raw[7]]),
+        u16::from_le_bytes([raw[8], raw[9]]),
+        u16::from_le_bytes([raw[10], raw[11]]),
+    ];
+    let mut quat = None;
+    if packed != [0, 0, 0] {
+        let (x, y, z) = (half(packed[0]), half(packed[1]), half(packed[2]));
+        let norm_sq = x * x + y * y + z * z;
+        // A quaternion the chip never produced would fail this; ≤ 1.02 allows for
+        // half-precision rounding at full scale.
+        if x.is_finite() && y.is_finite() && z.is_finite() && norm_sq <= 1.02 {
+            let w = (1.0 - norm_sq).max(0.0).sqrt();
+            quat = Some([w, x, y, z]);
+        }
+    }
+    SensorReading { gyro, quat }
+}
+
+// Single-sample spike rejection. A dropped or corrupted block shows up as one wild value;
 /// a median over three discards it without the lag of an average.
 fn median3_each(history: &[[f64; 3]; 2], now: [f64; 3]) -> [f64; 3] {
     let m = |a: f64, b: f64, c: f64| a.max(b).min(c).max(a.min(b));
