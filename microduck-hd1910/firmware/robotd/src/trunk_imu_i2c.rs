@@ -7,8 +7,10 @@
 //! Nothing here can make a tick wait: a slow, wedged or absent sensor shows up as an old
 //! sample, and `HostImuGate` refuses it with the bus board's own words.
 //!
-//! Faults go two ways. A device fault — open, lock, a transfer, a malformed packet, a stream
-//! gone quiet — closes the device and reopens it after a backoff, as a new epoch. A chip that
+//! Faults go three ways. A single failed transfer or a packet that makes no sense is dropped
+//! and counted, and the stream goes on. A device fault — open, lock, a run of failed transfers,
+//! a stream with nothing new for its stall time however its reads are going — closes the device
+//! and reopens it after a backoff, as a new epoch. A chip that
 //! starts over by itself (a BNO08x reset) or loses data (an LSM6DSV16X FIFO overrun) is set up
 //! again in place, also as a new epoch. Either way the gate holds samples off for a second while
 //! the fusion settles. Nothing written persists on the chip: a BNO08x's report settings live in
@@ -98,8 +100,6 @@ enum Fault {
     /// A transfer arrived but its bytes made no sense — a header that lost its framing, a
     /// packet that changed between its two reads. Dropped; the next read starts afresh.
     Garbled(String),
-    /// Nothing usable for too long: reopen.
-    Fatal(String),
 }
 
 /// Failed transfers in a row that make a device gone. Fewer are dropped and counted: a reopen
@@ -107,7 +107,9 @@ enum Fault {
 /// trunk IMU, which mid-walk is a fall risk that one missed sample is not.
 const IO_FAILURE_LIMIT: u32 = 5;
 
-/// One streaming step's outcome, with `io_run` counting failed transfers in a row.
+/// One streaming step's outcome, with `io_run` counting failed transfers in a row. `retry`
+/// is the wait after anything dropped: a chip answering garbage is read at the poll interval,
+/// never spun on.
 fn resolve(io_run: &mut u32, result: Result<Step, Fault>, retry: Duration) -> Step {
     match result {
         Ok(step) => {
@@ -125,13 +127,21 @@ fn resolve(io_run: &mut u32, result: Result<Step, Fault>, retry: Duration) -> St
                 Step::Dropped(reason, retry)
             }
         }
-        // The transfer itself worked.
-        Err(Fault::Garbled(reason)) => {
-            *io_run = 0;
-            Step::Dropped(reason, Duration::ZERO)
-        }
-        Err(Fault::Fatal(reason)) => Step::Failed(reason),
+        // The transfer worked but says nothing good about the device: it neither ends a run
+        // of failed transfers nor earns an immediate retry.
+        Err(Fault::Garbled(reason)) => Step::Dropped(reason, retry),
     }
+}
+
+/// Whatever a streaming step came to, a stream that has published nothing new for `stall`
+/// has stopped. Checked after the step, not inside it: a step that returns early on a failed
+/// or garbled read must not skip it, or a chip that answers only garbage — or garbage between
+/// NACKs — is read forever and never reopened.
+fn watchdog(step: Step, now: Instant, last_sample: Instant, stall: Duration, what: &str) -> Step {
+    if matches!(step, Step::Failed(_)) || now.saturating_duration_since(last_sample) <= stall {
+        return step;
+    }
+    Step::Failed(format!("{what} for {} s", stall.as_secs_f64()))
 }
 
 /// What a reader is doing, for `HostImuHealth::state`.
@@ -290,11 +300,6 @@ impl Bno08x {
             last_sample = now;
         }
         self.phase = BnoPhase::Stream { last_sample };
-        if now.saturating_duration_since(last_sample) > BNO08X_STALL {
-            return Err(Fault::Fatal(
-                "BNO08x sent no new orientation for 2 s".into(),
-            ));
-        }
         let wait = if drained { BNO08X_POLL } else { Duration::ZERO };
         Ok(match garbled {
             Some(reason) => Step::Dropped(reason, wait),
@@ -402,7 +407,18 @@ impl Bno08x {
             }
             BnoPhase::Stream { last_sample } => {
                 let result = self.stream(io, now, last_sample, publish);
-                resolve(&mut self.io_run, result, BNO08X_POLL)
+                let step = resolve(&mut self.io_run, result, BNO08X_POLL);
+                match self.phase {
+                    // A step that failed early left the last sample where it was.
+                    BnoPhase::Stream { last_sample } => watchdog(
+                        step,
+                        now,
+                        last_sample,
+                        BNO08X_STALL,
+                        "BNO08x sent no new orientation",
+                    ),
+                    _ => step,
+                }
             }
         })
     }
@@ -649,11 +665,6 @@ impl Lsm6dsv16x {
             last_sample = now;
         }
         self.phase = LsmPhase::Stream { last_sample };
-        if now.saturating_duration_since(last_sample) > LSM6DSV16X_STALL {
-            return Err(Fault::Fatal(
-                "LSM6DSV16X FIFO delivered no new game rotation for 1 s".into(),
-            ));
-        }
         Ok(Step::Again(if at_head {
             LSM6DSV16X_POLL
         } else {
@@ -678,7 +689,17 @@ impl Machine for Lsm6dsv16x {
                 .unwrap_or_else(Step::Failed),
             LsmPhase::Stream { last_sample } => {
                 let result = self.stream(io, now, last_sample, publish);
-                resolve(&mut self.io_run, result, LSM6DSV16X_POLL)
+                let step = resolve(&mut self.io_run, result, LSM6DSV16X_POLL);
+                match self.phase {
+                    LsmPhase::Stream { last_sample } => watchdog(
+                        step,
+                        now,
+                        last_sample,
+                        LSM6DSV16X_STALL,
+                        "LSM6DSV16X FIFO delivered no new game rotation",
+                    ),
+                    LsmPhase::BringUp { .. } => step,
+                }
             }
         }
     }
@@ -1115,6 +1136,11 @@ mod tests {
         answers_id: bool,
         /// Reads still to fail, as a NACK would.
         fail_reads: u32,
+        /// Every header reads all ones, as a wedged chip or a floating bus answers.
+        garbage: bool,
+        /// Alternate a NACK with a garbage header, read after read.
+        flapping: bool,
+        reads: u32,
     }
 
     impl I2c for FakeBno {
@@ -1122,6 +1148,18 @@ mod tests {
             if self.fail_reads > 0 {
                 self.fail_reads -= 1;
                 return Err(io::Error::other("Remote I/O error"));
+            }
+            if self.flapping {
+                self.reads += 1;
+                if self.reads % 2 == 1 {
+                    return Err(io::Error::other("Remote I/O error"));
+                }
+                buf.fill(0xFF);
+                return Ok(buf.len());
+            }
+            if self.garbage {
+                buf.fill(0xFF);
+                return Ok(buf.len());
             }
             if self.body_next {
                 self.body_next = false;
@@ -1356,6 +1394,60 @@ mod tests {
             matches!(step, Step::Failed(ref why) if why.contains("5 transfers failed in a row")),
             "{step:?}"
         );
+    }
+
+    /// Step a streaming chip the way the runner would, for `seconds` of invented time with at
+    /// least `floor` between steps (the runner never waits less than a step takes). Returns the
+    /// waits it asked for, and the failure with the time it came, if one did.
+    fn run_for(
+        chip: &mut dyn Machine,
+        io: &mut dyn I2c,
+        start: Instant,
+        seconds: u64,
+        floor: Duration,
+    ) -> (Vec<Duration>, Option<(String, Duration)>) {
+        let (mut now, mut waits) = (start, Vec::new());
+        while now < start + Duration::from_secs(seconds) {
+            match chip.step(io, now, &mut |_| {}) {
+                Step::Again(wait) | Step::Restart(_, wait) | Step::Dropped(_, wait) => {
+                    waits.push(wait);
+                    now += wait.max(floor);
+                }
+                Step::Failed(reason) => return (waits, Some((reason, now - start))),
+            }
+        }
+        (waits, None)
+    }
+
+    /// The reviewer's probe: a chip whose every header reads all ones. Each read is dropped at
+    /// the poll interval, not spun on at zero wait, and with nothing published the stall
+    /// watchdog reopens it two seconds in — it used to be skipped by the early return, so the
+    /// reader read garbage at full speed forever, "streaming".
+    #[test]
+    fn a_bno08x_answering_garbage_is_polled_then_reopened_at_its_stall() {
+        let t = Instant::now();
+        let (mut chip, mut io, now) = streaming_bno08x(t);
+        io.garbage = true;
+        let (waits, failed) = run_for(&mut chip, &mut io, now, 10, Duration::from_millis(10));
+        assert!(waits.iter().all(|w| *w >= BNO08X_POLL), "{waits:?}");
+        let (reason, at) = failed.expect("never reopened");
+        assert!(reason.contains("no new orientation for 2 s"), "{reason}");
+        assert!(at <= Duration::from_millis(2_100), "{at:?}");
+    }
+
+    /// The reviewer's second probe: a NACK, then a garbage header, over and over. A garbled
+    /// read used to clear the run of failed transfers, so the run never reached five and
+    /// nothing reopened. Now the run counts on, and the stall bounds it anyway.
+    #[test]
+    fn nacks_between_garbage_still_add_up_to_a_reopen() {
+        let t = Instant::now();
+        let (mut chip, mut io, now) = streaming_bno08x(t);
+        io.flapping = true;
+        let (waits, failed) = run_for(&mut chip, &mut io, now, 10, Duration::from_millis(10));
+        assert!(waits.iter().all(|w| *w >= BNO08X_POLL), "{waits:?}");
+        let (reason, at) = failed.expect("never reopened");
+        assert!(reason.contains("5 transfers failed in a row"), "{reason}");
+        assert!(at <= Duration::from_millis(2_100), "{at:?}");
     }
 
     /// A step that spends its budget without emptying the chip publishes nothing: those

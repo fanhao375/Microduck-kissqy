@@ -668,7 +668,11 @@ missing servo. `trunk_imu::HostImuGate` judges the sample: older than 50 ms, the
 three reads running, or less than a second into an *epoch* is refused, with the board's own
 error text. An epoch is a (re)start of the chip's reports — a reopen after a device fault
 (backing off 0.5 s doubling to 10 s), or a chip set up again in place after it reset itself
-(BNO08x) or lost FIFO data (LSM6DSV16X); the second's wait is for the fusion to settle. The
+(BNO08x) or lost FIFO data (LSM6DSV16X); the second's wait is for the fusion to settle. A
+device fault is five failed transfers in a row, or nothing new published for the stall time
+(2 s BNO08x, 1 s LSM6DSV16X) whatever the reads are doing — a chip answering garbage, or garbage
+between NACKs, is reopened rather than read forever. One failed transfer or garbled packet is
+only dropped and counted (`dropped` in the health), and read again at the poll interval. The
 control thread never waits on the reader: a slow, wedged or absent module is an old sample.
 
 **Same post-processing, same meaning.** Every source goes through `imu::TrunkFrame` — the mount,
