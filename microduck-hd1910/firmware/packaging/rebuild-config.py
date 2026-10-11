@@ -83,6 +83,10 @@ def prepare_calibration(path,base=BASE):
     if not has_local or data.get('imu_mount_verified') is not True:
         imu_source=saved if saved.get('imu_mount_verified') is True and any(r.get('calibrated') is True for r in saved.get('joints',[])) else seed
         for name in ('imu_mount_quat','imu_mount_verified'):data[name]=copy.deepcopy(imu_source[name])
+    # A module's mount ([imu_mounts.*]) is never seeded — the shipped snapshot is a bus robot's.
+    # Keep the local table, or the saved one when the local file has lost it.
+    if 'imu_mounts' not in data and isinstance(saved.get('imu_mounts'),dict):
+        data['imu_mounts']=copy.deepcopy(saved['imu_mounts'])
     if restored or imu_source is not None:
         data['motion_enabled']=False
         print('安装恢复装配标定：补齐 '+str(len(restored))+' 个关节；头部 ID 33 零位 '+str(data['joints'][8]['zero_raw'])+'；IMU '+('已恢复' if imu_source is not None else '保留本机设置'),flush=True)

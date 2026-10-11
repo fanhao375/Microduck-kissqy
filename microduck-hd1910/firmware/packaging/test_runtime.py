@@ -37,6 +37,8 @@ class RuntimeTests(unittest.TestCase):
             self.assertIn('--uart-setup',text)
             self.assertIn('--port /dev/ttyS2',text)
             self.assertIn('uart-service.py prepare',text)
+            # A trunk IMU module is opened by robotd on /dev/i2c-*.
+            self.assertIn('DeviceAllow=char-i2c rw',text)
         legacy=runtime.DROPINS/'zzzzz-old-test.conf'
         legacy.write_text('[Service]\nExecStart=\nExecStart=/opt/robot/feetech-ft5-r5/robotd-old-test --port /dev/ttyS9\nEnvironment=KEEP=1\n')
         old_profile=runtime.DROPINS/'zzzz-old-model-r4.conf'

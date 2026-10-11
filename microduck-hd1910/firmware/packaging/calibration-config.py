@@ -33,11 +33,34 @@ def integer(value: object, lo: int, hi: int) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and lo <= value <= hi
 
 
-def validate(data: dict) -> None:
-    require(data.get('imu_mount_verified') is True, 'IMU 安装方向尚未确认，请在正式服务中执行 bus verify-imu --confirmed。')
-    quat = data.get('imu_mount_quat')
-    require(isinstance(quat, list) and len(quat) == 4 and all(number(x) for x in quat), 'IMU 四元数必须包含四个有限数值。')
-    require(abs(sum(x*x for x in quat) - 1.0) <= 1e-6, 'IMU 安装四元数未归一化。')
+# robotd's [trunk_imu] sources. Each module keeps its own mount under [imu_mounts.<source>];
+# the bus board's stays in the top-level keys (docs/design/robotd-design.md owns the rule).
+SOURCES = ('bus', 'bno08x', 'lsm6dsv16x')
+
+
+def check_quat(quat: object, label: str) -> None:
+    require(isinstance(quat, list) and len(quat) == 4 and all(number(x) for x in quat), f'{label}四元数必须包含四个有限数值。')
+    require(abs(sum(x*x for x in quat) - 1.0) <= 1e-6, f'{label}安装四元数未归一化。')
+
+
+def validate(data: dict, source: str = 'bus') -> None:
+    """Motion needs the mount of the trunk IMU robotd actually reads to be verified."""
+    require(source in SOURCES, f'未知的躯干 IMU 来源：{source}')
+    mounts = data.get('imu_mounts', {})
+    require(isinstance(mounts, dict) and set(mounts) <= set(SOURCES[1:]), 'imu_mounts 只能包含 bno08x / lsm6dsv16x。')
+    if source == 'bus':
+        require(data.get('imu_mount_verified') is True, 'IMU 安装方向尚未确认，请在正式服务中执行 bus verify-imu --confirmed。')
+        check_quat(data.get('imu_mount_quat'), 'IMU ')
+    else:
+        mount = mounts.get(source)
+        require(isinstance(mount, dict) and mount.get('verified') is True,
+                f'{source} IMU 安装方向尚未确认，请在正式服务中执行 bus verify-imu --confirmed。')
+        if 'imu_mount_quat' in data:
+            check_quat(data['imu_mount_quat'], '总线 IMU ')
+    # robotd refuses a file with any mount that is not a rotation, used or not.
+    for name, mount in mounts.items():
+        require(isinstance(mount, dict), f'imu_mounts.{name} 必须是表。')
+        check_quat(mount.get('quat'), f'{name} IMU ')
     joints = data.get('joints')
     require(isinstance(joints, list) and len(joints) == 15, '需要 15 个关节的实际标定。')
     ids = set()
@@ -81,11 +104,20 @@ def migrate(path: Path) -> list[str]:
     return removed
 
 
+def configured_source(calibration: Path) -> str:
+    """The [trunk_imu] source of the robotd.toml beside the calibration, as installed."""
+    params = calibration.with_name('robotd.toml')
+    if not params.exists():
+        return 'bus'
+    return tomllib.loads(params.read_text()).get('trunk_imu', {}).get('source', 'bus')
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=['check', 'enable', 'migrate', 'copy'])
     parser.add_argument('path', type=Path)
     parser.add_argument('--output',type=Path)
+    parser.add_argument('--source', choices=SOURCES, help='默认读取同目录 robotd.toml 的 [trunk_imu] source')
     args = parser.parse_args()
     try:
         if args.action == 'copy':
@@ -96,7 +128,7 @@ def main() -> None:
             print('清理旧运动参数：' + (', '.join(removed) if removed else '无需清理'))
             return
         data = tomllib.loads(args.path.read_text())
-        validate(data)
+        validate(data, args.source or configured_source(args.path))
         if args.action == 'enable':
             data['motion_enabled'] = True
             save(args.path, data)

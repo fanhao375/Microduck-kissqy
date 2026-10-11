@@ -33,6 +33,14 @@ class RecoveryTests(unittest.TestCase):
                 self.assertIn('a481d9f211f31d9476ab1a319fe362a2',skill['path']);self.assertEqual(skill['duration_s'],9.0);self.assertEqual(skill['params']['action_scale'],1.0)
                 self.assertEqual(result['pad'],data['pad']);self.assertEqual(self.cal.read_bytes(),self.raw_cal)
 
+    def test_an_upgrade_keeps_the_trunk_imu_source(self):
+        # [trunk_imu] is the operator's wiring; the shipped profile has no such table to impose.
+        data=tomllib.loads((ROOT/'packaging/robotd-profile.toml').read_text())
+        data['trunk_imu']={'source':'bno08x','i2c_device':'/dev/i2c-4','i2c_address':0x4B}
+        source=self.base/'old.toml';source.write_text(dumps(data));output=self.base/'new.toml'
+        subprocess.run([sys.executable,str(ROOT/'packaging/configure.py'),'--source',str(source),'--previous-overrides',str(ROOT/'packaging/robotd-profile.toml'),'--overrides',str(ROOT/'packaging/robotd-profile.toml'),'--output',str(output)],check=True,capture_output=True,text=True)
+        self.assertEqual(tomllib.loads(output.read_text())['trunk_imu'],data['trunk_imu'])
+
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory();self.base=Path(self.temp.name)
         self.params=self.base/'robotd.toml';self.cal=self.base/'calibration.toml';self.state=self.base/'uart-state.json'

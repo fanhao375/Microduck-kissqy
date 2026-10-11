@@ -170,6 +170,12 @@ def verify_calibration():
         if not same(actual.get(field),expected.get(field,0 if field=='current_ma_per_count' else False)):raise ValueError('标定运行回读不一致：'+field)
     if len(actual.get('imu_mount_quat',[]))!=4 or any(not same(a,b) for a,b in zip(actual['imu_mount_quat'],expected['imu_mount_quat'])):
         raise ValueError('IMU 安装四元数未按保存文件加载')
+    loaded_mounts,saved_mounts=actual.get('imu_mounts',{}),expected.get('imu_mounts',{})
+    if set(loaded_mounts)!=set(saved_mounts):raise ValueError('模块 IMU 安装未按保存文件加载')
+    for name,saved in saved_mounts.items():
+        loaded=loaded_mounts[name]
+        if loaded.get('verified',False)!=saved.get('verified',False) or len(loaded.get('quat',[]))!=4 or any(not same(a,b) for a,b in zip(loaded['quat'],saved['quat'])):
+            raise ValueError('模块 IMU 安装未按保存文件加载：'+name)
     if len(actual.get('joints',[]))!=15:raise ValueError('运行服务未加载 15 个关节标定')
     for row,loaded in zip(expected['joints'],actual['joints']):
         for key in ('name','id','zero_raw','direction','calibrated','min_rad','max_rad'):
@@ -180,6 +186,8 @@ def verify_calibration():
 
 
 def unit(mode):
+    # char-i2c: a trunk IMU module on the board's I2C ([trunk_imu] in robotd.toml) is opened by
+    # robotd itself; without it /dev/i2c-* fails with EPERM. Harmless for the bus board.
     if mode not in ('commissioning', 'motion'): raise ValueError('服务模式无效')
     extra = ' --commissioning' if mode == 'commissioning' else ''
     return (f'# R17 / official 0.15.1 / self-trained HD1910 exports.\n'
@@ -189,7 +197,7 @@ def unit(mode):
             f'ExecStopPost=-/usr/bin/logger -t robotd-exit "result=${{SERVICE_RESULT}} code=${{EXIT_CODE}} status=${{EXIT_STATUS}}"\n'
             f'ExecStartPre=+/usr/bin/python3 {BASE}/uart-service.py prepare\n'
             f'ExecStartPost=+/usr/bin/python3 {BASE}/uart-service.py apply --pid $MAINPID --mode {mode}\n'
-            f'TimeoutStartSec=20s\nReadWritePaths=/run {CONFIG.parent} {MODEL_DIR} {STATE_DIR}\nPrivateDevices=no\nDeviceAllow={PORT} rw\nDeviceAllow=char-alsa rw\nSupplementaryGroups=audio\n')
+            f'TimeoutStartSec=20s\nReadWritePaths=/run {CONFIG.parent} {MODEL_DIR} {STATE_DIR}\nPrivateDevices=no\nDeviceAllow={PORT} rw\nDeviceAllow=char-alsa rw\nDeviceAllow=char-i2c rw\nSupplementaryGroups=audio\n')
 
 
 def configure_startup(mode):
@@ -250,7 +258,8 @@ def motion_readiness():
         spec = importlib.util.spec_from_file_location('r17_saved_calibration', Path(__file__).with_name('calibration-config.py'))
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        module.validate(tomllib.loads(CONFIG.with_name('hd1910-calibration.toml').read_text()))
+        path=CONFIG.with_name('hd1910-calibration.toml')
+        module.validate(tomllib.loads(path.read_text()),module.configured_source(path))
         return {'motion_ready': True, 'motion_readiness_message': '本机保存的 15 关节标定与 IMU 已通过检查'}
     except (OSError, ValueError, TypeError) as exc:
         return {'motion_ready': False, 'motion_readiness_message': str(exc)}
