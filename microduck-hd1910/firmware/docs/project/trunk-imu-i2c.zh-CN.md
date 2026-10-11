@@ -60,3 +60,20 @@ R17 的 robotd 只认一种躯干 IMU：舵机总线上的 FT6 / imu_to_dxl 小�
 - I²C 受舵机电流干扰时会重开，约 0.5 s 起的退避空窗加 1 秒稳定期，控制环先 coast 再 hold。
 - 新板要启用对应 I²C overlay；servo-web 占着节点时 flock 失败，报错会点名。
 - 升级时 `configure.py` 的合并保留 `[trunk_imu]`（有测试）；其他重建路径（`rebuild-config.py` 从 `.saved` 副本恢复）照搬整个文件，也应保留，但没有在板上走过一遍。
+
+## 第一次上真机（2026-10-12，BNO085，第一台）
+
+装法：官方 `daemon-v0.15.1` 用本地发布文件安装 → 本分支打出的 R17 包（原版包换 robotd、robotctl、`calibration-config.py`、`rebuild-config.py`、`runtime.py`、`voice-setup.py`，重算 `SHA256SUMS`）→ `robotd.toml` 加 `[trunk_imu] source = "bno08x"`、`/dev/i2c-4`、`0x4B`。
+
+已在真机确认：
+
+- BNO085 识别成功：`part=10003676 version=(2, 6, 6) build=193`。两段读取和时钟拉伸在 RK3566 的 i2c-dev 上都正常，没有出现乱码或重开。
+- 调试模式和运动模式都不读 ID 200，15 颗舵机 50 Hz 全应答；`robotctl health` 报 healthy。
+- 安装时没有 HAT 声卡，`voice-setup.py` 的 `alsactl store aic3104` 会让整个升级失败，已修（`790b45d`）：没有这张声卡就跳过音频设置。
+- 运动模式下 HOME（`robot.init`）写入 P5/D20 并回读确认，2 秒到位；启用策略原地保持 10 秒，机身倾斜从 6.6° 收到 3.3°。
+
+真机上发现、还没解决的：
+
+- **IMU 过期帧约 1.7%**（调试模式 2878 帧里 48 帧超过 50 ms；运动模式 `robotctl health` 报 1/52）。都是单帧，控制循环会 coast。当时 CPU 过热锁在 408 MHz，要等散热解决后复测，才能分清是降频还是读取线程本身的问题。
+- **`verify-imu` 没法在站着时做**：它只在调试模式下可用，而调试模式启动时会卸力。手扶软鸭子做不到 ≤5°（读到 15.2°）。这次是用 servo-web 让鸭子站到 HOME，读 BNO085 加速度，按 verify-imu 同样的标准判定（站立 4.95°；前倾变化 16.2°，方向偏正前方 3.9°），再手动写入 `[imu_mounts.bno08x]`（默认 quat，`verified = true`）。后续要让 verify-imu 能在运动模式的 HOME 保持状态下运行，或者让调试模式可以选择保持上力。
+- 原版 R17 的问题，跟本分支无关，但上机时会碰到：首次安装会把样机标定写成本机标定；舵机被别的程序上了力时，HOME 只核对 P/D、不重写，于是拒绝上力；`service.sh init` 在 robotd 运行时会抢锁失败；CPU 降频时网页手柄（webpad）超过 0.6 秒等不到 padd 确认，按键作废。
