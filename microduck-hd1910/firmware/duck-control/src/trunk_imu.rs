@@ -1,16 +1,18 @@
 //! Where the trunk IMU is wired, and how a sensor off the bus reaches the control loop.
 //!
-//! Two sources, chosen by configuration and never probed for:
+//! Chosen by configuration and never probed for:
 //!
 //! - [`TrunkImuKind::Bus`]: the FT6 board, ID 200 on the servo bus. Its block arrives in the
 //!   servos' own Sync Read and [`crate::feetech`] judges its freshness from the board's status.
-//! - [`TrunkImuKind::Bno08x`]: a BNO085/BNO086 module on the board's own I²C. Something outside
-//!   this crate (robotd's reader thread, Linux only) owns the device, speaks SH-2 to it with
-//!   the [`crate::bno08x`] codec, and publishes the newest [`HostImuSample`] behind [`HostImu`]. The
-//!   control thread takes one per tick and [`HostImuGate`] decides whether it is fit to use.
+//! - A module on the board's own I²C — [`TrunkImuKind::Bno08x`] (BNO085/BNO086, codec in
+//!   [`crate::bno08x`]) or [`TrunkImuKind::Lsm6dsv16x`] (the bus board's own chip on a
+//!   breakout, codec in [`crate::lsm6dsv16x`]). Something outside this crate (robotd's reader
+//!   thread, Linux only) owns the device, speaks the codec to it, and publishes the newest
+//!   [`HostImuSample`] behind [`HostImu`]. The control thread takes one per tick and
+//!   [`HostImuGate`] decides whether it is fit to use.
 //!
-//! Both end in the same [`crate::imu::TrunkFrame`], so the policy cannot tell them apart
-//! except through the mount each one was commissioned with.
+//! All of them end in the same [`crate::imu::TrunkFrame`], so the policy cannot tell them
+//! apart except through the mount each one was commissioned with.
 //!
 //! The control thread never waits on the reader: a slow or wedged I²C bus shows up as an old
 //! sample and a refused tick, the same failure the bus board produces, rather than as a
@@ -29,16 +31,18 @@ use crate::io::{ImuStale, IoError, Result};
 pub enum TrunkImuKind {
     Bus,
     Bno08x,
+    Lsm6dsv16x,
 }
 
 impl TrunkImuKind {
-    pub const ALL: [Self; 2] = [Self::Bus, Self::Bno08x];
+    pub const ALL: [Self; 3] = [Self::Bus, Self::Bno08x, Self::Lsm6dsv16x];
 
     /// The name configuration and diagnostics use for it.
     pub fn label(self) -> &'static str {
         match self {
             Self::Bus => "bus",
             Self::Bno08x => "bno08x",
+            Self::Lsm6dsv16x => "lsm6dsv16x",
         }
     }
 
@@ -47,6 +51,9 @@ impl TrunkImuKind {
         match self {
             Self::Bus => SflpDecoder::DEFAULT_MOUNT,
             Self::Bno08x => BNO08X_DEFAULT_MOUNT,
+            // A breakout has no standard way up. Identity says "unknown" honestly: it is
+            // only ever a starting point, and motion waits for a verified mount anyway.
+            Self::Lsm6dsv16x => [1.0, 0.0, 0.0, 0.0],
         }
     }
 }
@@ -60,7 +67,9 @@ pub const BNO08X_DEFAULT_MOUNT: [f64; 4] = [0.5, 0.5, 0.5, 0.5];
 /// The newest reading from a sensor the host reads itself, as the reader published it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HostImuSample {
-    /// Fused orientation, sensor→world, scalar-first, unit length with `w ≥ 0`.
+    /// Fused orientation, sensor→world, scalar-first, `w ≥ 0`. Unit length up to the chip's
+    /// own rounding — an LSM6DSV16X's half-precision components are passed on exactly as the
+    /// bus board's are, and [`crate::imu::TrunkFrame`] normalises both the same way.
     pub quat: [f64; 4],
     /// Angular velocity in the sensor's axes, rad/s.
     pub gyro: [f64; 3],
@@ -266,8 +275,12 @@ mod tests {
             SflpDecoder::DEFAULT_MOUNT
         );
         assert_eq!(TrunkImuKind::Bno08x.default_mount(), BNO08X_DEFAULT_MOUNT);
+        assert_eq!(
+            TrunkImuKind::Lsm6dsv16x.default_mount(),
+            [1.0, 0.0, 0.0, 0.0]
+        );
         let labels: Vec<_> = TrunkImuKind::ALL.iter().map(|k| k.label()).collect();
-        assert_eq!(labels, ["bus", "bno08x"]);
+        assert_eq!(labels, ["bus", "bno08x", "lsm6dsv16x"]);
         for kind in TrunkImuKind::ALL {
             assert_eq!(
                 serde_json::to_value(kind).unwrap(),
