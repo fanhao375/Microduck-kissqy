@@ -1017,7 +1017,8 @@ impl Calibration {
         {
             return Err(error(match source {
                 Some(kind) if kind != TrunkImuKind::Bus => format!(
-                    "motion requires all 15 calibrated joints, measured limits and verified IMU                      mounting for the {} IMU",
+                    "motion requires all 15 calibrated joints, measured limits and verified IMU \
+                     mounting for the {} IMU",
                     kind.label()
                 ),
                 _ => "motion requires all 15 calibrated joints, measured limits and verified IMU mounting"
@@ -2704,6 +2705,7 @@ quat = [1.0, 0.0, 0.0, 0.0]
         for kind in [TrunkImuKind::Bno08x, TrunkImuKind::Lsm6dsv16x] {
             let error = cal.validate_motion_for(kind).unwrap_err().to_string();
             assert!(error.contains(kind.label()), "{error}");
+            assert!(!error.contains("  "), "a broken line continuation: {error}");
         }
         cal.imu_mount_verified = false;
         cal.set_imu_mount(

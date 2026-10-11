@@ -487,7 +487,8 @@ fn verify_imu(
         // has to read upright through the mount being confirmed, or the mount is wrong.
         if tilt.is_none_or(|t| t > super::home_start::MAX_TILT_DEG) {
             return Err(format!(
-                "under this mount the trunk reads {} from upright (limit {}°); stand the robot                  upright, or the mount is wrong: {echo}",
+                "under this mount the trunk reads {} from upright (limit {}°); stand the robot \
+                 upright, or the mount is wrong: {echo}",
                 tilt.map_or("no valid gravity".to_owned(), |t| format!("{t:.1}°")),
                 super::home_start::MAX_TILT_DEG
             ));
@@ -1665,6 +1666,10 @@ mod tests {
         assert!(
             error.contains("25.0°") && error.contains("gravity"),
             "{error}"
+        );
+        assert!(
+            !error.contains("  "),
+            "a broken line continuation: {error}"
         );
         let none = ImuContext {
             source: TrunkImuKind::Lsm6dsv16x,
