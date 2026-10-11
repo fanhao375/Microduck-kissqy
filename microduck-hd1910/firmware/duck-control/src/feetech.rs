@@ -1265,6 +1265,8 @@ enum TrunkImu {
         frame: TrunkFrame,
         /// Age of the last sample a tick accepted, as the bus board's age is.
         latest_age_ms: Option<u16>,
+        /// Epoch of the last sample a tick accepted: a new one restarts the frame's median.
+        accepted_epoch: Option<u32>,
     },
 }
 
@@ -1395,6 +1397,7 @@ impl FeetechIo {
             gate: HostImuGate::default(),
             reader,
             latest_age_ms: None,
+            accepted_epoch: None,
         };
         Self::with_trunk_imu(bus, calibration, imu)
     }
@@ -1532,9 +1535,14 @@ impl FeetechIo {
                 reader,
                 gate,
                 frame,
+                accepted_epoch,
                 ..
             } => {
                 let sample = gate.check(reader.latest(), Instant::now())?;
+                if *accepted_epoch != Some(sample.epoch) {
+                    frame.restart_median();
+                    *accepted_epoch = Some(sample.epoch);
+                }
                 let reading = SensorReading {
                     gyro: sample.gyro,
                     quat: Some(sample.quat),
@@ -3022,6 +3030,8 @@ mod hd1910_transport_tests {
         kind: TrunkImuKind,
         sequence: std::sync::atomic::AtomicU32,
         stalled: Arc<AtomicBool>,
+        /// A later epoch and the orientation it reports, once the test restarts the stream.
+        restarted: Arc<Mutex<Option<(u32, [f64; 4])>>>,
     }
     impl FreshHost {
         fn new(kind: TrunkImuKind) -> Self {
@@ -3029,6 +3039,7 @@ mod hd1910_transport_tests {
                 kind,
                 sequence: std::sync::atomic::AtomicU32::new(0),
                 stalled: Arc::new(AtomicBool::new(false)),
+                restarted: Arc::new(Mutex::new(None)),
             }
         }
     }
@@ -3044,8 +3055,13 @@ mod hd1910_transport_tests {
             } else {
                 self.sequence.fetch_add(1, Ordering::Relaxed) + 1
             };
+            let (epoch, quat) = self
+                .restarted
+                .lock()
+                .unwrap()
+                .unwrap_or((1, self.kind.default_mount()));
             Some(crate::trunk_imu::HostImuSample {
-                quat: self.kind.default_mount(),
+                quat,
                 gyro: [0.0; 3],
                 received_at: if stalled {
                     now - Duration::from_millis(200)
@@ -3053,7 +3069,7 @@ mod hd1910_transport_tests {
                     now
                 },
                 sequence,
-                epoch: 1,
+                epoch,
                 epoch_started_at: now - Duration::from_secs(5),
                 accuracy: None,
             })
@@ -3208,6 +3224,38 @@ mod hd1910_transport_tests {
         assert!(error.contains("Feetech IMU not ready or stale"), "{error}");
         assert_eq!(io.latest_sample_at, before);
         assert!(io.imu_ready(), "a stale tick is not a convergence reset");
+    }
+
+    /// A module stream that started over (a reopen, a chip reset) is a new epoch, and the
+    /// first sample of it is reported as itself: the median does not carry the orientation from
+    /// before the outage across it. The bus board's decoder never restarts.
+    #[test]
+    fn a_new_host_epoch_restarts_the_median_but_not_readiness() {
+        let (bus, _device) = emulator(false);
+        let host = FreshHost::new(TrunkImuKind::Bno08x);
+        let restarted = Arc::clone(&host.restarted);
+        let mut io = FeetechIo::from_bus_with_imu(
+            bus,
+            calibration_for(TrunkImuKind::Bno08x),
+            Box::new(host),
+        )
+        .unwrap();
+        for _ in 0..30 {
+            io.read().unwrap();
+        }
+        // Pitched 30° nose-down: sensor = trunk · mount for the BNO08x default mount.
+        let (c, v) = (15f64.to_radians().cos(), 15f64.to_radians().sin());
+        let pitched = [0.5 * (c - v), 0.5 * (c + v), 0.5 * (c + v), 0.5 * (c - v)];
+        *restarted.lock().unwrap() = Some((2, pitched));
+        let gravity = io.read().unwrap().imu.gravity;
+        assert!(
+            (gravity[0] - 30f64.to_radians().sin()).abs() < 1e-9,
+            "the old epoch leaked through the median: {gravity:?}"
+        );
+        assert!(
+            io.imu_ready(),
+            "a restarted stream is not an unconverged chip"
+        );
     }
 
     /// The board is read in the servos' Sync Read; handing it in as a host reader would skip

@@ -82,6 +82,8 @@ pub struct TrunkFrame {
     quat_samples: u32,
     gyro_history: [[f64; 3]; 2],
     gravity_history: [[f64; 3]; 2],
+    /// The next reading fills the median's history instead of joining it.
+    seed_median: bool,
 }
 
 impl TrunkFrame {
@@ -92,7 +94,16 @@ impl TrunkFrame {
             quat_samples: 0,
             gyro_history: [[0.0; 3]; 2],
             gravity_history: [[0.0, 0.0, -1.0]; 2],
+            seed_median: false,
         }
+    }
+
+    /// Start the three-point median afresh at the next reading. For a stream that has just
+    /// started over: the two readings before an outage say nothing about the robot after it,
+    /// and a median across the gap would report the old orientation as the new one. The ready
+    /// count is untouched — a restarted stream is not an unconverged chip.
+    pub fn restart_median(&mut self) {
+        self.seed_median = true;
     }
 
     /// Whether the chip has demonstrably produced fused output — roughly 0.25 s at 100 Hz.
@@ -127,6 +138,11 @@ impl TrunkFrame {
         // slice 2 wires up observations — normalising after the median would guarantee it,
         // but that is a behaviour change to a path that currently walks.
         let gravity = normalise(rotate_inverse(self.last_quat, [0.0, 0.0, -1.0]));
+        if self.seed_median {
+            self.seed_median = false;
+            self.gyro_history = [gyro; 2];
+            self.gravity_history = [gravity; 2];
+        }
 
         let out = ImuData {
             gyro: median3_each(&self.gyro_history, gyro),
@@ -771,6 +787,41 @@ mod tests {
             d.decode(&BLOCKS[6]);
             assert!(d.ready());
         }
+    }
+
+    /// After `restart_median` the next reading is reported as itself, not as the median of
+    /// two readings from before the restart and this one; and the frame stays ready.
+    #[test]
+    fn a_restarted_median_reports_the_first_new_reading_as_itself() {
+        let mut frame = TrunkFrame::new([1.0, 0.0, 0.0, 0.0]);
+        let upright = SensorReading {
+            gyro: [0.0; 3],
+            quat: Some([1.0, 0.0, 0.0, 0.0]),
+        };
+        for _ in 0..30 {
+            frame.push(upright);
+        }
+        // Pitched 30° about +Y: the half angle is 15°.
+        let (c, v) = (15f64.to_radians().cos(), 15f64.to_radians().sin());
+        let pitched = SensorReading {
+            gyro: [0.0, 0.5, 0.0],
+            quat: Some([c, 0.0, v, 0.0]),
+        };
+        frame.restart_median();
+        let out = frame.push(pitched);
+        assert!(frame.ready());
+        assert!(
+            (out.gravity[0] - 30f64.to_radians().sin()).abs() < 1e-12,
+            "{:?}",
+            out.gravity
+        );
+        assert_eq!(out.gyro, [0.0, 0.5, 0.0]);
+        // Without a restart the same jump is held off by the median, as it always was.
+        let mut plain = TrunkFrame::new([1.0, 0.0, 0.0, 0.0]);
+        for _ in 0..30 {
+            plain.push(upright);
+        }
+        assert_eq!(plain.push(pitched).gravity, [0.0, 0.0, -1.0]);
     }
 
     /// Gyro counts are signed. Reading them as unsigned would turn every negative rate

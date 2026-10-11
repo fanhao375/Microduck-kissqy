@@ -994,6 +994,7 @@ pub async fn run(
     let mut imu_decoder = SflpDecoder::new(calibration.imu_mount_quat);
     let mut imu_frame = TrunkFrame::new(calibration.imu_mount(source).quat);
     let mut imu_gate = HostImuGate::default();
+    let mut imu_epoch = None;
     let mut host_reading = None;
     let mut last_sample = None;
     let mut last_failure = None;
@@ -1037,6 +1038,10 @@ pub async fn run(
                     .fetch_add(after.total - before.total, Ordering::Relaxed);
                 state.imu_stale_run.store(after.run, Ordering::Relaxed);
                 let sample = checked.map_err(|e| format!("IMU {}: {e}", source.label()))?;
+                if imu_epoch != Some(sample.epoch) {
+                    imu_frame.restart_median();
+                    imu_epoch = Some(sample.epoch);
+                }
                 let reading = SensorReading {
                     gyro: sample.gyro,
                     quat: Some(sample.quat),
@@ -1667,10 +1672,7 @@ mod tests {
             error.contains("25.0°") && error.contains("gravity"),
             "{error}"
         );
-        assert!(
-            !error.contains("  "),
-            "a broken line continuation: {error}"
-        );
+        assert!(!error.contains("  "), "a broken line continuation: {error}");
         let none = ImuContext {
             source: TrunkImuKind::Lsm6dsv16x,
             reading: None,
