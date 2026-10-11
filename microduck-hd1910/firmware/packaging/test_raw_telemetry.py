@@ -324,6 +324,8 @@ console.log('PASS');
         service=(ROOT/'console/static/service.js').read_text(encoding='utf-8')
         self.assertIn('imuMountSlot(s.calibration)',service)
         self.assertNotIn('saved?.imu_mount_quat',service)
+        # The hint states the module's 5° upright limit robotd enforces.
+        self.assertIn('5° 以内',service)
 
     def test_browser_adapter_matches_existing_python_store_for_motion_commissioning_and_stale_samples(self):
         cfg={'mode':'service','control_enabled':True,'ids':IDS,'names':NAMES,'labels':LABELS,'version':VERSION,'baseline':BASELINE}

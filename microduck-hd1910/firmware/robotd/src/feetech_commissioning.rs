@@ -68,9 +68,10 @@ pub enum BusCommand {
     /// Show the persisted calibration and what still prevents full control.
     CalibrationStatus,
     /// Record that the official IMU mounting axes have been physically checked — for the
-    /// trunk IMU this robotd reads (`[trunk_imu] source`), in that source's own slot. For a
-    /// module, start with the robot upright (≤ 10° under the mount being confirmed), then tip
-    /// it nose-down by 15–30° within 20 s; the command answers once it has seen the tip.
+    /// trunk IMU this robotd reads (`[trunk_imu] source`), in that source's own slot. For the
+    /// bus board that check is the operator's word. For a module, start with the robot upright
+    /// (within 5° under the mount being confirmed), then tip it nose-down by 15–30° within 20 s;
+    /// the command answers once it has seen the tip.
     VerifyImu {
         #[arg(long, required = true)]
         confirmed: bool,
@@ -1894,6 +1895,24 @@ mod tests {
     }
 
     const BNO: [f64; 4] = duck_control::trunk_imu::BNO08X_DEFAULT_MOUNT;
+
+    /// The CLI help states the limit the check enforces, and the bus board's own rule, so the
+    /// two cannot drift apart again (it said ≤ 10° after the module limit became 5°).
+    #[test]
+    fn verify_imu_help_states_both_rules() {
+        let command = BusCommand::augment_subcommands(clap::Command::new("bus"));
+        let verify = command.find_subcommand("verify-imu").unwrap();
+        let help = verify
+            .get_long_about()
+            .or(verify.get_about())
+            .unwrap()
+            .to_string();
+        assert!(
+            help.contains(&format!("within {MODULE_UPRIGHT_DEG}°")),
+            "{help}"
+        );
+        assert!(help.contains("bus board"), "{help}");
+    }
 
     /// The upright half: under the mount being confirmed the trunk must read within 5° of
     /// upright — whatever it reads here stays as a tilt bias, so half the HOME guard's 10° —
