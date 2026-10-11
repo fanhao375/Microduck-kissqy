@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::imu::SflpDecoder;
 use crate::io::{ImuStale, IoError, JointTargets, Result, RobotIo, Sensors, SlowSensors};
 use crate::model::{JOINT_NAMES, NUM_JOINTS};
+use crate::trunk_imu::TrunkImuKind;
 
 pub const BAUD: u32 = 1_000_000;
 pub const IMU_ID: u8 = 200;
@@ -764,9 +765,50 @@ pub struct Calibration {
     pub current_ma_per_count: f64,
     #[serde(default)]
     pub units_verified: bool,
+    /// Mounts of trunk IMUs other than the bus board, by source. The bus board's stays in
+    /// `imu_mount_quat`/`imu_mount_verified`, where every existing file already has it, so
+    /// such a file reads and writes exactly as before. See [`Calibration::imu_mount`].
+    #[serde(default, skip_serializing_if = "ImuMounts::is_empty")]
+    pub imu_mounts: ImuMounts,
 }
 fn default_imu_mount() -> [f64; 4] {
     SflpDecoder::DEFAULT_MOUNT
+}
+
+/// One trunk IMU's commissioned mount.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImuMount {
+    /// Sensor-to-trunk rotation [w, x, y, z], not a heading reset.
+    pub quat: [f64; 4],
+    #[serde(default)]
+    pub verified: bool,
+}
+
+/// `[imu_mounts.<source>]`: one entry per source that is not the bus board.
+///
+/// Per source because the two sensors sit in different places, so a mount verified for one
+/// says nothing about the other — and a robot switched back to the board must find the
+/// board's mount where it left it.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImuMounts {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bno08x: Option<ImuMount>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lsm6dsv16x: Option<ImuMount>,
+}
+impl ImuMounts {
+    fn is_empty(&self) -> bool {
+        self.bno08x.is_none() && self.lsm6dsv16x.is_none()
+    }
+    fn slot(&mut self, kind: TrunkImuKind) -> Option<&mut Option<ImuMount>> {
+        match kind {
+            TrunkImuKind::Bus => None,
+            TrunkImuKind::Bno08x => Some(&mut self.bno08x),
+            TrunkImuKind::Lsm6dsv16x => Some(&mut self.lsm6dsv16x),
+        }
+    }
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -840,14 +882,49 @@ impl Calibration {
                 .collect(),
             current_ma_per_count: 0.0,
             units_verified: false,
+            imu_mounts: ImuMounts::default(),
+        }
+    }
+    /// The mount commissioned for `kind`; an unverified default for a source never
+    /// commissioned.
+    pub fn imu_mount(&self, kind: TrunkImuKind) -> ImuMount {
+        let commissioned = match kind {
+            TrunkImuKind::Bus => Some(ImuMount {
+                quat: self.imu_mount_quat,
+                verified: self.imu_mount_verified,
+            }),
+            TrunkImuKind::Bno08x => self.imu_mounts.bno08x,
+            TrunkImuKind::Lsm6dsv16x => self.imu_mounts.lsm6dsv16x,
+        };
+        commissioned.unwrap_or(ImuMount {
+            quat: kind.default_mount(),
+            verified: false,
+        })
+    }
+    /// Record `kind`'s mount. The bus board's goes where it always has.
+    pub fn set_imu_mount(&mut self, kind: TrunkImuKind, mount: ImuMount) {
+        match self.imu_mounts.slot(kind) {
+            Some(slot) => *slot = Some(mount),
+            None => {
+                self.imu_mount_quat = mount.quat;
+                self.imu_mount_verified = mount.verified;
+            }
         }
     }
     pub fn validate(&self) -> Result<()> {
-        let mount_norm = self.imu_mount_quat.iter().map(|v| v * v).sum::<f64>();
-        if !mount_norm.is_finite() || (mount_norm - 1.0).abs() > 1e-6 {
-            return Err(error(
-                "IMU mounting quaternion must be finite unit length [w,x,y,z]",
-            ));
+        for kind in TrunkImuKind::ALL {
+            let mount_norm = self.imu_mount(kind).quat.iter().map(|v| v * v).sum::<f64>();
+            if !mount_norm.is_finite() || (mount_norm - 1.0).abs() > 1e-6 {
+                return Err(error(match kind {
+                    TrunkImuKind::Bus => {
+                        "IMU mounting quaternion must be finite unit length [w,x,y,z]".to_owned()
+                    }
+                    other => format!(
+                        "{} IMU mounting quaternion must be finite unit length [w,x,y,z]",
+                        other.label()
+                    ),
+                }));
+            }
         }
         if self.units_verified
             && (!self.current_ma_per_count.is_finite() || self.current_ma_per_count <= 0.0)
@@ -904,19 +981,33 @@ impl Calibration {
             }
         }
         if self.motion_enabled {
-            self.validate_motion_fields()?;
+            self.validate_motion_fields(None)?;
         }
         Ok(())
     }
-    fn validate_motion_fields(&self) -> Result<()> {
-        if !self.imu_mount_verified
+    /// `source`: the trunk IMU motion will run on. `None` when the file is judged on its own,
+    /// without knowing which is wired — then a verified mount for any source will do, which for
+    /// a file that has only ever known the bus board is exactly the old rule.
+    fn validate_motion_fields(&self, source: Option<TrunkImuKind>) -> Result<()> {
+        let mount_verified = match source {
+            Some(kind) => self.imu_mount(kind).verified,
+            None => TrunkImuKind::ALL
+                .into_iter()
+                .any(|kind| self.imu_mount(kind).verified),
+        };
+        if !mount_verified
             || self.joints.iter().any(|joint| {
                 !joint.calibrated || joint.min_rad.is_none() || joint.max_rad.is_none()
             })
         {
-            return Err(error(
-                "motion requires all 15 calibrated joints, measured limits and verified IMU mounting",
-            ));
+            return Err(error(match source {
+                Some(kind) if kind != TrunkImuKind::Bus => format!(
+                    "motion requires all 15 calibrated joints, measured limits and verified IMU                      mounting for the {} IMU",
+                    kind.label()
+                ),
+                _ => "motion requires all 15 calibrated joints, measured limits and verified IMU mounting"
+                    .to_owned(),
+            }));
         }
         Ok(())
     }
@@ -927,7 +1018,13 @@ impl Calibration {
                 "Feetech motion_enabled is false; complete commissioning first",
             ));
         }
-        self.validate_motion_fields()
+        self.validate_motion_fields(None)
+    }
+    /// [`Self::validate_motion`] for the trunk IMU actually wired: that source's own mount must
+    /// be verified, whatever the others say.
+    pub fn validate_motion_for(&self, source: TrunkImuKind) -> Result<()> {
+        self.validate_motion()?;
+        self.validate_motion_fields(Some(source))
     }
 }
 
@@ -2340,6 +2437,144 @@ mod tests {
         cal.imu_mount_quat = [2.0, 0.0, 0.0, 0.0];
         assert!(cal.validate().is_err());
     }
+    /// Every calibration written before a second trunk IMU existed has the bus board's mount
+    /// at the top level and nothing else. It must read, validate and write as it always did —
+    /// no new table appearing in a file nobody asked to change.
+    #[test]
+    fn a_bus_only_calibration_reads_validates_and_writes_as_before() {
+        let text = include_str!("../../packaging/hd1910-calibration.robot.toml");
+        let cal: Calibration = toml::from_str(text).unwrap();
+        assert!(cal.validate().is_ok());
+        assert_eq!(
+            cal.imu_mount(TrunkImuKind::Bus),
+            ImuMount {
+                quat: cal.imu_mount_quat,
+                verified: true
+            }
+        );
+        for kind in [TrunkImuKind::Bno08x, TrunkImuKind::Lsm6dsv16x] {
+            assert_eq!(
+                cal.imu_mount(kind),
+                ImuMount {
+                    quat: kind.default_mount(),
+                    verified: false
+                },
+                "{kind:?} was never commissioned"
+            );
+        }
+        let written = toml::to_string_pretty(&cal).unwrap();
+        assert!(!written.contains("imu_mounts"), "{written}");
+        let reread: Calibration = toml::from_str(&written).unwrap();
+        assert_eq!(
+            serde_json::to_value(&reread).unwrap(),
+            serde_json::to_value(&cal).unwrap()
+        );
+    }
+
+    /// Module mounts survive the file robotd writes (`toml::to_string_pretty`, as
+    /// `save_calibration` does), each in its own table, with the board's left where it was.
+    /// The hand-written form parses too, and a source this build has no slot for is refused
+    /// rather than dropped.
+    #[test]
+    fn module_mounts_round_trip_in_their_own_tables() {
+        let mut cal = calibrated();
+        cal.set_imu_mount(
+            TrunkImuKind::Bno08x,
+            ImuMount {
+                quat: crate::trunk_imu::BNO08X_DEFAULT_MOUNT,
+                verified: true,
+            },
+        );
+        cal.set_imu_mount(
+            TrunkImuKind::Lsm6dsv16x,
+            ImuMount {
+                quat: [0.0, 0.0, 0.0, 1.0],
+                verified: false,
+            },
+        );
+        let written = toml::to_string_pretty(&cal).unwrap();
+        let reread: Calibration = toml::from_str(&written).unwrap();
+        for kind in TrunkImuKind::ALL {
+            assert_eq!(reread.imu_mount(kind), cal.imu_mount(kind), "{written}");
+        }
+        assert_eq!(reread.imu_mount_quat, SflpDecoder::DEFAULT_MOUNT);
+
+        let base = toml::to_string_pretty(&calibrated()).unwrap();
+        let hand: Calibration = toml::from_str(&format!(
+            "{base}
+[imu_mounts.bno08x]
+quat = [0.5, 0.5, 0.5, 0.5]
+verified = true
+"
+        ))
+        .unwrap();
+        assert!(hand.imu_mount(TrunkImuKind::Bno08x).verified);
+        assert!(
+            toml::from_str::<Calibration>(&format!(
+                "{base}
+[imu_mounts.bmi088]
+quat = [1.0, 0.0, 0.0, 0.0]
+"
+            ))
+            .is_err()
+        );
+    }
+
+    /// Motion on a module needs that module's mount verified: the board's verification says
+    /// nothing about a sensor sitting somewhere else. Judged without a source — as when robotd
+    /// saves the file — any verified mount will do, which for a bus-only file is the old rule.
+    #[test]
+    fn motion_is_authorised_per_source() {
+        let mut cal = calibrated();
+        assert!(cal.validate_motion().is_ok());
+        assert!(cal.validate_motion_for(TrunkImuKind::Bus).is_ok());
+        for kind in [TrunkImuKind::Bno08x, TrunkImuKind::Lsm6dsv16x] {
+            let error = cal.validate_motion_for(kind).unwrap_err().to_string();
+            assert!(error.contains(kind.label()), "{error}");
+        }
+        cal.imu_mount_verified = false;
+        cal.set_imu_mount(
+            TrunkImuKind::Bno08x,
+            ImuMount {
+                quat: crate::trunk_imu::BNO08X_DEFAULT_MOUNT,
+                verified: true,
+            },
+        );
+        assert!(
+            cal.validate().is_ok(),
+            "a verified module mount carries the file"
+        );
+        assert!(cal.validate_motion_for(TrunkImuKind::Bno08x).is_ok());
+        assert!(cal.validate_motion_for(TrunkImuKind::Bus).is_err());
+        cal.set_imu_mount(
+            TrunkImuKind::Bno08x,
+            ImuMount {
+                quat: crate::trunk_imu::BNO08X_DEFAULT_MOUNT,
+                verified: false,
+            },
+        );
+        assert!(
+            cal.validate().is_err(),
+            "motion enabled with no verified mount anywhere"
+        );
+    }
+
+    /// A module's mount is a rotation like the board's; one that is not unit length is
+    /// refused, and the error says whose it is.
+    #[test]
+    fn a_module_mount_must_be_a_rotation() {
+        let mut cal = calibrated();
+        cal.set_imu_mount(
+            TrunkImuKind::Lsm6dsv16x,
+            ImuMount {
+                quat: [2.0, 0.0, 0.0, 0.0],
+                verified: false,
+            },
+        );
+        let error = cal.validate().unwrap_err().to_string();
+        assert!(error.contains("lsm6dsv16x"), "{error}");
+    }
+
     #[test]
     fn calibrated_target_roundtrips_and_clamps_without_wrapping() {
         let mut joint = calibrated().joints.remove(0);

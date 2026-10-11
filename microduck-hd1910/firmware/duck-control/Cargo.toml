@@ -46,3 +46,6 @@ serialport = { version = "4.8", default-features = false }
 
 [dev-dependencies]
 serde_json.workspace = true
+# Calibration files are TOML and robotd writes them with `toml::to_string_pretty`; the
+# per-source IMU mounts are tested through that same round trip. robotd's own version.
+toml = "0.9"
