@@ -10,6 +10,15 @@ pub const MAX_TILT_DEG: f64 = 10.0;
 const STABLE_SAMPLES: u32 = 3;
 const MAX_AGE: Duration = Duration::from_millis(80);
 
+/// How far the trunk leans from upright, from projected gravity (upright is `[0, 0, -1]`).
+/// `None` for a vector that is not gravity — no IMU, or one reporting nonsense.
+pub fn tilt_deg(gravity: [f64; 3]) -> Option<f64> {
+    let [x, y, z] = gravity;
+    let norm = (x * x + y * y + z * z).sqrt();
+    (norm.is_finite() && norm > 0.5 && norm < 1.5)
+        .then(|| (-z / norm).clamp(-1.0, 1.0).acos().to_degrees())
+}
+
 #[derive(Debug, Serialize)]
 pub struct Report {
     #[serde(skip)]
@@ -113,12 +122,7 @@ impl Guard {
                         .then(|| largest.max((actual - target).abs().to_degrees()))
                 })
         });
-        let tilt = sensors.and_then(|s| {
-            let [x, y, z] = s.imu.gravity;
-            let norm = (x * x + y * y + z * z).sqrt();
-            (norm.is_finite() && norm > 0.5 && norm < 1.5)
-                .then(|| (-z / norm).clamp(-1.0, 1.0).acos().to_degrees())
-        });
+        let tilt = sensors.and_then(|s| tilt_deg(s.imu.gravity));
         let reason = if !conditions.home_phase {
             Some("尚未完成回 HOME，或正在卸力 / 关机")
         } else if sensors.is_none() || !conditions.all_joints_fresh {

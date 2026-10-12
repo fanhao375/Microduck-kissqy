@@ -120,6 +120,24 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Bool,
         "Read the bus with fast sync read — needs XL330 firmware v46+",
     ),
+    // ── [trunk_imu] ──────────────────────────────────────────────────────────
+    // Wiring, like the serial port: set once per board. Not a front-page switch, because
+    // flipping it without commissioning the new sensor's mount leaves motion refused.
+    entry(
+        "trunk_imu.source",
+        Kind::Choice(&["bus", "bno08x", "lsm6dsv16x"]),
+        "Trunk IMU: the servo-bus board, or a BNO08x / LSM6DSV16X module on I²C (needs bus.protocol feetech)",
+    ),
+    entry(
+        "trunk_imu.i2c_device",
+        Kind::Text,
+        "I²C bus a module source is read through",
+    ),
+    entry(
+        "trunk_imu.i2c_address",
+        Kind::Integer,
+        "Module address, decimal: BNO08x 75 = 0x4B / 74 = 0x4A; LSM6DSV16X 107 = 0x6B / 106 = 0x6A",
+    ),
     // ── [control] ────────────────────────────────────────────────────────────
     entry("control.hz", Kind::Integer, "Control loop rate"),
     entry(

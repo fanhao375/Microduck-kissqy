@@ -313,6 +313,35 @@ console.log('PASS production Rust bytes → Python/JS exact fields → 15 joints
             result=subprocess.run(['node',str(base/'test.mjs')],input=json.dumps({'config':config,'frames':frames,'expected':exact_js(expected)}),text=True,capture_output=True)
             self.assertEqual(result.returncode,0,result.stdout+'\n'+result.stderr)
 
+    def test_the_imu_panel_confirms_the_mount_robotd_uses(self):
+        # A module robot's panel used to prefill and badge the bus board's top-level mount, so it
+        # offered the wrong quaternion to confirm and contradicted the health badge. It reads the
+        # report's imu_mount for a module, and the bus board's keys exactly as before.
+        saved={'imu_mount_quat':[0,1,0,0],'imu_mount_verified':True,'imu_mounts':{'bno08x':{'quat':[.5,.5,.5,.5],'verified':False}}}
+        cases={'module':{'calibration':saved,'imu_source':'bno08x','imu_mount':{'quat':[.5,.5,.5,.5],'verified':False}},
+               'bus':{'calibration':saved,'imu_source':'bus'},'older':{'calibration':saved},'none':None}
+        script='''import assert from 'node:assert/strict';
+import {imuMountSlot,imuName} from './raw-telemetry.js';
+let input='';for await(const part of process.stdin)input+=part;const cases=JSON.parse(input);
+assert.deepEqual(imuMountSlot(cases.module),{module:true,name:'BNO08x',quat:[.5,.5,.5,.5],verified:false,known:true});
+for(const name of ['bus','older'])assert.deepEqual(imuMountSlot(cases[name]),{module:false,name:'FT6',quat:[0,1,0,0],verified:true,known:true},name);
+assert.deepEqual(imuMountSlot(cases.none),{module:false,name:'FT6',quat:undefined,verified:undefined,known:false});
+assert.equal(imuName('lsm6dsv16x'),'LSM6DSV16X');assert.equal(imuName(undefined),'FT6');assert.equal(imuName('constructor'),'constructor');
+console.log('PASS');
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            base=Path(directory);(base/'package.json').write_text('{"type":"module"}')
+            for name in ('raw-telemetry.js','raw-kinematics.js','service-builds.js'):
+                shutil.copyfile(ROOT/'console/static'/name,base/name)
+            (base/'test.mjs').write_text(script)
+            result=subprocess.run(['node',str(base/'test.mjs')],input=json.dumps(cases),text=True,capture_output=True)
+            self.assertEqual(result.returncode,0,result.stdout+'\n'+result.stderr)
+        service=(ROOT/'console/static/service.js').read_text(encoding='utf-8')
+        self.assertIn('imuMountSlot(s.calibration)',service)
+        self.assertNotIn('saved?.imu_mount_quat',service)
+        # The hint states the module's 5° upright limit robotd enforces.
+        self.assertIn('5° 以内',service)
+
     def test_browser_adapter_matches_existing_python_store_for_motion_commissioning_and_stale_samples(self):
         cfg={'mode':'service','control_enabled':True,'ids':IDS,'names':NAMES,'labels':LABELS,'version':VERSION,'baseline':BASELINE}
         mapping={'calibration':{'joints':[{'id':sid,'name':name,'calibrated':True,'zero_raw':2048,'direction':1,'min_rad':-2,'max_rad':2} for sid,name in zip(IDS,NAMES)]}}
@@ -322,13 +351,18 @@ console.log('PASS production Rust bytes → Python/JS exact fields → 15 joints
         health={'imu':{'ready':True,'consecutive_stale_blocks':0},'motors':{'max_c':40,'hottest':NAMES[0]}}
         first=[{'channel':k,'data':v} for k,v in {'state':state,'bus':bus,'calibration':mapping,'health':health,'system':{'cpu_temp_c':88},'capabilities':{'accepted':True},'tof':{'subscription':{'accepted':True}}}.items()]
         commissioning={'build':bus['build'],'mode':'commissioning','phase':'ready','updated_at_us':1000100,'last_sample':{'at_us':1000000,'servos':[dict(row,calibrated=True) for row in joints],'imu':{'gravity':[0,0,-1],'gyro_rad_s':[0,0,0],'quaternion_wxyz':[1,0,0,0],'valid':True}},'torque_state':'single_joint_enabled','motion':{'id':20,'target_raw':2200},'imu_mount_verified':True}
-        steps=[{'now':10,'events':first},{'now':10.2,'events':[]},{'now':11.6,'events':[]},{'now':12,'events':[{'channel':'bus','data':commissioning}]},{'now':12.1,'events':[{'channel':'tof','data':{'seq':1,'rows':8,'cols':8,'status':[5]*64,'distance_mm':[100]*64}}]},{'now':12.3,'events':[{'channel':'state','error':'test disconnect'}]}]
+        # The same commissioning sample from a robot reading a BNO08x module instead of FT6.
+        module=copy.deepcopy(commissioning);module['updated_at_us']=1000150;module['last_sample']['imu']['source']='bno08x'
+        steps=[{'now':10,'events':first},{'now':10.2,'events':[]},{'now':11.6,'events':[]},{'now':12,'events':[{'channel':'bus','data':commissioning}]},{'now':12.05,'events':[{'channel':'bus','data':module}]},{'now':12.1,'events':[{'channel':'tof','data':{'seq':1,'rows':8,'cols':8,'status':[5]*64,'distance_mm':[100]*64}}]},{'now':12.3,'events':[{'channel':'state','error':'test disconnect'}]}]
         now=[10];store=Store('service',clock=lambda:now[0],control_enabled=True);expected=[]
         for step in steps:
             now[0]=step['now']
             with patch('telemetry.time.time',return_value=1700000000+step['now']):
                 for event in step['events']:store.ingest(event)
                 expected.append(store.peek())
+        # The IMU line names the trunk IMU robotd reads, not always FT6.
+        self.assertEqual(expected[3]['imu']['source'],'robotd / FT6 / 当前安装变换')
+        self.assertEqual(expected[4]['imu']['source'],'robotd / BNO08x / 当前安装变换')
         payload={'config':cfg,'steps':steps,'expected':expected,'records':[list(frame(1,{'schema':'r17.raw.v1','channels':{'bus':{'native':{'fixed':'kept'}}}})),list(frame(2,{'bus':{'cycle':2,'native':{'sample_age_ms':1}}})),list(frame(4,{'system':{'cpu_temp_c':88}}))],'integer':list(frame(2,{'state':{'t_ns':2**64-1}})), 'nonfinite':list(frame(2,{'state':{'joints':[float('nan')]*15},'bus':{'mode':'motion','cycle':2**64-1,'native':{'sample_age_ms':1}}}))}
         with tempfile.TemporaryDirectory() as directory:
             base=Path(directory);(base/'package.json').write_text('{"type":"module"}')

@@ -37,6 +37,7 @@ mod sound;
 mod telemetry_geometry;
 mod telemetry_system;
 mod theremin;
+mod trunk_imu_i2c;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -53,6 +54,7 @@ use duck_control::io::RobotIo;
 use duck_control::obs::{BodyPose, Command as PolicyCommand};
 use duck_control::policy::{DEFAULT_STANDING_THRESHOLD, Policy, PolicyError, PolicyPaths};
 use duck_control::safety::{Safety, SafetyConfig};
+use duck_control::trunk_imu::{HostImu, TrunkImuKind};
 use duck_control::{FakeIo, NUM_JOINTS};
 use duck_ipc_proto as proto;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -1237,7 +1239,7 @@ fn run_init(params: &Params, duration: Duration) -> ExitCode {
     if params.bus.protocol == params::BusProtocol::Feetech {
         return ExitCode::FAILURE;
     }
-    let Some(BusIo::Dynamixel(mut io)) = open_bus(&params.bus, 0, None) else {
+    let Some(BusIo::Dynamixel(mut io)) = open_bus(&params.bus, None, 0, None) else {
         return ExitCode::FAILURE;
     };
     if let Err(e) = io.set_torque(true) {
@@ -1325,6 +1327,31 @@ fn spawn_control_thread(
                 }
             };
 
+            // A trunk IMU module is read by a thread of its own, started once here, so that
+            // commissioning, read-only and every startup retry share one reader and one lock on
+            // the device. `None` for the bus board, and for `--fake` and `--sim`.
+            let host_imu = if fake || sim.is_some() {
+                None
+            } else {
+                match trunk_imu_i2c::spawn_for(&params.trunk_imu) {
+                    None => None,
+                    Some(Ok(reader)) => {
+                        tracing::warn!(
+                            source = reader.kind().label(),
+                            device = %params.trunk_imu.i2c_device,
+                            address = params.trunk_imu.i2c_address,
+                            "trunk IMU is a module on I2C; ID 200 is not read"
+                        );
+                        Some(reader)
+                    }
+                    Some(Err(e)) => {
+                        tracing::error!(error = %e, "cannot start the trunk IMU reader");
+                        return;
+                    }
+                }
+            };
+            let host = host_imu.as_ref().map(|reader| reader as &dyn HostImu);
+
             if commissioning {
                 let calibration_path =
                     params
@@ -1339,11 +1366,17 @@ fn spawn_control_thread(
                     &state,
                     period,
                     calibration_path,
+                    host,
                 ));
                 return;
             }
             if read_only {
-                runtime.block_on(feetech_read_only::run(&params.bus.port, &state, period));
+                runtime.block_on(feetech_read_only::run(
+                    &params.bus.port,
+                    &state,
+                    period,
+                    host,
+                ));
                 return;
             }
             if fake {
@@ -1385,7 +1418,7 @@ fn spawn_control_thread(
             // loop has not completed a cycle yet", forever, whatever happened to the robot
             // afterwards. Retrying the read alone was not enough: execution never got there.
             runtime.block_on(async move {
-                if let Some(io) = open_bus_waiting(&bus, &state).await {
+                if let Some(io) = open_bus_waiting(&bus, host_imu.as_ref(), &state).await {
                     control_loop(io, state, intents, params, params_path, period, poweroff).await;
                 }
             });
@@ -1425,11 +1458,19 @@ type BusIo = FakeIo;
 /// one to abandon the control loop over.
 ///
 /// Returns `None` only if shutdown is requested while waiting.
-async fn open_bus_waiting(bus: &params::Bus, state: &RobotState) -> Option<BusIo> {
+///
+/// `host_imu` is the trunk IMU module's reader, when `[trunk_imu]` names one: each attempt hands
+/// the I/O a clone, so the reader (and its lock on the device) outlives failed attempts and
+/// belongs to whichever attempt succeeds.
+async fn open_bus_waiting(
+    bus: &params::Bus,
+    host_imu: Option<&trunk_imu_i2c::TrunkImuReader>,
+    state: &RobotState,
+) -> Option<BusIo> {
     let mut attempt = 0u32;
     state.startup_step(2, "starting", "读取保存标定、打开串口、关闭并确认扭矩、初始化 IMU");
     while !state.shutdown.load(Ordering::Relaxed) {
-        if let Some(io) = open_bus(bus, attempt, Some(state)) {
+        if let Some(io) = open_bus(bus, host_imu, attempt, Some(state)) {
             state.startup_bus_failures.store(0, Ordering::Relaxed);
             return Some(io);
         }
@@ -1445,7 +1486,12 @@ async fn open_bus_waiting(bus: &params::Bus, state: &RobotState) -> Option<BusIo
 
 /// Open and verify the bus, or explain why not.
 #[cfg(target_os = "linux")]
-fn open_bus(bus: &params::Bus, attempt: u32, state: Option<&RobotState>) -> Option<BusIo> {
+fn open_bus(
+    bus: &params::Bus,
+    host_imu: Option<&trunk_imu_i2c::TrunkImuReader>,
+    attempt: u32,
+    state: Option<&RobotState>,
+) -> Option<BusIo> {
     // First attempt and every thirtieth — about one line per 30 s while waiting.
     let loud = attempt == 0 || attempt.is_multiple_of(STARTUP_READ_LOG_EVERY);
     let port = bus.port.as_str();
@@ -1457,10 +1503,18 @@ fn open_bus(bus: &params::Bus, attempt: u32, state: Option<&RobotState>) -> Opti
             )?;
             let calibration: duck_control::feetech::Calibration =
                 toml::from_str(&std::fs::read_to_string(path)?)?;
-            calibration.validate_motion()?;
-            let report = feetech_commissioning::calibration_status(&calibration, path);
+            let kind = host_imu.map_or(TrunkImuKind::Bus, |reader| reader.kind());
+            calibration.validate_motion_for(kind)?;
+            let report = feetech_commissioning::calibration_status(&calibration, path, kind);
             let raw = duck_control::feetech::Bus::open(port)?;
-            let mut io = duck_control::feetech::FeetechIo::for_startup(raw, calibration)?;
+            let mut io = match host_imu {
+                Some(reader) => duck_control::feetech::FeetechIo::for_startup_with_imu(
+                    raw,
+                    calibration,
+                    Box::new(reader.clone()),
+                )?,
+                None => duck_control::feetech::FeetechIo::for_startup(raw, calibration)?,
+            };
             io.confirm_startup_limp()?;
             if let Some(state) = state {
                 state.bus_calibration.store(Some(Arc::new(report)));
@@ -1585,7 +1639,12 @@ fn adopt_missing_servo(io: &mut duck_control::bus::DynamixelIo, loud: bool) -> b
 }
 
 #[cfg(not(target_os = "linux"))]
-fn open_bus(_bus: &params::Bus, _attempt: u32, _state: Option<&RobotState>) -> Option<BusIo> {
+fn open_bus(
+    _bus: &params::Bus,
+    _host_imu: Option<&trunk_imu_i2c::TrunkImuReader>,
+    _attempt: u32,
+    _state: Option<&RobotState>,
+) -> Option<BusIo> {
     tracing::error!("no bus on this platform; use --fake");
     None
 }
@@ -2339,8 +2398,11 @@ async fn control_loop<T: RobotIo>(
     // `robot.state` timestamp by one inference otherwise. It rides the coast: a coasted tick
     // republishes the last fresh sample, so it must republish that sample's read time too.
     let mut sensors_read_ns = 0u64;
+    // ID 200 is only on the bus when the trunk IMU is the bus board.
     let mut communication_stats = communication_stats::CommunicationStats::new(
-        duck_control::model::JOINT_IDS.into_iter().chain([200]),
+        duck_control::model::JOINT_IDS
+            .into_iter()
+            .chain((params.trunk_imu.source == params::TrunkImuSource::Bus).then_some(200)),
     );
     let raw_port: Arc<str> = Arc::from(params.bus.port.as_str());
     let mut raw_models = raw_stream::ModelCache::default();
@@ -6903,6 +6965,7 @@ mod tests {
                 let ready = self.stage.load(Ordering::Relaxed) >= 2;
                 let metadata = Arc::new(snapshot::Metadata {
                     backend: "feetech_ft6",
+                    imu_source: "bus",
                     read_timing_revision: "test",
                     motion_enabled: true,
                     calibration_complete: true,
@@ -6924,6 +6987,7 @@ mod tests {
                         imu_age_ms: None,
                         imu_age_upper_bound_ms: None,
                         imu_status: None,
+                        imu_reader: None,
                         command_clamps_total: 0,
                         partial_samples_total: 0,
                         all_joints_fresh: self.stage.load(Ordering::Relaxed) > 0,
@@ -9017,7 +9081,7 @@ mod tests {
             ..Default::default()
         };
         let handle = tokio::spawn(async move {
-            open_bus_waiting(&nowhere, &waiter_state)
+            open_bus_waiting(&nowhere, None, &waiter_state)
                 .await
                 .is_none()
         });

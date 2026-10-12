@@ -68,6 +68,7 @@ Dated records rather than reference. They describe a moment, and go stale on pur
 | [`media-bringup.md`](project/media-bringup.md) | What a Radxa Zero 3W does about video: the VPU, what MPP needs, and the two plugins that have to be built. |
 | [`pad-minimal-pairing.md`](project/pad-minimal-pairing.md) | The smallest board configuration a gamepad will bond under, found by taking one away at a time. |
 | [`idle-cpu.md`](project/idle-cpu.md) | What the daemons do when nobody is asking them to: four things that stopped, two that were measured and left alone, and what still wants a board. |
+| [`trunk-imu-i2c.zh-CN.md`](project/trunk-imu-i2c.zh-CN.md) | Implementation log for the trunk IMU on the board's I²C: the steps, what deviated from the plan, what is still unverified on a robot. The mechanism is [`robotd-design.md`](design/robotd-design.md) §2.6. |
 | [`tof-on-demand.md`](project/tof-on-demand.md) | `tofd`'s idle 5% is nine parts head IMU to one part depth, and the IMU has no consumer. Why the laser and the unit were left alone and the IMU got a switch. |
 
 ## `ideas/` — not designed yet

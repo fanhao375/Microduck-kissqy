@@ -192,6 +192,7 @@ fn r9_startup_cadence_and_motion_use_one_bus_without_recovery() {
                 &control_state,
                 Duration::from_millis(20),
                 &path,
+                None,
             ))
     });
     let wait = |predicate: &dyn Fn() -> bool| {

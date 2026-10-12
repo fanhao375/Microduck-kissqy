@@ -42,6 +42,8 @@ class RuntimeTests(unittest.TestCase):
         text=(runtime.DROPINS/runtime.DROPIN_NAME).read_text()
         self.assertIn('--commissioning',text);self.assertNotIn('uart-service.py',text)
         self.assertNotIn('--uart-setup',text)
+        # A trunk IMU module is opened by robotd on /dev/i2c-*.
+        self.assertIn('DeviceAllow=char-i2c rw',text)
         self.assertFalse(hasattr(runtime,'retire_legacy_dropins'))
         self.assertFalse(hasattr(runtime,'verify_startup'))
         self.assertFalse(hasattr(runtime,'verify_ready'))

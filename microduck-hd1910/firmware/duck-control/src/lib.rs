@@ -7,6 +7,7 @@
 //! The control path it holds — model, bus, [`io::RobotIo`], observations, policy, safety — is
 //! designed in `docs/design/robotd-design.md` §2.
 
+pub mod bno08x;
 pub mod bus;
 pub mod fall;
 pub mod feetech;
@@ -14,12 +15,14 @@ pub mod feetech_snapshot;
 pub mod hardware;
 pub mod imu;
 pub mod io;
+pub mod lsm6dsv16x;
 pub mod model;
 pub mod obs;
 pub mod policy;
 pub mod safety;
 /// A robot in MuJoCo, over TCP — the backend `robotd-design.md` §9 deferred.
 pub mod sim;
+pub mod trunk_imu;
 
 pub use imu::ImuData;
 pub use io::{FakeIo, IoError, JointTargets, RobotIo, Sensors, SlowSensors};

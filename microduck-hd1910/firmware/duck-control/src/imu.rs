@@ -1,9 +1,17 @@
-//! The `imu_to_dxl` v2 board (LSM6DSV16X), decoded.
+//! The robot's trunk orientation: what every trunk IMU shares, and the bus board's bytes.
 //!
-//! One IMU, one code path. The board rides the Dynamixel bus and its 12-byte block is
-//! fetched in the same `sync_read` as the servos, so there is no separate sensor to poll
-//! and no fusion to run on the host — the chip's SFLP block ships a game-rotation
-//! quaternion and estimates its own gyro bias.
+//! Two parts, because the sensor can be wired more than one way
+//! ([`crate::trunk_imu::TrunkImuKind`]) and only the bus board is this module's byte format:
+//!
+//! - [`TrunkFrame`] is the post-processing: the sensor→trunk mount, holding the last good
+//!   quaternion, the 25-sample ready gate and the three-point median. Every source feeds it
+//!   a reading in the sensor's own axes, so [`ImuData`] means the same thing whichever chip
+//!   produced it.
+//! - [`SflpDecoder`] is the `imu_to_dxl` v2 board (LSM6DSV16X) on the servo bus: its 12-byte
+//!   block parsed into such a reading, then the frame. The block is fetched in the same
+//!   `sync_read` as the servos, and the chip's SFLP ships a game-rotation quaternion and
+//!   estimates its own gyro bias, so there is no fusion to run on the host. Its gyro and
+//!   quaternion conversions are shared with [`crate::lsm6dsv16x`], the same chip on a breakout.
 //!
 //! Block layout at address 124:
 //!
@@ -50,23 +58,109 @@ impl Default for ImuData {
 /// ±500 dps at 17.5 mdps/LSB, in rad/s.
 const GYRO_RAD_PER_LSB: f64 = 0.0175 * std::f64::consts::PI / 180.0;
 
-/// Decodes the board's block into [`ImuData`].
+/// One IMU reading in the sensor's own axes, before the mount is applied.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SensorReading {
+    /// Angular velocity, rad/s.
+    pub gyro: [f64; 3],
+    /// Fused orientation, sensor→world, scalar-first. `None` when this reading carries no
+    /// quaternion the chip actually produced; [`TrunkFrame`] then holds the last one.
+    pub quat: Option<[f64; 4]>,
+}
+
+/// Sensor readings, expressed in the trunk frame.
 ///
 /// Stateful only for spike rejection and for holding the last good quaternion — there is
 /// no filter here. Keeping the state explicit means [`crate::io::FakeIo`] can drive the
 /// same decoder in tests.
-pub struct SflpDecoder {
+pub struct TrunkFrame {
     /// Sensor→trunk mounting rotation, scalar-first.
     mount: [f64; 4],
-    /// Last quaternion the board actually produced. Held across blocks that arrive before
-    /// SFLP has written its table — snapping to identity would report a robot as upright
-    /// when its orientation is simply unknown, which is the worst possible lie to tell
-    /// fall detection.
+    /// Last quaternion the sensor actually produced. Held across readings that arrive before
+    /// the fusion has output anything — snapping to identity would report a robot as upright
+    /// when its orientation is simply unknown, which is the worst possible lie to tell fall
+    /// detection.
     last_quat: [f64; 4],
-    /// Blocks carrying a live quaternion. Gates [`SflpDecoder::ready`].
+    /// Readings carrying a live quaternion. Gates [`TrunkFrame::ready`].
     quat_samples: u32,
     gyro_history: [[f64; 3]; 2],
     gravity_history: [[f64; 3]; 2],
+    /// The next reading fills the median's history instead of joining it.
+    seed_median: bool,
+}
+
+impl TrunkFrame {
+    pub fn new(mount: [f64; 4]) -> Self {
+        Self {
+            mount,
+            last_quat: [1.0, 0.0, 0.0, 0.0],
+            quat_samples: 0,
+            gyro_history: [[0.0; 3]; 2],
+            gravity_history: [[0.0, 0.0, -1.0]; 2],
+            seed_median: false,
+        }
+    }
+
+    /// Start the three-point median afresh at the next reading. For a stream that has just
+    /// started over: the two readings before an outage say nothing about the robot after it,
+    /// and a median across the gap would report the old orientation as the new one. The ready
+    /// count is untouched — a restarted stream is not an unconverged chip.
+    pub fn restart_median(&mut self) {
+        self.seed_median = true;
+    }
+
+    /// Whether the chip has demonstrably produced fused output — roughly 0.25 s at 100 Hz.
+    ///
+    /// Until this is true the orientation is a default, not a measurement. Slice 2's fall
+    /// detection must not run before it.
+    pub fn ready(&self) -> bool {
+        self.quat_samples >= SFLP_READY_SAMPLES
+    }
+
+    pub fn push(&mut self, reading: SensorReading) -> ImuData {
+        let gyro = rotate(self.mount, reading.gyro);
+        if let Some(sensor_quat) = reading.quat {
+            let mount_inv = [
+                self.mount[0],
+                -self.mount[1],
+                -self.mount[2],
+                -self.mount[3],
+            ];
+            let q = mul(sensor_quat, mount_inv);
+            let norm = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+            if norm > 0.5 {
+                self.last_quat = [q[0] / norm, q[1] / norm, q[2] / norm, q[3] / norm];
+                self.quat_samples = self.quat_samples.saturating_add(1);
+            }
+        }
+
+        // Normalise *before* the median, matching the runtime. Note the consequence: a
+        // component-wise median across three unit vectors is not itself unit-norm, so
+        // during a transient the policy sees a slightly short vector. Steady state is
+        // exact. Whether the training env expects strict unit norm is worth settling when
+        // slice 2 wires up observations — normalising after the median would guarantee it,
+        // but that is a behaviour change to a path that currently walks.
+        let gravity = normalise(rotate_inverse(self.last_quat, [0.0, 0.0, -1.0]));
+        if self.seed_median {
+            self.seed_median = false;
+            self.gyro_history = [gyro; 2];
+            self.gravity_history = [gravity; 2];
+        }
+
+        let out = ImuData {
+            gyro: median3_each(&self.gyro_history, gyro),
+            gravity: median3_each(&self.gravity_history, gravity),
+            quat: self.last_quat,
+        };
+        self.gyro_history = [self.gyro_history[1], gyro];
+        self.gravity_history = [self.gravity_history[1], gravity];
+        out
+    }
+}
+
+/// Decodes the bus board's block into [`ImuData`]: [`parse_block`], then a [`TrunkFrame`].
+pub struct SflpDecoder {
+    frame: TrunkFrame,
 }
 
 impl Default for SflpDecoder {
@@ -87,75 +181,65 @@ impl SflpDecoder {
 
     pub fn new(mount: [f64; 4]) -> Self {
         Self {
-            mount,
-            last_quat: [1.0, 0.0, 0.0, 0.0],
-            quat_samples: 0,
-            gyro_history: [[0.0; 3]; 2],
-            gravity_history: [[0.0, 0.0, -1.0]; 2],
+            frame: TrunkFrame::new(mount),
         }
     }
 
-    /// Whether the chip has demonstrably produced fused output — roughly 0.25 s at 100 Hz.
-    ///
-    /// Until this is true the orientation is a default, not a measurement. Slice 2's fall
-    /// detection must not run before it.
+    /// See [`TrunkFrame::ready`].
     pub fn ready(&self) -> bool {
-        self.quat_samples >= SFLP_READY_SAMPLES
+        self.frame.ready()
     }
 
     pub fn decode(&mut self, raw: &[u8; IMU_BLOCK_LEN]) -> ImuData {
-        let gyro_sensor = [
-            i16::from_le_bytes([raw[0], raw[1]]) as f64 * GYRO_RAD_PER_LSB,
-            i16::from_le_bytes([raw[2], raw[3]]) as f64 * GYRO_RAD_PER_LSB,
-            i16::from_le_bytes([raw[4], raw[5]]) as f64 * GYRO_RAD_PER_LSB,
-        ];
-        let gyro = rotate(self.mount, gyro_sensor);
+        self.frame.push(parse_block(raw))
+    }
+}
 
-        // All-zero quaternion bytes mean SFLP has not written its table yet — the board
-        // just powered up, or its init failed. Keep the last good value.
-        let packed = [
-            u16::from_le_bytes([raw[6], raw[7]]),
-            u16::from_le_bytes([raw[8], raw[9]]),
-            u16::from_le_bytes([raw[10], raw[11]]),
-        ];
-        if packed != [0, 0, 0] {
-            let (x, y, z) = (half(packed[0]), half(packed[1]), half(packed[2]));
-            let norm_sq = x * x + y * y + z * z;
-            // A quaternion the chip never produced would fail this; ≤ 1.02 allows for
-            // half-precision rounding at full scale.
-            if x.is_finite() && y.is_finite() && z.is_finite() && norm_sq <= 1.02 {
-                let w = (1.0 - norm_sq).max(0.0).sqrt();
-                let mount_inv = [
-                    self.mount[0],
-                    -self.mount[1],
-                    -self.mount[2],
-                    -self.mount[3],
-                ];
-                let q = mul([w, x, y, z], mount_inv);
-                let norm = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
-                if norm > 0.5 {
-                    self.last_quat = [q[0] / norm, q[1] / norm, q[2] / norm, q[3] / norm];
-                    self.quat_samples = self.quat_samples.saturating_add(1);
-                }
-            }
-        }
+/// The board's 12 bytes as a reading in its own axes.
+pub fn parse_block(raw: &[u8; IMU_BLOCK_LEN]) -> SensorReading {
+    let gyro = lsm6dsv16x_gyro([raw[0], raw[1], raw[2], raw[3], raw[4], raw[5]]);
 
-        // Normalise *before* the median, matching the runtime. Note the consequence: a
-        // component-wise median across three unit vectors is not itself unit-norm, so
-        // during a transient the policy sees a slightly short vector. Steady state is
-        // exact. Whether the training env expects strict unit norm is worth settling when
-        // slice 2 wires up observations — normalising after the median would guarantee it,
-        // but that is a behaviour change to a path that currently walks.
-        let gravity = normalise(rotate_inverse(self.last_quat, [0.0, 0.0, -1.0]));
+    // All-zero quaternion bytes mean SFLP has not written its table yet — the board
+    // just powered up, or its init failed. The frame keeps the last good value.
+    let packed = [
+        u16::from_le_bytes([raw[6], raw[7]]),
+        u16::from_le_bytes([raw[8], raw[9]]),
+        u16::from_le_bytes([raw[10], raw[11]]),
+    ];
+    let quat = if packed != [0, 0, 0] {
+        sflp_quaternion(packed)
+    } else {
+        None
+    };
+    SensorReading { gyro, quat }
+}
 
-        let out = ImuData {
-            gyro: median3_each(&self.gyro_history, gyro),
-            gravity: median3_each(&self.gravity_history, gravity),
-            quat: self.last_quat,
-        };
-        self.gyro_history = [self.gyro_history[1], gyro];
-        self.gravity_history = [self.gravity_history[1], gravity];
-        out
+/// The chip's gyro words — `i16` LE x/y/z at ±500 dps — in rad/s.
+///
+/// Shared with [`crate::lsm6dsv16x`], whose FIFO carries the same chip's same words: one
+/// conversion, so the same bytes are the same rate whichever way the chip is wired.
+pub(crate) fn lsm6dsv16x_gyro(raw: [u8; 6]) -> [f64; 3] {
+    [
+        i16::from_le_bytes([raw[0], raw[1]]) as f64 * GYRO_RAD_PER_LSB,
+        i16::from_le_bytes([raw[2], raw[3]]) as f64 * GYRO_RAD_PER_LSB,
+        i16::from_le_bytes([raw[4], raw[5]]) as f64 * GYRO_RAD_PER_LSB,
+    ]
+}
+
+/// SFLP's game rotation — x/y/z as IEEE half-precision bit patterns — as a scalar-first
+/// quaternion with `w = √(1 − x² − y² − z²)`, or `None` for one the chip never produced.
+///
+/// Shared with [`crate::lsm6dsv16x`] for the reason [`lsm6dsv16x_gyro`] is.
+pub(crate) fn sflp_quaternion(packed: [u16; 3]) -> Option<[f64; 4]> {
+    let (x, y, z) = (half(packed[0]), half(packed[1]), half(packed[2]));
+    let norm_sq = x * x + y * y + z * z;
+    // A quaternion the chip never produced would fail this; ≤ 1.02 allows for
+    // half-precision rounding at full scale.
+    if x.is_finite() && y.is_finite() && z.is_finite() && norm_sq <= 1.02 {
+        let w = (1.0 - norm_sq).max(0.0).sqrt();
+        Some([w, x, y, z])
+    } else {
+        None
     }
 }
 
@@ -334,6 +418,413 @@ mod tests {
         let mag = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt();
         assert!(mag > 0.5, "transient gravity collapsed to {mag}");
         assert!(mag <= 1.0 + 1e-9);
+    }
+
+    /// The decoder's output for a fixed run of FT6 blocks, pinned exactly: zeros before SFLP
+    /// starts, held quaternions, the half-precision cases the chip can emit (NaN, an over-unit
+    /// vector, a `w` clamped to zero, subnormals, a negative zero), a gyro spike for the median
+    /// to eat, under the default mount and under the one a commissioned robot carries
+    /// (`packaging/hd1910-calibration.robot.toml`).
+    ///
+    /// Exists for the change that put a second IMU behind the same post-processing. These
+    /// numbers are what the policy walks on, so "the same arithmetic" is an equality check
+    /// here rather than a claim in a commit message. If this fails, the bus board's
+    /// observations changed — do not update the table to make it pass.
+    #[test]
+    // Exact outputs, not approximations: 0.7071… is what the decoder computed.
+    #[allow(clippy::approx_constant)]
+    fn golden_outputs_for_a_fixed_block_sequence() {
+        const BLOCKS: [[u8; IMU_BLOCK_LEN]; 12] = [
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [120, 0, 172, 254, 75, 0, 0, 48, 0, 0, 0, 0],
+            [24, 252, 250, 0, 184, 11, 0, 52, 0, 176, 102, 46],
+            [255, 127, 0, 128, 1, 0, 0, 0, 0, 0, 0, 0],
+            [15, 0, 16, 0, 17, 0, 0, 60, 0, 56, 0, 0],
+            [251, 255, 5, 0, 251, 255, 0, 126, 0, 0, 0, 0],
+            [200, 0, 200, 0, 56, 255, 0, 58, 0, 50, 0, 180],
+            [0, 0, 0, 0, 0, 0, 0, 60, 0, 44, 0, 0],
+            [199, 207, 133, 26, 82, 247, 1, 0, 1, 128, 255, 3],
+            [200, 0, 200, 0, 56, 255, 0, 58, 0, 50, 0, 180],
+            [200, 0, 200, 0, 56, 255, 0, 58, 0, 50, 0, 180],
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128],
+        ];
+        let imu = |gyro, gravity, quat| ImuData {
+            gyro,
+            gravity,
+            quat,
+        };
+        let default_mount = [
+            imu([0.0, 0.0, 0.0], [0.0, 0.0, -1.0], [1.0, 0.0, 0.0, 0.0]),
+            imu(
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, -1.0],
+                [
+                    0.701560760020114,
+                    0.08838834764831843,
+                    -0.701560760020114,
+                    -0.08838834764831843,
+                ],
+            ),
+            imu(
+                [0.022907446432425566, 0.0, 0.0],
+                [-0.84375, -0.24803918541230535, 0.0],
+                [
+                    0.5868449017612666,
+                    0.24747011006614159,
+                    -0.7636215970579036,
+                    -0.1060832805271322,
+                ],
+            ),
+            imu(
+                [
+                    0.022907446432425566,
+                    -0.10384709049366261,
+                    -0.03665191429188093,
+                ],
+                [-0.84375, -0.45246811305576984, 0.28871879773882275],
+                [
+                    0.5868449017612666,
+                    0.24747011006614159,
+                    -0.7636215970579036,
+                    -0.1060832805271322,
+                ],
+            ),
+            imu(
+                [
+                    0.005192354524683132,
+                    0.004886921905584123,
+                    -0.004581489286485117,
+                ],
+                [-0.84375, -0.45246811305576984, 0.28871879773882275],
+                [
+                    0.5868449017612666,
+                    0.24747011006614159,
+                    -0.7636215970579036,
+                    -0.1060832805271322,
+                ],
+            ),
+            imu(
+                [
+                    0.00030543261909699027,
+                    0.0015271630954950385,
+                    -0.004581489286485117,
+                ],
+                [-0.84375, -0.45246811305576984, 0.28871879773882275],
+                [
+                    0.5868449017612666,
+                    0.24747011006614159,
+                    -0.7636215970579036,
+                    -0.1060832805271322,
+                ],
+            ),
+            imu(
+                [
+                    -0.0015271630954950387,
+                    0.004886921905584123,
+                    -0.004581489286485117,
+                ],
+                [-0.84375, -0.45246811305576984, 0.28871879773882275],
+                [
+                    0.5447983326685064,
+                    0.35355339059327384,
+                    -0.2796332897235511,
+                    -0.7071067811865476,
+                ],
+            ),
+            imu(
+                [-0.0015271630954950387, 0.0015271630954950385, 0.0],
+                [
+                    0.19531250000000006,
+                    -0.45246811305576984,
+                    -1.1102230246251568e-16,
+                ],
+                [
+                    0.04410810913912309,
+                    0.7057297462259694,
+                    0.04410810913912309,
+                    -0.7057297462259694,
+                ],
+            ),
+            imu(
+                [-0.06108652381980155, 0.061086523819801536, 0.0],
+                [
+                    0.19531250000000006,
+                    -1.1920202047699028e-7,
+                    -1.1102230246251568e-16,
+                ],
+                [
+                    0.7071067377251787,
+                    4.315837287515549e-5,
+                    -0.7071068220188756,
+                    4.30740791781337e-5,
+                ],
+            ),
+            imu(
+                [-0.06108652381980155, 0.061086523819801536, 0.0],
+                [
+                    0.19531250000000006,
+                    -1.1920202047699028e-7,
+                    -1.1102230246251568e-16,
+                ],
+                [
+                    0.5447983326685064,
+                    0.35355339059327384,
+                    -0.2796332897235511,
+                    -0.7071067811865476,
+                ],
+            ),
+            imu(
+                [
+                    -0.06108652381980155,
+                    0.061086523819801536,
+                    -0.06108652381980153,
+                ],
+                [
+                    0.19531250000000006,
+                    -0.7806917862270766,
+                    -0.5936104465567689,
+                ],
+                [
+                    0.5447983326685064,
+                    0.35355339059327384,
+                    -0.2796332897235511,
+                    -0.7071067811865476,
+                ],
+            ),
+            imu(
+                [
+                    -0.06108652381980155,
+                    0.061086523819801536,
+                    -0.06108652381980153,
+                ],
+                [
+                    0.19531250000000006,
+                    -0.7806917862270766,
+                    -0.5936104465567689,
+                ],
+                [0.7071067811865476, 0.0, -0.7071067811865476, 0.0],
+            ),
+        ];
+        let robot_mount = [
+            imu([0.0, 0.0, 0.0], [0.0, 0.0, -1.0], [1.0, 0.0, 0.0, 0.0]),
+            imu(
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, -1.0],
+                [
+                    0.12495170864752603,
+                    -0.6911553370316859,
+                    0.12445044956609345,
+                    -0.7008590844110374,
+                ],
+            ),
+            imu(
+                [0.03306433616955812, 0.0, 0.0],
+                [
+                    -0.7883188755230409,
+                    0.3471665368808003,
+                    -0.30097023291887215,
+                ],
+                [
+                    0.28677963032465864,
+                    -0.5750659075108415,
+                    0.13716444714027093,
+                    -0.7538186519915041,
+                ],
+            ),
+            imu(
+                [0.9046365853673919, 0.10102524762180379, 0.0367828924195899],
+                [
+                    -0.7883188755230409,
+                    0.5366286140254248,
+                    -0.30097023291887215,
+                ],
+                [
+                    0.28677963032465864,
+                    -0.5750659075108415,
+                    0.13716444714027093,
+                    -0.7538186519915041,
+                ],
+            ),
+            imu(
+                [
+                    0.9046365853673919,
+                    -0.005384745436993037,
+                    0.004660219961653226,
+                ],
+                [
+                    -0.7883188755230409,
+                    0.5366286140254248,
+                    -0.30097023291887215,
+                ],
+                [
+                    0.28677963032465864,
+                    -0.5750659075108415,
+                    0.13716444714027093,
+                    -0.7538186519915041,
+                ],
+            ),
+            imu(
+                [
+                    0.0045955915689434015,
+                    -0.0013653052847908155,
+                    0.004660219961653226,
+                ],
+                [
+                    -0.7883188755230409,
+                    0.5366286140254248,
+                    -0.30097023291887215,
+                ],
+                [
+                    0.28677963032465864,
+                    -0.5750659075108415,
+                    0.13716444714027093,
+                    -0.7538186519915041,
+                ],
+            ),
+            imu(
+                [
+                    -0.0016567753915614455,
+                    -0.005384745436993037,
+                    0.004660219961653226,
+                ],
+                [
+                    -0.7883188755230409,
+                    0.5366286140254248,
+                    -0.30097023291887215,
+                ],
+                [
+                    0.3634664797908743,
+                    -0.5050093135671382,
+                    0.7364819130867856,
+                    -0.26542815030607864,
+                ],
+            ),
+            imu(
+                [-0.0016567753915614455, -0.0013653052847908155, 0.0],
+                [
+                    0.26728560078366925,
+                    0.5366286140254248,
+                    0.013633963942761397,
+                ],
+                [
+                    0.6977502401293072,
+                    -0.006841785409611863,
+                    0.7118779192697224,
+                    0.07954634138735346,
+                ],
+            ),
+            imu(
+                [-0.06790602603077543, -0.05423128860696595, 0.0],
+                [
+                    0.26728560078366925,
+                    0.10370697134673999,
+                    0.013633963942761397,
+                ],
+                [
+                    0.037620655498035636,
+                    -0.7013555318342231,
+                    0.03582424164460604,
+                    -0.7109161187904106,
+                ],
+            ),
+            imu(
+                [-0.06790602603077543, -0.05423128860696595, 0.0],
+                [
+                    0.26728560078366925,
+                    0.10370697134673999,
+                    0.013633963942761397,
+                ],
+                [
+                    0.3634664797908743,
+                    -0.5050093135671382,
+                    0.7364819130867856,
+                    -0.26542815030607864,
+                ],
+            ),
+            imu(
+                [
+                    -0.06790602603077543,
+                    -0.05423128860696595,
+                    0.06035254074641234,
+                ],
+                [0.26728560078366925, 0.7580739787767224, 0.5948800301870474],
+                [
+                    0.3634664797908743,
+                    -0.5050093135671382,
+                    0.7364819130867856,
+                    -0.26542815030607864,
+                ],
+            ),
+            imu(
+                [
+                    -0.06790602603077543,
+                    -0.05423128860696595,
+                    0.06035254074641234,
+                ],
+                [0.26728560078366925, 0.7580739787767224, 0.5948800301870474],
+                [
+                    0.03757726298627153,
+                    -0.7013533907437678,
+                    0.03586696698689637,
+                    -0.7109183717402732,
+                ],
+            ),
+        ];
+        for (mount, expected) in [
+            (SflpDecoder::DEFAULT_MOUNT, default_mount),
+            (
+                [0.037577263, 0.701353391, -0.035866967, 0.710918372],
+                robot_mount,
+            ),
+        ] {
+            let mut d = SflpDecoder::new(mount);
+            for (i, (block, want)) in BLOCKS.iter().zip(expected).enumerate() {
+                assert_eq!(d.decode(block), want, "block {i} under mount {mount:?}");
+                assert!(!d.ready());
+            }
+            // Eight of those twelve carried a live quaternion; seventeen more make 25.
+            for _ in 0..16 {
+                d.decode(&BLOCKS[6]);
+            }
+            assert!(!d.ready());
+            d.decode(&BLOCKS[6]);
+            assert!(d.ready());
+        }
+    }
+
+    /// After `restart_median` the next reading is reported as itself, not as the median of
+    /// two readings from before the restart and this one; and the frame stays ready.
+    #[test]
+    fn a_restarted_median_reports_the_first_new_reading_as_itself() {
+        let mut frame = TrunkFrame::new([1.0, 0.0, 0.0, 0.0]);
+        let upright = SensorReading {
+            gyro: [0.0; 3],
+            quat: Some([1.0, 0.0, 0.0, 0.0]),
+        };
+        for _ in 0..30 {
+            frame.push(upright);
+        }
+        // Pitched 30° about +Y: the half angle is 15°.
+        let (c, v) = (15f64.to_radians().cos(), 15f64.to_radians().sin());
+        let pitched = SensorReading {
+            gyro: [0.0, 0.5, 0.0],
+            quat: Some([c, 0.0, v, 0.0]),
+        };
+        frame.restart_median();
+        let out = frame.push(pitched);
+        assert!(frame.ready());
+        assert!(
+            (out.gravity[0] - 30f64.to_radians().sin()).abs() < 1e-12,
+            "{:?}",
+            out.gravity
+        );
+        assert_eq!(out.gyro, [0.0, 0.5, 0.0]);
+        // Without a restart the same jump is held off by the median, as it always was.
+        let mut plain = TrunkFrame::new([1.0, 0.0, 0.0, 0.0]);
+        for _ in 0..30 {
+            plain.push(upright);
+        }
+        assert_eq!(plain.push(pitched).gravity, [0.0, 0.0, -1.0]);
     }
 
     /// Gyro counts are signed. Reading them as unsigned would turn every negative rate

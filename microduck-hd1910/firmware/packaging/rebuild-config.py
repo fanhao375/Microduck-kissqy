@@ -51,17 +51,23 @@ def source_data(path, kind, base):
 
 def prepare(directory, params=CONFIG, calibration=CALIBRATION, base=BASE):
     # Stage before service mutation; malformed old files must not abort replacement.
-    values=(source_data(params,'params',base),prepare_calibration(calibration,base))
+    settings=source_data(params,'params',base)
+    source=(settings.get('trunk_imu') or {}).get('source','bus')
+    values=(settings,prepare_calibration(calibration,base,source))
     for name,data in zip(('robotd.toml','hd1910-calibration.toml'),values):
         atomic_write(directory/name,dumps(data))
 
-def prepare_calibration(path,base=BASE):
+def prepare_calibration(path,base=BASE,source='bus'):
     """Installation only: restore known assembled robot values where no saved ones exist.
 
     Later restarts/failure recovery never reapply the model snapshot. Calibrated
     local joints (and their limits) always win, then saved local data, then the
     explicitly supplied robot snapshot. A fresh all-unmarked template also has
     a placeholder IMU orientation, even if its default was just confirmed.
+
+    `source` is robotd.toml's [trunk_imu] source. The snapshot's IMU mount is a bus
+    board's, so it is restored only for a bus robot: a module robot's bus slot is
+    left as it is, never marked verified for a board nobody checked.
     """
     current=source_data(path,'calibration',base)
     saved=read_config(saved_path(path),'calibration') or {}
@@ -79,10 +85,16 @@ def prepare_calibration(path,base=BASE):
         if candidate['id']!=row['id']:raise ValueError('本机标定 ID 与随包装配记录不符：'+row['name'])
         data['joints'][i]=copy.deepcopy(candidate);restored.append(row['name'])
     imu_source=None
-    if not has_local or data.get('imu_mount_verified') is not True:
+    if source=='bus' and (not has_local or data.get('imu_mount_verified') is not True):
         imu_source=saved if saved.get('imu_mount_verified') is True and any(r.get('calibrated') is True for r in saved.get('joints',[])) else seed
         for name in ('imu_mount_quat','imu_mount_verified'):data[name]=copy.deepcopy(imu_source[name])
-    if restored or imu_source is not None:
+    # A module's mount ([imu_mounts.*]) is never seeded — the shipped snapshot is a bus robot's.
+    # Keep the local table, or the saved one when the local file has lost it.
+    if 'imu_mounts' not in data and isinstance(saved.get('imu_mounts'),dict):
+        data['imu_mounts']=copy.deepcopy(saved['imu_mounts'])
+    wired_unverified=(source!='bus' and
+        ((data.get('imu_mounts') or {}).get(source) or {}).get('verified') is not True)
+    if restored or imu_source is not None or wired_unverified:
         data['motion_enabled']=False
         print('安装恢复装配标定：补齐 '+str(len(restored))+' 个关节；头部 ID 33 零位 '+str(data['joints'][8]['zero_raw'])+'；IMU '+('已恢复' if imu_source is not None else '保留本机设置'),flush=True)
     return data
