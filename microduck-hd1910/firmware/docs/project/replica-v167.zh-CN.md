@@ -20,11 +20,15 @@
 5. **安装脚本**（`40871ae`）：装整套（3 个程序 + 5 个脚本），见 `IMU-MODULE.md` 第 2 节。
 6. **第一轮代码审核的修正**（`c85fb81`）：卸力前第一次 busStatus 超时不再当成「robotd 不在运行」；恢复确认不了时给出路；joint-filters 的只读检查提到卸力之前；已上力核对不一致的报错写明「torque stays on; relax first」；重启 robotd 失败时说明参数已写入。
 7. **robotctl**（`ff5ea66`）：合进 UDP 手柄后 `robotctl` 的 `every_registry_key_says_how_it_applies` 测试失败（三个 `[netpad]` 键没说改了以后要重启谁）；补上「重启 padd」。V164 那条 UDP 分支没跑过 robotctl 的测试，所以当时没发现。
+8. **第二轮审核的修正**（`2b14b11`、`aea117d`，文档同本提交）：
+   - `netpad`：备份改用专用的 `.netpad-previous`，只给这次写的文件留、只恢复这次写的文件、恢复或确认后都删掉。原来用 `.previous`，而 kissqy 的 `atomic_write` 每次写都会改它，恢复可能把别人的改动撤掉、两次恢复还会来回翻。`netpad on` 先要求 robotd 已完成四步启动，失败时说明是 robotd 没就绪还是 padd 没起来；`netpad off` 从不回滚（它是回到蓝牙手柄的路）。`reconnect` 改成只在启用时起 GameSir 输入桥；三条调参命令回读失败时也拉起 padd。
+   - 安装脚本：加 `set -E` 和 ERR / INT / TERM 陷阱，忽略 HUP——停了 padd、robotd 还没换文件就失败（或被打断）时把原服务起回来，换了文件之后照旧自动撤回；跟 `service.sh` 用同一把锁；顺序改成先停 padd、再卸力、再停 robotd；判断 robotd 状态照搬 `runtime.py`（只有套接字不存在或被拒才算没在跑，慢的再问，8 秒都不回答按「状态未知」处理）；装后 busStatus 再问 8 秒；`ldd` 先写文件再查；报告随 robotd 停止的单元。撤回：拒绝第一版脚本的旧备份（除非 `--old-backup`）和「备份里是原版 robotd 而标定有 `[imu_mounts]`」；**不恢复两份标定**（不一样时提示备份那份在哪）；`robotd.toml` 恢复前另存到 `etc-at-rollback/`。
+   - 文档：「逐字节相同」只说串口报文，诊断多一个 `servo_parameters: null`；掉线坐下写成「按代码推断的预期」；英文摘要补齐。
 
 ## 与方案的出入、实施时的取舍
 
 - 文件分支抽成独立方法 `arm_with_file`，`arm()` 里只多一个条件和一个分支入口，V167 原文其余不动。
-- `servo_parameters` 放在诊断结构的最后一个字段：去掉这个键后 JSON 与 V167 逐字节相同。
+- `servo_parameters` 放在诊断结构的最后一个字段：没有参数文件时诊断只多这一个 null，去掉它后与 V167 相同（金样按 JSON 值比较）。
 - 删掉没人调用的 `configure_servo_test`；`raw_stream` 的 BusKey 不加参数（参数只在进程启动时读一次，审核意见）。
 - 金样测试：两份副本（本分支、kissqy `78bef11` 的临时副本）的测试模拟器都加一行记录原始请求帧；金样（从启动卸力确认到两轮上力卸力的每一帧，加 hd1910 诊断 JSON）是在 `78bef11` 副本上实际跑出来的，测试函数两边逐字节相同，两边都通过。`78bef11` 副本只在本机临时目录，没提交到任何分支。
 - `robotd-params` 多一个测试（共 107）：板上真实的 `robotd.toml` 加上 `service.sh netpad on` 写出的那一节能加载；`test_netpad.py` 断言写出的那一节与这个测试用的文本逐字节相同。另在 `78bef11` 的临时副本里确认：kissqy 原版 robotd-params 加载同一文件成功、忽略 `[netpad]`（撤回或被 kissqy 升级后不会因此起不来）。
@@ -46,11 +50,11 @@
 |---|---|---|---|
 | `run-V167-tests.py`（duck-control、duck-ipc-proto、robotd 逐用例、padd） | 498 过 / 17 败 | 579 过 / 17 败 | 626 过 / 17 败（新增：调参 9、padd 38） |
 | robotd-params / robotctl | — | 103 / 199 | 107 / 200 |
-| packaging Python（逐用例） | 293 个用例：233 通过 / 16 失败 / 44 出错 | 301：240 / 16 / 45 | 335：274 / 16 / 45；相对 IMU 版新增失败 0，新增的 34 个全过 |
+| packaging Python（逐用例） | 293 个用例：233 通过 / 16 失败 / 44 出错 | 301：240 / 16 / 45 | 338：277 / 16 / 45；相对 IMU 版新增失败 0，新增的 37 个全过 |
 | rustfmt（有差异的文件） | 9 个 | 8 个 | 8 个，同 IMU 版；改过的文件都干净 |
 | clippy 警告（不加 `-D`；加 `-D` 时三边都在 duck-ipc-proto 停下） | 15 条 | 14 条 | 14 条，同 IMU 版（只有 `hardware.rs` 那条枚举大小从 2512 变成 2536 字节） |
 
-另外：安装脚本的假板子测试 `deploy/test-imu-module-install.sh` 56 项全过；UDP 手柄的电脑端到端联调（假 robotd + 模拟 `duckctl udp-pad` 的发送端，跑本分支 x86 的 padd）14 项全过。clippy 加上 padd 时，padd 的测试目标在三边都因 `roller_test.rs` 里一处 `approx_constant`（默认拒绝）停下，这是原版就有的；上表是加 `-A clippy::approx_constant` 后的结果，padd 没有警告。
+另外：安装脚本的假板子测试 `deploy/test-imu-module-install.sh` 68 项全过（第一版的 21 项、不接 systemd 的新增项，以及用假 systemctl 和假 robotd 套接字模拟的卸力状态、慢回答、不回答、备份失败、ERR 陷阱、中途 TERM、随 robotd 停的单元、撤回前重新标定、旧备份、原版 robotd + imu_mounts、锁被占用）；UDP 手柄的电脑端到端联调（假 robotd + 模拟 `duckctl udp-pad` 的发送端，跑本分支 x86 的 padd）14 项全过。clippy 加上 padd 时，padd 的测试目标在三边都因 `roller_test.rs` 里一处 `approx_constant`（默认拒绝）停下，这是原版就有的；上表是加 `-A clippy::approx_constant` 后的结果，padd 没有警告。
 
 ## 上一版安装脚本在真板上的经历（2026-10-14 晚）
 

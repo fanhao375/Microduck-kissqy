@@ -28,10 +28,12 @@ sudo bash /opt/robot/feetech-ft5-r5/service.sh netpad off             # back to 
 ```
 
 It checks the numbers against both `robotd.toml` and `robotd.saved.toml` (each against its own
-`[safety] deadman_ms`), that this `padd` knows `[netpad]` and that `padd.service` allows `AF_INET`;
-writes `[netpad]` into both files (a `.previous` copy of each first); restarts `padd` alone and
-reads its new process's journal for the line below. If that line does not come, both files are put
-back and `padd` restarted. `off` keeps the port and timeout already in the files.
+`[safety] deadman_ms`), that this `padd` knows `[netpad]`, that `padd.service` allows `AF_INET` and,
+for `on`, that robotd has finished its four startup steps (padd waits for them); writes `[netpad]`
+into the files that change (a `<name>.netpad-previous` copy of each first); restarts `padd` alone and
+reads its new process's journal for the line below. If `on` does not bring that line, the files this
+run wrote are put back and `padd` restarted. `off` keeps the port and timeout already in the files
+and is never rolled back: it is the way back to the Bluetooth pad.
 
 By hand it is this section in `/etc/robot/feetech-ft5/robotd.toml` (and `robotd.saved.toml`):
 
@@ -56,7 +58,8 @@ one source. `enabled = false` (or removing the section) and the same restart go 
 this tree too, which then refuses to start and names the key in its journal, exactly as upstream
 does. `padd` treats a file it cannot read as netpad off. A `robotd` from before this change ignores
 the section with a warning. If `robotd` refuses to start over it, fix or remove `[netpad]` in both
-files and run `sudo bash /opt/robot/feetech-ft5-r5/service.sh reconnect`.
+files and run `sudo bash /opt/robot/feetech-ft5-r5/service.sh reconnect` (it restarts robotd, then
+padd, and the GameSir bridge only where that is enabled).
 
 `padd.service` must allow `AF_INET` (`RestrictAddressFamilies=… AF_INET`, in both
 `padd/systemd/padd.service` and `packaging/padd.service`). A unit installed before this change
