@@ -1,3 +1,4 @@
+# Modified 2026-10 by fanhao375 (microduck-replica): optional servo P/D/torque-limit file; see IMU-MODULE.md at the repository root.
 """Applying numeric settings and listing installed models must not reparse training YAML."""
 import json,shutil,tempfile,time,tomllib,unittest
 from pathlib import Path
@@ -27,10 +28,10 @@ class ParameterReadbackTests(unittest.TestCase):
     if path.name=='policy.onnx' or path.suffix=='.yaml':raise AssertionError('parameter read reparsed model/training data')
     return original_read_bytes(path)
    with patch.object(runtime,'BASE',base),patch.object(runtime,'CONFIG',cfg),patch.object(runtime,'detect_port',return_value='/dev/ttyS2'),patch.object(Path,'read_bytes',read_bytes),patch.object(models,'verify_directory',side_effect=AssertionError('numeric apply revalidates models')):
-    before=runtime.model_list();self.assertNotIn('servo_parameters',before)
+    before=runtime.model_list();self.assertIsNone(before['servo_parameters'])
     runtime.set_action_scale(ident,.63)
     after=runtime.model_list()
-    self.assertNotIn('servo_parameters',after)
+    self.assertIsNone(after['servo_parameters'])
     self.assertEqual(after['action_scale'],.7);self.assertEqual(next(r for r in after['models'] if r['slot']=='walk')['action_scale'],.63)
     self.assertEqual(after['configured_model'],ident)
     self.assertEqual(len(after['models']),5);self.assertTrue(all(r['available'] for r in after['models']))
@@ -38,7 +39,7 @@ class ParameterReadbackTests(unittest.TestCase):
     self.assertEqual(ident,'1cbf8730eadd75a5704332c9f3c10f60')
     self.assertNotIn('9e3ff8bde021be28a728c02dbd8e7aaf',[r['id'] for r in after['models']])
     runtime.set_action_scale(ident,.7)
-    again=runtime.model_list();self.assertNotIn('servo_parameters',again)
+    again=runtime.model_list();self.assertIsNone(again['servo_parameters'])
    self.assertEqual(cfg.read_bytes(),cfg.with_name('robotd.saved.toml').read_bytes())
    self.assertEqual(tomllib.loads(cfg.read_text())['policy']['head_lowpass'],.5)
    self.assertEqual(tomllib.loads(cfg.read_text())['policy']['legs_lowpass'],.7)

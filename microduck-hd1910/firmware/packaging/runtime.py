@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; see IMU-MODULE.md at the repository root.
+# Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; optional servo P/D/torque-limit file and joint filters; see IMU-MODULE.md at the repository root.
 """HAT deployment helpers. Motor operations use the single robotd IPC owner."""
 from __future__ import annotations
 import hashlib
@@ -313,6 +313,115 @@ def set_action_scale(ident,value):
     atomic_write(CONFIG.with_name(CONFIG.stem+'.saved'+CONFIG.suffix),text)
     return {'model':ident,'action_scale':scale,'sitstand_base_action_scale':1.0,'message':'动作缩放已保存；重启后重新 HOME。'}
 
+# Optional servo P/D/torque limit (microduck-replica): robotd reads this file at startup and writes
+# it at the next HOME arm (duck-control hd1910_test). Relax leaves P restored, D=0 and torque limit
+# 1000, as V167 does. No file = V167 unchanged (contract P, D=0, limit 1000). Same ranges as robotd.
+SERVO_FILE_NAME = 'servo-test-parameters.json'
+SERVO_LIMITS = {'kp': (1, 32), 'kd': (0, 64), 'torque_limit': (200, 1000)}
+
+def servo_path():
+    return CONFIG.with_name(SERVO_FILE_NAME)
+
+def validate_servo(kp, kd, torque_limit):
+    values = {}
+    for name, text in zip(('kp', 'kd', 'torque_limit'), (kp, kd, torque_limit)):
+        text = str(text); low, high = SERVO_LIMITS[name]
+        if not re.fullmatch('[0-9]{1,4}', text) or not low <= int(text) <= high:
+            raise ValueError(f'{name} 必须是 {low} 到 {high} 的整数')
+        values[name] = int(text)
+    return values
+
+def servo_parameters():
+    path = servo_path()
+    if not path.exists(): return None
+    try:
+        data = json.loads(path.read_text())
+        # robotd (serde) accepts JSON integers only; strings or booleans would leave it waiting for the bus.
+        if not isinstance(data, dict) or set(data) != set(SERVO_LIMITS) or any(type(v) is not int for v in data.values()):
+            raise ValueError('须为 kp/kd/torque_limit 三个整数')
+        return validate_servo(**data)
+    except (OSError, ValueError, TypeError) as exc: return {'error': f'{SERVO_FILE_NAME} 无效：{exc}'}
+
+def set_servo_parameters(kp, kd, torque_limit):
+    values = validate_servo(kp, kd, torque_limit)
+    atomic_write(servo_path(), json.dumps(values, ensure_ascii=False) + '\n', mode=0o644)
+    return {'servo_parameters': values, 'message': '舵机参数已保存；下次 HOME 上力时写入。卸力时 P 恢复原值，D=0、转矩 1000（同 V167）。'}
+
+def clear_servo_parameters():
+    path = servo_path(); existed = path.exists()
+    path.unlink(missing_ok=True)
+    return {'servo_parameters': None, 'removed': existed, 'message': '已恢复默认（未设置）：按 V167 原版，P=合同 5、D=0、转矩 1000。若曾在上力中重启过 robotd，P 可能停在旧值，给舵机断一次电即恢复。'}
+
+def verify_servo_parameters(expected):
+    """Poll robotd until busStatus reports the file it loaded (motion mode only)."""
+    wanted = None if expected == 'none' else json.loads(expected)
+    until = time.monotonic() + 8; last = '等待控制器启动'
+    while time.monotonic() < until:
+        try:
+            bus = rpc('robot.busStatus', timeout=2)
+            hd = (bus.get('native') or {}).get('hd1910') or {}
+            if 'servo_parameters' not in hd:
+                last = '控制器没有回报 servo_parameters（板上 robotd 不是可调版本？）'
+            elif hd['servo_parameters'] == wanted:
+                return {'servo_parameters_verified': True, 'servo_parameters': wanted, 'gain_mode': (bus.get('native') or {}).get('gain_mode')}
+            else:
+                last = '控制器加载的是 ' + json.dumps(hd['servo_parameters'], ensure_ascii=False)
+        except (OSError, ValueError, RuntimeError, KeyError) as exc:
+            last = str(exc)
+        time.sleep(.1)
+    raise ValueError('舵机参数已保存，但控制器回读不一致：' + last[-800:])
+
+def relax_and_restore():
+    """Before stopping robotd for a servo/filter change. In motion control: relax, then wait until
+    torque is OFF and the HD1910 restore has finished, otherwise refuse (robotd keeps running, so the
+    in-memory restore data is not lost). Not in control (bad file, waiting for bus, commissioning,
+    unreachable): nothing is armed by this robotd, request a relax and let the caller stop it."""
+    try:
+        report = rpc('robot.busStatus', timeout=2)
+    except (OSError, ValueError, RuntimeError, KeyError) as exc:
+        return {'restored': None, 'message': 'robotd 未响应，直接停止：' + str(exc)[-200:]}
+    if report.get('mode') != 'motion' or report.get('phase') != 'control':
+        request_relax()
+        return {'restored': None, 'message': f"robotd 处于 {report.get('mode')} / {report.get('phase')}，不在控制阶段，直接停止"}
+    rpc('robot.relax')
+    until = time.monotonic() + 8; last = ''
+    while time.monotonic() < until:
+        try:
+            report = rpc('robot.busStatus', timeout=2)
+        except (OSError, ValueError, RuntimeError, KeyError) as exc:
+            last = str(exc)[-200:]; time.sleep(.1); continue   # one slow reply is not a refusal
+        hd = (report.get('native') or {}).get('hd1910') or {}
+        if torque_off(report) and hd.get('restore_pending') is False and hd.get('temporary_gains_applied') is False:
+            return {'restored': True, 'message': '已卸力：P 已恢复原值，D=0、转矩 1000（同 V167）'}
+        last = json.dumps({'torque_off': torque_off(report), 'restore_pending': hd.get('restore_pending'),
+                           'temporary_gains_applied': hd.get('temporary_gains_applied')}, ensure_ascii=False)
+        time.sleep(.1)
+    raise RuntimeError('未确认卸力并恢复 P 原值，操作未继续，robotd 保持运行：' + last)
+
+def validate_filter(value):
+    lowpass = float(value)
+    if lowpass not in tuple(round(n/100, 2) for n in range(10, 101)): raise ValueError('滤波只能选择 0.10 到 1.00，步长 0.01')
+    return lowpass
+
+def set_joint_filters(ident, head, legs):
+    """Edit only head_lowpass/legs_lowpass of the active joint Walk; scale stays with set_action_scale."""
+    head, legs = validate_filter(head), validate_filter(legs)
+    if not re.fullmatch('[a-f0-9]{32}', ident): raise ValueError('模型标识无效')
+    walk = Path(str(tomllib.loads(CONFIG.read_text()).get('policy', {}).get('walk', '')))
+    if walk.parent.name != ident: raise ValueError('只能修改当前启用的 Walk 模型')
+    from model_packages import EXECUTION_FILE, describe_directory, execution_profile
+    info = describe_directory(walk.parent)
+    if 'execution_profile' not in info: raise ValueError('该模型没有联合执行配置；滤波由 robotd.toml 决定')
+    updated = {**info['execution_profile'], 'head_lowpass': head, 'legs_lowpass': legs}
+    text = json.dumps(updated, ensure_ascii=False, indent=2) + '\n'
+    contract = json.loads((walk.parent/'deployment-contract.json').read_text())
+    execution_profile(text.encode(), {**{k: info[k] for k in ('slot', 'label', 'task', 'sha256')}, 'contract': contract})
+    path = walk.parent/EXECUTION_FILE
+    original = path.with_name(path.name + '.orig')
+    if not original.exists(): atomic_write(original, path.read_bytes())   # the first original is never replaced
+    atomic_write(path, text)
+    return {'model': ident, 'execution_profile': updated, 'message': '头腿滤波已保存；缩放保持原值。重启后读取新配置。'}
+
 def model_list():
     from model_packages import catalog
     result=catalog(BASE,CONFIG);policy=tomllib.loads(CONFIG.read_text()).get('policy',{})
@@ -322,7 +431,7 @@ def model_list():
             row['action_scale']=row['execution_profile']['action_scale']
         if row.get('slot')=='roulade':
             row['action_scale']=next((a.get('params',{}).get('action_scale',policy.get('action_scale',DEFAULT_ACTION_SCALE)) for a in policy.get('skill',[]) if a.get('name')=='roulade'),policy.get('action_scale',DEFAULT_ACTION_SCALE))
-    return {**result,'management_actions':['action-scale','joint-action-scale'],'action_scale':policy.get('action_scale',DEFAULT_ACTION_SCALE),'default_action_scale':DEFAULT_ACTION_SCALE,'default_joint_action_scale':DEFAULT_JOINT_ACTION_SCALE,'port':detect_port()}
+    return {**result,'management_actions':['action-scale','joint-action-scale','servo-parameters','joint-filters'],'servo_parameters':servo_parameters(),'servo_limits':SERVO_LIMITS,'action_scale':policy.get('action_scale',DEFAULT_ACTION_SCALE),'default_action_scale':DEFAULT_ACTION_SCALE,'default_joint_action_scale':DEFAULT_JOINT_ACTION_SCALE,'port':detect_port()}
 
 def verify_loaded_models():
     paths={slot:path for slot,path in config()['policy'].items() if slot in SLOTS and path and path!='none'}
@@ -356,6 +465,9 @@ def main():
     action, *args = sys.argv[1:]
     if action == 'disable-automatic-recovery':disable_automatic_recovery();return
     if action == 'validate-scale': print(validate_scale(*args)); return
+    if action == 'validate-servo': print(json.dumps(validate_servo(*args))); return
+    if action == 'validate-filters': print(json.dumps([validate_filter(v) for v in args])); return
+    if action == 'verify-servo': print(json.dumps(verify_servo_parameters(*args), ensure_ascii=False)); return
     if action == 'port': print(detect_port()); return
     if action == 'config-path': print(effective_config_path()); return
     if action == 'connection': print(json.dumps(connection_status(), ensure_ascii=False)); return
@@ -369,6 +481,10 @@ def main():
         if action == 'configure-startup': result = configure_startup(*args)
         elif action == 'power': result = power(*args)
         elif action == 'set-action-scale': result = set_action_scale(*args)
+        elif action == 'relax-and-restore': result = relax_and_restore()
+        elif action == 'set-servo-parameters': result = set_servo_parameters(*args)
+        elif action == 'clear-servo-parameters': result = clear_servo_parameters()
+        elif action == 'set-joint-filters': result = set_joint_filters(*args)
         elif action == 'relax-confirmed': relax_confirmed(); result = {'torque':'off'}
         elif action == 'relax-request': result = request_relax()
         else: raise ValueError('不支持的运行管理操作')

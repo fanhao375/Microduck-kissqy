@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Modified 2026-10 by fanhao375 (microduck-replica): optional servo P/D/torque-limit file and joint filters (servo-parameters, servo-parameters-clear, joint-filters); see IMU-MODULE.md at the repository root.
 # Manages the existing official service. All motor commands go through robotd's socket.
 set -Eeuo pipefail
 # Root runs installation in a user-owned staging tree; keep it free of root
@@ -86,6 +87,16 @@ write_dropin() {
     systemctl daemon-reload
 }
 
+
+verify_servo_loaded() {
+    local running
+    running=$(systemctl show robotd.service -p ExecStart --value)
+    if [[ $running == *--commissioning* ]]; then
+        echo '标定模式不读取舵机参数：已保存，切到运动模式后上力时生效。'
+        return 0
+    fi
+    python3 "$install_dir/runtime.py" verify-servo "$1"
+}
 
 verify_motion_models() {
     local running
@@ -323,8 +334,54 @@ action-scale)
     echo "动作缩放已应用：$3；重新 HOME 后可启用动作。"
     ;;
 
+servo-parameters)
+    require_installed
+    [[ $# -eq 4 ]] || fail '用法：servo-parameters P D 转矩限制'
+    servo_json=$(python3 "$install_dir/runtime.py" validate-servo "$2" "$3" "$4")
+    # Allowed but outside the values tried on a duck so far: say so, never ask.
+    if (( 10#$2 > 10 || 10#$4 < 500 )); then
+        echo "警告：P=$2 大于 10 或转矩限制=$4 小于 500，超出常用范围；下次 HOME 时扶住或吊起鸭子。" >&2
+    fi
+    python3 "$install_dir/runtime.py" relax-and-restore
+    systemctl stop robotd.service || { restart_service || true; fail 'robotd 停止失败；已尝试重新启动，未写入。'; }
+    if ! python3 "$install_dir/runtime.py" set-servo-parameters "$2" "$3" "$4"; then
+        restart_service || true
+        fail '舵机参数写入失败；robotd 已重新启动，原设置未变。'
+    fi
+    restart_service
+    verify_servo_loaded "$servo_json"
+    echo "舵机参数已应用：P=$2 D=$3 转矩限制=$4；下次 HOME 上力时写入。卸力时 P 恢复原值，D=0、转矩 1000（同 V167）。"
+    ;;
+servo-parameters-clear)
+    require_installed
+    [[ $# -eq 1 ]] || fail '用法：servo-parameters-clear'
+    python3 "$install_dir/runtime.py" relax-and-restore
+    systemctl stop robotd.service || { restart_service || true; fail 'robotd 停止失败；已尝试重新启动，未写入。'; }
+    if ! python3 "$install_dir/runtime.py" clear-servo-parameters; then
+        restart_service || true
+        fail '恢复默认失败；robotd 已重新启动。'
+    fi
+    restart_service
+    verify_servo_loaded none
+    echo '已恢复默认（未设置）：按 V167 原版，P=合同 5、D=0、转矩 1000。'
+    ;;
+joint-filters)
+    require_installed
+    [[ $# -eq 4 ]] || fail '用法：joint-filters 模型标识 头部滤波 腿部滤波'
+    python3 "$install_dir/runtime.py" validate-filters "$3" "$4"
+    python3 "$install_dir/runtime.py" relax-and-restore
+    systemctl stop robotd.service || { restart_service || true; fail 'robotd 停止失败；已尝试重新启动，未写入。'; }
+    if ! python3 "$install_dir/runtime.py" set-joint-filters "$2" "$3" "$4"; then
+        restart_service || true
+        fail '滤波写入失败；robotd 已重新启动，原设置未变。'
+    fi
+    restart_service
+    verify_motion_models
+    echo "头腿滤波已应用：头 $3、腿 $4；重新 HOME 后生效。"
+    ;;
+
 *)
-    echo '用法：sudo bash service.sh {install|upgrade|status|connection|report|bus ...|enable|disable|init|enable-policy|disable-policy|relax|reconnect|models|power reboot/shutdown}' >&2
+    echo '用法：sudo bash service.sh {install|upgrade|status|connection|report|bus ...|enable|disable|init|enable-policy|disable-policy|relax|reconnect|models|power reboot/shutdown|servo-parameters P D 转矩限制|servo-parameters-clear|joint-filters 模型标识 头部滤波 腿部滤波}' >&2
     exit 2
     ;;
 esac
