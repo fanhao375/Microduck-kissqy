@@ -2,7 +2,7 @@
 
 > **这是 [microduck-replica](https://github.com/fanhao375/microduck-replica) 维护的 fork，不是 kissqy 的官方版本，没经过他审阅，也不代表他认可。**
 > 原版在 [kissqy/Microduck-kissqy](https://github.com/kissqy/Microduck-kissqy)。用这一版出了问题，请到 [microduck-replica 的 Issues](https://github.com/fanhao375/microduck-replica/issues) 反馈，别去找 kissqy：这一版的 robotd 报的版本号跟他的一模一样，他分不出来。
-> 本仓库首页 README 里的下载区、一键镜像、中控 ZIP 都是 kissqy 的原版，**不带**这里的 IMU 模块支持。
+> kissqy 的原版首页改名为 [README-kissqy.md](README-kissqy.md) 保留；那里的下载区、一键镜像、中控 ZIP 都是他的原版，**不带**这里的 IMU 模块支持。
 
 ## 这是什么
 
@@ -128,13 +128,13 @@ sudo bash /opt/robot/feetech-ft5-r5/service.sh enable                     # 回�
 | `docs/` | `design/robotd-design.md` §2.6；新增 `project/trunk-imu-i2c.zh-CN.md`；`README.md` 加一行索引 |
 | `Cargo.lock` | 依赖锁定跟着变 |
 | `console/`（kissqy 的中控） | **没改**，原样保留。所以用模块时，中控调试页的 IMU 那一行还写着 FT6；「保存安装确认」只等 15 秒，模块要 20 秒，会超时，安装方向用第 3 节的 SSH 办法确认 |
-| 仓库根目录 | `README.md`、`README.en.md` 顶部加了 fork 说明；新增本页 |
+| 仓库根目录 | `README.md`、`README.en.md` 换成我们写的首页；kissqy 的原首页改名为 `README-kissqy.md`、`README-kissqy.en.md` 原样保留（只改了顶部一段和语言切换链接）；`DUCK-SHOPPING-LIST*.md`、`docs/README*.md`、`docs/AUTHOR-JOURNEY*.md` 里指向首页的链接改指原版首页；新增本页 |
 
 每个改过的源码和文档文件开头，都加了一行修改声明（`Cargo.lock` 没法加注释，见本表）。
 
 **许可**：
 - 我们对 Rust 工作区、`packaging/`、`deploy/`、`docs/` 的改动，跟 kissqy 的固件一样按 **Apache-2.0** 提供（版权 fanhao375 / microduck-replica）；
-- 根目录 README 的那几行改动，跟随 kissqy 原 README 的个人非商业许可；
+- 原首页和那几份文档里的改动，跟随 kissqy 原文的个人非商业许可；新首页 `README.md`、`README.en.md` 是我们写的；
 - LSM6DSV16X 的寄存器配置照搬自 microduck-replica 的 `imu_to_dxl` 固件（MIT，Copyright (c) 2026 imu_to_dxl contributors），引用的是 ST 的 LSM6DSV16X 驱动（BSD-3-Clause，Copyright (c) 2019 STMicroelectronics）的寄存器定义；
 - kissqy 的 `LICENSE`、`LICENSES/`、第三方声明都原样保留；
 - `SOURCE-SHA256SUMS.txt`、`firmware/SHA256SUMS`、`PUBLICATION-MANIFEST.json`、`console/BUILD_MANIFEST.json`、`verification/v167/` 描述的是 kissqy 的原版发布，对我们改过的文件不成立，**我们没有重算**：不拿他的发布身份给我们的代码作保。

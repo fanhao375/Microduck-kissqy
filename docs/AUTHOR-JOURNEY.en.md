@@ -1,6 +1,7 @@
+<!-- Modified 2026-10 by fanhao375 (microduck-replica): links to the homepage now point to README-kissqy.md, where the upstream homepage is kept. -->
 [简体中文](AUTHOR-JOURNEY.md) | **English**
 
-[Back to the homepage](../README.en.md) · [Documentation](README.en.md)
+[Back to the homepage](../README-kissqy.en.md) · [Documentation](README.en.md)
 
 # From beginner to builder: the author's Microduck journey
 
@@ -351,4 +352,4 @@ The software records trace this progression: **obtain the code → run the offic
 - [HAT build timeline](../hardware/HAT-TIMELINE.en.md): component analysis, the two-layer design, home reflow, and robot integration.
 - [IMU build timeline](../hardware/IMU-TIMELINE.en.md): independent hardware and real orientation readings, followed by bus adaptation and robot verification.
 - [Hardware projects and notes](../hardware/README.en.md)
-- [Back to the project homepage](../README.en.md)
+- [Back to the project homepage](../README-kissqy.en.md)

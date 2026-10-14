@@ -1,8 +1,9 @@
+<!-- Modified 2026-10 by fanhao375 (microduck-replica): links to the homepage now point to README-kissqy.md, where the upstream homepage is kept. -->
 **简体中文** | [English](DUCK-SHOPPING-LIST.en.md)
 
 # 🦆 Microduck 鸭子采购总清单
 
-[🏠 返回项目首页](README.md)
+[🏠 返回项目首页](README-kissqy.md)
 
 **做一只完整的鸭子，从这份总清单开始。** 按 **鸭子本体 → PCB → 工具** 分好三类，商品链接、指定型号和费用都可以直接在线查看。
 

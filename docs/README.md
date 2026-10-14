@@ -1,3 +1,4 @@
+<!-- Modified 2026-10 by fanhao375 (microduck-replica): links to the homepage now point to README-kissqy.md, where the upstream homepage is kept. -->
 **简体中文** | [English](README.en.md)
 
 # Microduck 说明文档
@@ -10,7 +11,7 @@
 | --- | --- | --- |
 | 仓库目录与重复资源 | [中文](REPOSITORY-LAYOUT.md) | [English](REPOSITORY-LAYOUT.en.md) |
 | 飞特已编译固件 control.43 — 下载与安装 | [中文](../release-assets/README.md) | [English](../release-assets/README.en.md) |
-| 🎬 看看鸭鸭的真实表现（5 段视频） | [中文](../README.md) | [English](../README.en.md) |
+| 🎬 看看鸭鸭的真实表现（5 段视频） | [中文](../README-kissqy.md) | [English](../README-kissqy.en.md) |
 | 🌱 作者如何从新手进阶 — 学习时间线与完整提问回顾 | [中文](AUTHOR-JOURNEY.md) | [English](AUTHOR-JOURNEY.en.md) |
 | START-HERE | [中文](../START-HERE.txt) | [English](../START-HERE.en.md) |
 | 🦆 Microduck 一键系统镜像 R1 | [中文](releases/public-image-r1.md) | [English](releases/public-image-r1.en.md) |
@@ -96,4 +97,4 @@
 - [Training tests](../microduck-hd1910/training-console/tests/README.md)
 - [Licenses and sources](../microduck-hd1910/training-console/NOTICE.md)
 
-[🦆 项目首页](../README.md)
+[🦆 项目首页](../README-kissqy.md)

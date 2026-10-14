@@ -1,6 +1,7 @@
+<!-- Modified 2026-10 by fanhao375 (microduck-replica): links to the homepage now point to README-kissqy.md, where the upstream homepage is kept. -->
 **简体中文** | [English](AUTHOR-JOURNEY.en.md)
 
-[返回首页](../README.md) · [文档目录](README.md)
+[返回首页](../README-kissqy.md) · [文档目录](README.md)
 
 # 作者如何从新手进阶
 
@@ -351,4 +352,4 @@
 - [HAT 制作时间线](../hardware/HAT-TIMELINE.md)：器件分析、两层板方案、家庭回流与整机接入。
 - [IMU 制作时间线](../hardware/IMU-TIMELINE.md)：从独立硬件和真实姿态读取，到总线适配与整机验证。
 - [硬件工程与说明](../hardware/README.md)
-- [返回项目首页](../README.md)
+- [返回项目首页](../README-kissqy.md)

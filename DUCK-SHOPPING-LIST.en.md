@@ -1,8 +1,9 @@
+<!-- Modified 2026-10 by fanhao375 (microduck-replica): links to the homepage now point to README-kissqy.md, where the upstream homepage is kept. -->
 [简体中文](DUCK-SHOPPING-LIST.md) | **English**
 
 # 🦆 Microduck shopping guide
 
-[🏠 Project homepage](README.en.md)
+[🏠 Project homepage](README-kissqy.en.md)
 
 **Start here to buy parts for one complete duck.** This guide has three sections: **duck body, PCB boards, and build tools**. Product links, exact variants and costs can be viewed directly on GitHub.
 
