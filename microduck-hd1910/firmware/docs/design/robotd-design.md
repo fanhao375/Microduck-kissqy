@@ -1,4 +1,4 @@
-<!-- Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; see IMU-MODULE.md at the repository root. -->
+<!-- Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; UDP pad ([netpad]) and pad-loss sit; see IMU-MODULE.md at the repository root. -->
 **原文 / Original** | [English](robotd-design.en.md)
 
 ## 当前 R17 v1.0.157-Fix6 / control.36
@@ -1015,7 +1015,9 @@ remote client is the one a developer exercises every day, so it cannot quietly r
 `ssh -L /tmp/robotd.sock:/run/robotd.sock` gives pad-on-laptop, robot-on-board with no code.
 
 On the robot it is `padd.service`, running from boot and driving whatever pad connects — safe with
-no pad, because it sends nothing and the deadman holds the robot. It stays **unprivileged**, which
+no pad, because it sends nothing and the deadman holds the robot. The one exception is a pad that
+was driving and stays gone a second: then it sits the robot down (`padd/src/loss.rs`). With
+`[netpad] enabled` the pad is read from UDP instead (`docs/robot/udp-pad.md`). It stays **unprivileged**, which
 is the load-bearing part of "the gamepad is a client": its `input` and `robot` group membership is
 all it has. Pairing a pad therefore belongs to `configd` (`architecture.md` §1), not here — bonding
 a device needs root and BlueZ, and a `padd` holding either would no longer be exercising the API

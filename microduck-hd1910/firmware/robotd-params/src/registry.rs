@@ -1,4 +1,4 @@
-// Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; see IMU-MODULE.md at the repository root.
+// Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; UDP pad ([netpad]); see IMU-MODULE.md at the repository root.
 //! The machine-readable index of every key in `robotd.toml` — what an editor needs to know.
 //!
 //! [`Params`] and its `Default` impls are the truth about *values*; what they cannot carry at
@@ -501,6 +501,24 @@ pub const REGISTRY: &[Entry] = &[
         "pad_imu_head_control.gain",
         Kind::Float,
         "Head radians per pad radian — 1 follows the pad exactly, more amplifies the wrist",
+    ),
+    // ── [netpad] ─────────────────────────────────────────────────────────────
+    //
+    // The pad over UDP (`duckctl udp-pad`), read by `padd` instead of the Bluetooth pad.
+    entry(
+        "netpad.enabled",
+        Kind::Bool,
+        "Drive from UDP (duckctl udp-pad) instead of the Bluetooth pad — restart padd after",
+    ),
+    entry(
+        "netpad.port",
+        Kind::Integer,
+        "UDP port padd listens on for the pad",
+    ),
+    entry(
+        "netpad.timeout_ms",
+        Kind::Integer,
+        "Silence after which the UDP client counts as gone — below safety.deadman_ms",
     ),
 ];
 

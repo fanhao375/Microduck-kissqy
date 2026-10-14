@@ -1,3 +1,4 @@
+# Modified 2026-10 by fanhao375 (microduck-replica): AF_INET for the UDP pad ([netpad]); see IMU-MODULE.md at the repository root.
 # padd — the gamepad, as an intent client.
 #
 # Install to /etc/systemd/system/padd.service.
@@ -74,7 +75,9 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
-RestrictAddressFamilies=AF_UNIX AF_NETLINK
+# AF_INET: the UDP pad ([netpad] enabled, padd/src/udp.rs) — one IPv4 datagram socket, bound only
+# when that is on. Without it the bind fails with EAFNOSUPPORT and padd exits saying so.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET
 RestrictNamespaces=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes

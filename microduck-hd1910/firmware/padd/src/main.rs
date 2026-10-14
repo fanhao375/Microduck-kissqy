@@ -1,3 +1,4 @@
+// Modified 2026-10 by fanhao375 (microduck-replica): UDP pad ([netpad]) and pad-loss sit, after Pollen Robotics microduck 0.17.1 (Apache-2.0); see IMU-MODULE.md at the repository root.
 //! `padd` — a gamepad, as an intent client.
 //!
 //! It has no privileged access to the robot. It reads a pad, turns sticks and buttons into
@@ -74,6 +75,17 @@
 //! stream one layer below has the evidence, so it is passed out unaltered rather than summarised.
 //! `robotctl monitor` draws it; `docs/robot/pair-a-gamepad.md` says how to read it.
 //!
+//! ## Or a pad over UDP
+//!
+//! With `[netpad] enabled` the pad is read from a UDP port instead — the official `duckctl
+//! udp-pad <robot IP>` (Pollen microduck 0.17) on a laptop with any pad plugged in. Same mapping,
+//! same holds and gates: `src/udp.rs` turns datagrams into the edges and axes below.
+//!
+//! ## A pad that goes away
+//!
+//! A pad that was driving and stays gone a second sits the robot down (`sit_toggle`, D-pad down's
+//! default) after a questioning quack, and greets the pad when it comes back — `src/loss.rs`.
+//!
 //! For development against a board: `ssh -L /tmp/robotd.sock:/run/robotd.sock duck`, then
 //! point `--socket` at the forwarded path. Pad on your laptop, robot on the bench, no code.
 //! `systemctl stop padd` first, or two processes fight over the sticks. Run that way, `--tap-socket`
@@ -89,7 +101,12 @@ use clap::Parser;
 use duck_ipc_proto as proto;
 use gilrs::{Axis, Button, Gilrs};
 mod input_settings;
+mod loss;
 mod roller_test;
+mod udp;
+
+use loss::{PadLoss, PadLossAction};
+use udp::PadEdge;
 
 #[cfg(test)]
 mod roller_click_tests {
@@ -243,6 +260,20 @@ impl SelectButton {
     /// `released` is the edge from the event queue, because a press and release inside one tick
     /// leaves `pressed` false on both sides and would otherwise be a stop nobody saw.
     fn tick(&mut self, pressed: bool, released: bool, now: Instant) -> SelectAction {
+        if pressed && released {
+            // Let go and pressed again since the last tick — inside 20 ms by hand, or merged from
+            // a backlog after the loop was held up. The release came first: it is the stop it
+            // always is, and the press after it is a new hold timed from now, not a continuation
+            // of the old one (which would make two short presses a shutdown).
+            let was_shutdown = self.shutdown_sent;
+            self.held_since = Some(now);
+            self.shutdown_sent = false;
+            return if was_shutdown {
+                SelectAction::Nothing
+            } else {
+                SelectAction::Relax
+            };
+        }
         if pressed {
             let since = *self.held_since.get_or_insert(now);
             if now.duration_since(since) >= SHUTDOWN_HOLD && !self.shutdown_sent {
@@ -574,6 +605,69 @@ fn head_from_pad(relative: [f32; 4], gain: f64, max_head: f64) -> proto::HeadPar
     }
 }
 
+/// Where the pad comes from: a gamepad through gilrs (Bluetooth, USB, the web pad's evdev device),
+/// or datagrams on a UDP port (`[netpad] enabled`, see `src/udp.rs`). Exactly one, chosen at start.
+enum Source {
+    Gilrs(Gilrs),
+    Udp(udp::Link),
+}
+
+/// The pad driving this tick, read the same way whichever source it came from — the mapping below
+/// is written once, against this.
+enum PadNow<'a> {
+    Gilrs(gilrs::Gamepad<'a>),
+    Udp(&'a udp::receiver::Frame),
+}
+
+impl PadNow<'_> {
+    fn name(&self) -> String {
+        match self {
+            Self::Gilrs(pad) => pad.name().to_owned(),
+            Self::Udp(frame) => frame.name(),
+        }
+    }
+
+    fn is_pressed(&self, button: Button) -> bool {
+        match self {
+            Self::Gilrs(pad) => pad.is_pressed(button),
+            Self::Udp(frame) => frame.is_pressed(button),
+        }
+    }
+
+    fn value(&self, axis: Axis) -> f32 {
+        match self {
+            Self::Gilrs(pad) => pad.value(axis),
+            Self::Udp(frame) => frame.value(axis),
+        }
+    }
+
+    /// The sticks read as centred because what they came from had queued for an unknown time —
+    /// a UDP pad read after the loop was held up. Never for a gilrs pad.
+    fn unverified(&self) -> bool {
+        matches!(self, Self::Udp(frame) if frame.unverified)
+    }
+
+    /// An analog trigger, 0..1.
+    fn trigger(&self, button: Button) -> f64 {
+        match self {
+            Self::Gilrs(pad) => pad.button_data(button).map(|d| d.value()).unwrap_or(0.0) as f64,
+            Self::Udp(frame) => frame.trigger(button),
+        }
+    }
+}
+
+/// `[netpad]`, read once at start like upstream's two pad daemons do. A config that cannot be read
+/// counts as off, so a damaged file never leaves somebody without the Bluetooth pad.
+fn read_netpad(path: &Path) -> robotd_params::NetpadParams {
+    match robotd_params::Params::load(path, false) {
+        Ok(params) => params.netpad,
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(), "cannot read [netpad]; the UDP pad is off");
+            robotd_params::NetpadParams::default()
+        }
+    }
+}
+
 /// When the config was last written, for spotting a change. `None` for a file that is not there,
 /// which is a real state and compares equal to itself.
 fn config_mtime(path: &Path) -> Option<std::time::SystemTime> {
@@ -595,11 +689,36 @@ fn main() -> std::process::ExitCode {
     // exactly that question across all five.
     duck_ipc_proto::log_startup_identity!("padd");
 
-    let mut gilrs = match Gilrs::new() {
-        Ok(gilrs) => gilrs,
-        Err(e) => {
-            tracing::error!(error = %e, "no gamepad subsystem");
-            return std::process::ExitCode::FAILURE;
+    let netpad = read_netpad(&args.config);
+    let mut source = if netpad.enabled {
+        match udp::Link::bind(
+            netpad.port,
+            Duration::from_millis(netpad.timeout_ms),
+            &args.socket,
+        ) {
+            Ok(link) => {
+                tracing::warn!(
+                    port = netpad.port,
+                    timeout_ms = netpad.timeout_ms,
+                    "netpad on — reading the pad from UDP (duckctl udp-pad <this robot's IP>); \
+                     the Bluetooth and web pads are not read until [netpad] enabled = false"
+                );
+                Source::Udp(link)
+            }
+            Err(e) => {
+                // Exit rather than fall back to Bluetooth: someone switched UDP on and is
+                // waiting at a laptop. systemd retries, and this line says why.
+                tracing::error!(error = %e, port = netpad.port, "cannot bind the UDP pad port");
+                return std::process::ExitCode::FAILURE;
+            }
+        }
+    } else {
+        match Gilrs::new() {
+            Ok(gilrs) => Source::Gilrs(gilrs),
+            Err(e) => {
+                tracing::error!(error = %e, "no gamepad subsystem");
+                return std::process::ExitCode::FAILURE;
+            }
         }
     };
 
@@ -670,6 +789,10 @@ fn main() -> std::process::ExitCode {
     // ticks so a steady state neither allocates nor re-sends — see [`Continuous`].
     let mut continuous = Continuous::default();
     let mut frame: Vec<proto::Call> = Vec::with_capacity(2);
+    // A pad that was driving and went away — see `loss`.
+    let mut pad_loss = PadLoss::default();
+    // This tick's button edges, from whichever source. Kept across ticks for its buffer.
+    let mut edges: Vec<PadEdge> = Vec::new();
 
     let mut input_limits = input_settings::Live::new(
         args.input_settings.clone(),
@@ -699,25 +822,65 @@ fn main() -> std::process::ExitCode {
         // Only the selected pad's events may act: with two pads
         // connected, a Start or Select from the *other* one would otherwise steer a robot
         // whose sticks belong to somebody else.
-        let pad_id = preferred_pad(
-            gilrs
-                .gamepads()
-                .map(|(id, pad)| (id, pad_priority(pad.name()))),
-        );
-        if active_pad != pad_id {
-            if active_pad.is_some() {
-                input.reset();
-                continuous.at = None;
-                driving = false;
-            }
-            if let Some(pad) = pad_id.and_then(|id| gilrs.connected_gamepad(id)) {
-                // Before tap.watch: the web device is born neutral and waits for that
-                // acknowledgement before sending its first real Start press.
-                input.buttons = button_baseline(&pad);
-            }
-        }
-        active_pad = pad_id;
         let mut pad_disconnected = false;
+        let mut udp_frame = None;
+        edges.clear();
+        let pad_id = match &mut source {
+            Source::Gilrs(gilrs) => {
+                let pad_id = preferred_pad(
+                    gilrs
+                        .gamepads()
+                        .map(|(id, pad)| (id, pad_priority(pad.name()))),
+                );
+                if active_pad != pad_id {
+                    if active_pad.is_some() {
+                        input.reset();
+                        continuous.at = None;
+                        driving = false;
+                    }
+                    if let Some(pad) = pad_id.and_then(|id| gilrs.connected_gamepad(id)) {
+                        // Before tap.watch: the web device is born neutral and waits for that
+                        // acknowledgement before sending its first real Start press.
+                        input.buttons = button_baseline(&pad);
+                    }
+                }
+                active_pad = pad_id;
+                while let Some(event) = gilrs.next_event() {
+                    if Some(event.id) != pad_id {
+                        continue;
+                    }
+                    match event.event {
+                        gilrs::EventType::Disconnected => pad_disconnected = true,
+                        gilrs::EventType::ButtonReleased(button, _) => {
+                            edges.push(PadEdge::Released(button))
+                        }
+                        gilrs::EventType::ButtonPressed(button, _) => {
+                            edges.push(PadEdge::Pressed(button))
+                        }
+                        _ => {}
+                    }
+                }
+                pad_id
+            }
+            Source::Udp(link) => {
+                match link.step(tick) {
+                    udp::Step::Driving(frame) => {
+                        if frame.new_session {
+                            // A client's first datagram, as a Bluetooth pad's connection: what it
+                            // held *then* was pressed before it was seen, and waits for its
+                            // release — including a release that already landed before this take.
+                            input.buttons =
+                                ReleaseGate::baseline(|button| frame.was_pressed(button));
+                        }
+                        edges.extend(frame.pad_edges());
+                        udp_frame = Some(frame);
+                    }
+                    udp::Step::Gone => pad_disconnected = true,
+                    udp::Step::Absent => {}
+                }
+                None
+            }
+        };
         let mut toggle_enable = false;
         let mut toggle_head = false;
         let mut toggle_body = false;
@@ -728,22 +891,16 @@ fn main() -> std::process::ExitCode {
         let mut select_released = false;
         let mut reboot_motors = false;
         let mut roller_stand_test = false;
-        while let Some(event) = gilrs.next_event() {
-            if Some(event.id) != pad_id {
-                continue;
-            }
-            if matches!(event.event, gilrs::EventType::Disconnected) {
-                pad_disconnected = true;
-            }
+        for &edge in &edges {
             // Select is the one button read on its release: a short press stops, a long hold shuts
             // down, and which it was is only known when the thumb comes off.
-            if let gilrs::EventType::ButtonReleased(button, _) = event.event {
+            if let PadEdge::Released(button) = edge {
                 let allowed = input.buttons.release(button);
                 if button == Button::Select && allowed {
                     select_released = true;
                 }
             }
-            if let gilrs::EventType::ButtonPressed(button, _) = event.event
+            if let PadEdge::Pressed(button) = edge
                 && input.buttons.allows(button)
             {
                 match button {
@@ -775,10 +932,14 @@ fn main() -> std::process::ExitCode {
         // Re-read the pad by id after the drain: a `Disconnected` dequeued above may have
         // taken it, and asking for the first pad again would silently hand the robot the
         // *other* pad's sticks. One tick of "pad gone" beats that.
-        let Some(pad) = pad_id
-            .filter(|_| !pad_disconnected)
-            .and_then(|id| gilrs.connected_gamepad(id))
-        else {
+        let pad = match &source {
+            Source::Gilrs(gilrs) => pad_id
+                .filter(|_| !pad_disconnected)
+                .and_then(|id| gilrs.connected_gamepad(id))
+                .map(PadNow::Gilrs),
+            Source::Udp(_) => udp_frame.as_ref().map(PadNow::Udp),
+        };
+        let Some(pad) = pad else {
             // No pad. Send nothing: `robotd`'s deadman stops the robot on its own, which is
             // exactly the wanted behaviour, and inventing a zero command here would mask a
             // disconnected pad as a deliberate stop.
@@ -787,8 +948,36 @@ fn main() -> std::process::ExitCode {
             // "The pad went away" is the single most useful line in the journal when the robot
             // stops responding mid-drive, and one line per tick would bury it.
             if driving {
-                tracing::warn!("pad gone — sending nothing; robotd's deadman holds the robot");
+                tracing::warn!(
+                    "pad gone — robotd's deadman stops the walking; sitting down in {:?} if it stays gone",
+                    loss::PAD_LOST_SIT
+                );
                 driving = false;
+                pad_loss.lost(tick);
+            }
+            // Heard, because whoever lost the pad is looking at the robot, not the journal — but
+            // only once the loss has lasted to the sit: a blip is not worth a quack.
+            if pad_loss.ask(tick) {
+                sound(&mut stream, proto::SoundTag::Inquire);
+            }
+            match pad_loss.tick(tick) {
+                PadLossAction::Nothing => {}
+                PadLossAction::Sit => match sit_if_standing(&mut stream, &mut next_id) {
+                    Ok(true) => pad_loss.settle(),
+                    // Refused — mid-move, typically. Asked again on the next poll.
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::error!(error = %e, "sit request failed");
+                        return std::process::ExitCode::FAILURE;
+                    }
+                },
+                PadLossAction::GiveUp => {
+                    tracing::warn!(
+                        "pad gone: the robot would not sit after {:?} of asking — leaving it as it is",
+                        loss::PAD_LOST_SIT_TRIES
+                    );
+                    pad_loss.settle();
+                }
             }
             // A hold in flight was measured against the pad that just left: drop it, or a
             // Select (or D-pad up) still down when the pad returns lands its full hold time
@@ -799,13 +988,25 @@ fn main() -> std::process::ExitCode {
             if let Some(tap) = tap.as_ref() {
                 tap.idle();
             }
-            std::thread::sleep(IDLE_POLL);
+            let pause = if pad_loss.pending() {
+                loss::PAD_LOST_POLL
+            } else {
+                IDLE_POLL
+            };
+            match &mut source {
+                // Wakes for the first datagram of a client rather than leaving it half a second.
+                Source::Udp(link) => link.wait(tick + pause, true),
+                Source::Gilrs(_) => std::thread::sleep(pause),
+            }
             continue;
         };
 
         if !driving {
-            tracing::warn!(pad = pad.name(), "pad connected — driving");
+            tracing::warn!(pad = %pad.name(), "pad connected — driving");
             driving = true;
+            if pad_loss.found() {
+                sound(&mut stream, proto::SoundTag::Greet);
+            }
         }
 
         if input.pose_reset_pending {
@@ -828,15 +1029,21 @@ fn main() -> std::process::ExitCode {
         // two ticks never clears `driving`, and it comes back as a different event node often
         // enough that a tap following the old one would report the rest of the session as silence.
         if let Some(tap) = tap.as_ref() {
-            tap.watch(&pad);
-            // Every tick, like the bindings: switching the feature on in the config has to start
-            // the IMU reader without a restart, and off has to let it go.
-            tap.imu_control(imu_head_cfg.enabled);
+            match &pad {
+                PadNow::Gilrs(gamepad) => {
+                    tap.watch(gamepad);
+                    // Every tick, like the bindings: switching the feature on in the config has to
+                    // start the IMU reader without a restart, and off has to let it go.
+                    tap.imu_control(imu_head_cfg.enabled);
+                }
+                // The tap reads evdev; a UDP pad has none, and no IMU.
+                PadNow::Udp(_) => tap.idle(),
+            }
         }
 
         // The pad's attitude this tick, when the feature is on and the pad has an IMU that has
         // said something believable. `None` is every other case, and Y then means the sticks.
-        let attitude = if imu_head_cfg.enabled {
+        let attitude = if imu_head_cfg.enabled && matches!(pad, PadNow::Gilrs(_)) {
             tap.as_ref().and_then(|tap| tap.attitude())
         } else {
             None
@@ -980,8 +1187,15 @@ fn main() -> std::process::ExitCode {
         // Whatever X is bound to, not the word "roulade": a skill that does not chain simply
         // refuses the resend, which costs a notification nobody reads. Only X, because it is the
         // button the prototype held and the only one anybody holds.
+        //
+        // A UDP pad read from a hold-up's queue (`src/udp.rs`) may say a button is *held* from
+        // before its client left: then the holds — this resend, Select's shutdown, the D-pad mode
+        // holds — keep their time but fire only once the pad is heard live. Edges still count: a
+        // press or a release really happened.
+        let holds_trusted = !pad.unverified();
         let held = bindings.skill("x").unwrap_or_default();
-        if input.buttons.allows(Button::West)
+        if holds_trusted
+            && input.buttons.allows(Button::West)
             && pad.is_pressed(Button::West)
             && !pressed.contains(&"x")
             && !held.is_empty()
@@ -999,11 +1213,19 @@ fn main() -> std::process::ExitCode {
         // Select: a short press is the emergency stop, on release; held two seconds it is the
         // shutdown sequence — sit down, torque off, power off — sent once per hold, and the
         // release after it does nothing. The robot owns the sequence from there.
-        match input.select.tick(
-            input.buttons.allows(Button::Select) && pad.is_pressed(Button::Select),
-            select_released,
-            tick,
-        ) {
+        let select = if holds_trusted || select_released {
+            input.select.tick(
+                input.buttons.allows(Button::Select) && pad.is_pressed(Button::Select),
+                select_released,
+                tick,
+            )
+        } else {
+            // Skipped rather than ticked as "not pressed": that would clear a shutdown already
+            // sent, and the real release that follows would become a stop that drops a robot
+            // mid-sit. The hold keeps its start and resumes when the pad is heard live.
+            SelectAction::Nothing
+        };
+        match select {
             SelectAction::Nothing => {}
             SelectAction::Relax => relax = true,
             SelectAction::Shutdown => {
@@ -1047,7 +1269,7 @@ fn main() -> std::process::ExitCode {
         // for a mode rather than for "the other one", which could be either by the time it lands.
         if input.buttons.allows(Button::DPadUp) && pad.is_pressed(Button::DPadUp) {
             let held = input.dpad_up_held_since.get_or_insert(tick);
-            if tick.duration_since(*held) >= MODE_HOLD && !input.mode_switch_sent {
+            if holds_trusted && tick.duration_since(*held) >= MODE_HOLD && !input.mode_switch_sent {
                 input.mode_switch_sent = true;
                 let target = if roller { "walk" } else { "roller" };
                 tracing::warn!(
@@ -1091,7 +1313,7 @@ fn main() -> std::process::ExitCode {
         if roller && pad.name() != "Microduck R17 Web Xbox"
             && input.buttons.allows(Button::DPadLeft) && pad.is_pressed(Button::DPadLeft) {
             let held = input.dpad_left_held_since.get_or_insert(tick);
-            if tick.duration_since(*held) >= ROLLER_ACTION_HOLD && !input.roller_action_switch_sent {
+            if holds_trusted && tick.duration_since(*held) >= ROLLER_ACTION_HOLD && !input.roller_action_switch_sent {
                 input.roller_action_switch_sent = true;
                 let requested = if roller_spin { "roller_crouch" } else { "roller_spin" };
                 match request(&mut stream, &mut next_id,
@@ -1128,7 +1350,7 @@ fn main() -> std::process::ExitCode {
 
         // Either trigger opens the mouth; the max wins, as in the prototype — where RT
         // also chirps and LT rides the wheee, which they now do here too.
-        let trigger = |b: Button| pad.button_data(b).map(|d| d.value()).unwrap_or(0.0) as f64;
+        let trigger = |b: Button| pad.trigger(b);
         let rt = trigger(Button::RightTrigger2);
         let lt = trigger(Button::LeftTrigger2);
         let mouth = input_limits.settings.mouth(rt, lt);
@@ -1251,15 +1473,52 @@ fn main() -> std::process::ExitCode {
             )));
         }
 
+        // Centred sticks stop a walk, but in head and body-pose mode they pose the head or body to
+        // centre: while the sticks are not trusted, the only continuous intent is the stop.
+        if pad.unverified() && input.mode != Mode::Drive {
+            frame.clear();
+            frame.push(proto::Call::RobotMove(proto::MoveParams::default()));
+        }
+
         if let Err(e) = continuous.send(&mut stream, &frame, tick) {
             tracing::error!(error = %e, "send failed");
             return std::process::ExitCode::FAILURE;
         }
 
-        if let Some(remaining) = period.checked_sub(tick.elapsed()) {
-            std::thread::sleep(remaining);
+        match &mut source {
+            // The same tick rate as a Bluetooth pad, but every datagram in between is read and
+            // answered as it lands, so the sender's round trip is the network's, not this loop's.
+            Source::Udp(link) => {
+                link.report(Instant::now());
+                link.wait(tick + period, false);
+            }
+            Source::Gilrs(_) => {
+                if let Some(remaining) = period.checked_sub(tick.elapsed()) {
+                    std::thread::sleep(remaining);
+                }
+            }
         }
     }
+}
+
+/// Play one of the robot's sounds, best effort: a cue, not something worth stopping for.
+fn sound(stream: &mut UnixStream, tag: proto::SoundTag) {
+    if let Err(e) = notify(stream, &loss::sound(tag)) {
+        tracing::debug!(error = %e, "sound not sent");
+    }
+}
+
+/// Sit the robot down unless it is sitting already. `Ok(true)` when there is nothing left to do,
+/// `Ok(false)` when the robot refused for a reason that passes — `loss` reads the answers.
+///
+/// Its refusals are not the pad's: nobody pressed anything, so they stay out of the UDP report.
+fn sit_if_standing(stream: &mut UnixStream, next_id: &mut u64) -> std::io::Result<bool> {
+    let policies = request_as(stream, next_id, &proto::Call::RobotPolicies, false)?;
+    if loss::already_sitting(policies.as_ref()) {
+        return Ok(true);
+    }
+    let answer = request_as(stream, next_id, &loss::sit_call(), false)?;
+    Ok(loss::sit_settled(answer.as_ref()))
 }
 
 /// Bound socket stalls without adding another input or recovery loop.
@@ -1382,6 +1641,17 @@ fn request(
     next_id: &mut u64,
     call: &proto::Call,
 ) -> std::io::Result<Option<proto::Response>> {
+    request_as(stream, next_id, call, true)
+}
+
+/// [`request`], saying whether a refusal is one the pad asked for and so belongs in the UDP pad's
+/// report (`udp::note_refusal`).
+fn request_as(
+    stream: &mut UnixStream,
+    next_id: &mut u64,
+    call: &proto::Call,
+    from_the_pad: bool,
+) -> std::io::Result<Option<proto::Response>> {
     let id = proto::Id::Number(*next_id);
     *next_id += 1;
     let mut line = serde_json::to_vec(&proto::Request::call(id.clone(), call))?;
@@ -1409,10 +1679,19 @@ fn request(
             }
             if let Some(error) = &response.error {
                 tracing::warn!(code = error.code, message = %error.message, "refused");
+                if from_the_pad {
+                    udp::note_refusal(call.method(), error.message.clone());
+                }
             } else if let Ok(result) = response.result_as::<proto::IntentResult>()
                 && !result.accepted
             {
                 tracing::warn!(reason = ?result.reason, "not accepted");
+                if from_the_pad {
+                    udp::note_refusal(
+                        call.method(),
+                        result.reason.unwrap_or_else(|| "not accepted".to_owned()),
+                    );
+                }
             }
             Ok(Some(response))
         }
@@ -1491,6 +1770,41 @@ mod tests {
             Some(0)
         );
         assert_eq!(pad_priority("GameSir Other"), Some(1));
+    }
+
+    /// The UDP pad's reconnect, as the loop wires it: Select held in the datagram that starts the
+    /// session and let go before the first take must not reach Select's emergency stop — the same
+    /// rule the Bluetooth pad's baseline enforces.
+    #[test]
+    fn a_udp_select_released_before_the_first_take_does_not_relax() {
+        use udp::receiver::Receiver;
+        use udp::wire::{Buttons, Packet};
+        let mut rx = Receiver::new(Duration::from_millis(250));
+        let (t, peer) = (Instant::now(), "10.0.0.2:5000".parse().unwrap());
+        let datagram = |seq, held| Packet::from_axes(seq, 0, [0.0; 4], [0.0; 2], held).encode();
+        rx.on_datagram(t, peer, &datagram(1, Buttons::SELECT));
+        rx.on_datagram(
+            t + Duration::from_millis(100),
+            peer,
+            &datagram(2, Buttons::NONE),
+        );
+        let frame = rx.take().unwrap();
+        assert!(frame.new_session);
+        let mut gate = ReleaseGate::baseline(|button| frame.was_pressed(button));
+        let mut select_released = false;
+        for edge in frame.pad_edges() {
+            if let PadEdge::Released(button) = edge
+                && gate.release(button)
+                && button == Button::Select
+            {
+                select_released = true;
+            }
+        }
+        assert!(
+            !select_released,
+            "an inherited Select release is not a stop"
+        );
+        assert!(gate.allows(Button::Select), "and the next press is armed");
     }
 
     #[test]
@@ -1925,6 +2239,29 @@ mod tests {
         );
         let head = head_from_pad(left, 2.0, 0.5);
         assert!((head.head_yaw - 0.5).abs() < 1e-6, "{head:?}");
+    }
+
+    /// Let go and pressed again inside one tick: the release is still the stop, and the press
+    /// after it is a new hold from now — two short presses are never a shutdown.
+    #[test]
+    fn a_release_and_re_press_inside_one_tick_is_a_stop_then_a_new_hold() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut select = SelectButton::default();
+        assert_eq!(select.tick(true, false, at(0)), SelectAction::Nothing);
+        assert_eq!(select.tick(true, false, at(1_000)), SelectAction::Nothing);
+        assert_eq!(select.tick(true, true, at(1_100)), SelectAction::Relax);
+        for ms in (1_120..3_100).step_by(20) {
+            assert_eq!(
+                select.tick(true, false, at(ms)),
+                SelectAction::Nothing,
+                "{ms} ms: the new hold is not two seconds old"
+            );
+        }
+        assert_eq!(select.tick(true, false, at(3_100)), SelectAction::Shutdown);
+
+        // After a shutdown, a re-press inside one tick is not a stop: the robot is sitting down.
+        assert_eq!(select.tick(true, true, at(3_200)), SelectAction::Nothing);
     }
 
     /// Select is read on release. A short press is the stop, on the release; a hold reaching two

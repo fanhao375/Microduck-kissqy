@@ -1,4 +1,4 @@
-// Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; see IMU-MODULE.md at the repository root.
+// Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; UDP pad ([netpad]); see IMU-MODULE.md at the repository root.
 //! `robotd`'s startup parameters: the schema, the defaults, and the validation.
 //!
 //! A file rather than a wall of CLI flags — the prototype grew 142 of them and most were
@@ -91,6 +91,37 @@ pub struct Params {
     /// editor renames the section the next time it saves that file.
     #[serde(alias = "imu_head")]
     pub pad_imu_head_control: PadImuHeadControlParams,
+    /// The pad over UDP, from a program on the LAN. `padd` reads this at start to pick its source.
+    pub netpad: NetpadParams,
+}
+
+/// A gamepad over UDP, from a program on the LAN — the official `duckctl udp-pad` (Pollen
+/// microduck 0.17), speaking its wire format (`padd/src/udp/wire.rs`).
+///
+/// Upstream runs this as a second daemon, `netpadd`, beside `padd`. Here it is a second *source*
+/// inside `padd`: the same mapping, holds and gates whichever pad is driving, so a UDP pad does on
+/// this robot exactly what the Bluetooth pad does. `enabled` is read at start; restart `padd` after
+/// changing it. While it is on, the Bluetooth pad (and the web pad, which `padd` reads through
+/// evdev) is not read at all.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct NetpadParams {
+    /// UDP is the pad source; the Bluetooth pad is not read.
+    pub enabled: bool,
+    /// The UDP port, bound on IPv4 0.0.0.0. Upstream's default, so `duckctl udp-pad <ip>` finds it.
+    pub port: u16,
+    /// Silence after which the client counts as gone, and nothing more is sent for it.
+    pub timeout_ms: u64,
+}
+
+impl Default for NetpadParams {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: 4210,
+            timeout_ms: 250,
+        }
+    }
 }
 
 /// Controller-IMU head control: pose the head by tilting the pad.
@@ -2075,6 +2106,8 @@ pub enum ParamsError {
     },
     #[error("{path}: trunk_imu: {reason}")]
     TrunkImu { path: String, reason: String },
+    #[error("{path}: {reason}")]
+    Netpad { path: String, reason: String },
 }
 
 /// The band `media.bitrate` is accepted in, bits per second.
@@ -2169,6 +2202,26 @@ impl Params {
             return Err(ParamsError::TrunkImu {
                 path: path.display().to_string(),
                 reason,
+            });
+        }
+        // Gated on `enabled` because robotd loads this file too: a board not using netpad must
+        // never fail to load over a section it does not read. Upstream's rule, unchanged.
+        if self.netpad.enabled
+            && (self.netpad.timeout_ms == 0 || self.netpad.timeout_ms >= self.safety.deadman_ms)
+        {
+            return Err(ParamsError::Netpad {
+                path: path.display().to_string(),
+                reason: format!(
+                    "netpad.timeout_ms ({}) must be above 0 and below safety.deadman_ms ({}) — \
+                     past the deadman it would re-send a dead client's last stick",
+                    self.netpad.timeout_ms, self.safety.deadman_ms
+                ),
+            });
+        }
+        if self.netpad.enabled && self.netpad.port == 0 {
+            return Err(ParamsError::Netpad {
+                path: path.display().to_string(),
+                reason: "netpad.port must not be 0 — a client has to know where to send".to_owned(),
             });
         }
         Ok(())
@@ -3690,6 +3743,51 @@ source = \"{}\"
             Params::load(&path, true).unwrap().trunk_imu.source,
             TrunkImuSource::Bus
         );
+    }
+
+    /// Off, on upstream's port and timeout, when the section is absent — a robot that never
+    /// heard of the UDP pad keeps its Bluetooth one.
+    #[test]
+    fn netpad_is_off_by_default_on_upstreams_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = Params::load(&write(dir.path(), ""), true).unwrap();
+        assert_eq!(p.netpad, NetpadParams::default());
+        assert!(!p.netpad.enabled);
+        assert_eq!((p.netpad.port, p.netpad.timeout_ms), (4210, 250));
+    }
+
+    /// The client's timeout must end before the deadman would: past it, `padd` would re-send a
+    /// dead client's last stick to a robot that had already stopped. Upstream's rule, and only
+    /// checked when netpad is on: robotd loads this file too.
+    #[test]
+    fn netpad_timeout_must_be_below_the_deadman() {
+        let dir = tempfile::tempdir().unwrap();
+        for bad in [
+            "[netpad]\nenabled = true\ntimeout_ms = 500\n",
+            "[netpad]\nenabled = true\ntimeout_ms = 0\n",
+            "[netpad]\nenabled = true\nport = 0\n",
+        ] {
+            let error = Params::load(&write(dir.path(), bad), true)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("netpad."), "{bad}: {error}");
+        }
+        let off = write(dir.path(), "[netpad]\nenabled = false\ntimeout_ms = 500\n");
+        assert!(Params::load(&off, true).is_ok(), "off: never refused");
+        let raised = write(
+            dir.path(),
+            "[netpad]\nenabled = true\ntimeout_ms = 500\n[safety]\ndeadman_ms = 800\n",
+        );
+        assert_eq!(Params::load(&raised, true).unwrap().netpad.timeout_ms, 500);
+    }
+
+    /// Upstream also has `max_hz`, which sizes its separate daemon's send rate; here the pad is
+    /// read at `padd --hz` like the Bluetooth one. A file copied from upstream's docs still loads.
+    #[test]
+    fn upstreams_max_hz_is_ignored_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "[netpad]\nenabled = true\nmax_hz = 30\n");
+        assert!(Params::load(&path, true).unwrap().netpad.enabled);
     }
 }
 

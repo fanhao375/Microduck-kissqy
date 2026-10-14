@@ -1,4 +1,4 @@
-<!-- Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; see IMU-MODULE.md at the repository root. -->
+<!-- Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; UDP pad ([netpad]) and pad-loss sit; see IMU-MODULE.md at the repository root. -->
 # Microduck R17 V164 / control.40 documentation
 
 The [R17 README](../README-R17.zh-CN.md) is the current package overview. For this robot's
@@ -22,6 +22,7 @@ docs give the reasoning and point at it.
 |---|---|
 | [`cheatsheet.md`](robot/cheatsheet.md) | Every `robotctl` command. |
 | [`pair-a-gamepad.md`](robot/pair-a-gamepad.md) | Once per pad: pairing mode, `pad pair`, and what to do when it will not bond. |
+| [`udp-pad.md`](robot/udp-pad.md) | A pad on a laptop over the LAN: `[netpad]`, `duckctl udp-pad`, and what the robot does when it goes quiet. |
 | [`cheatsheet-dev.md`](robot/cheatsheet-dev.md) | The commands that need a dev board: branch builds, candidates, dev pushes. |
 | [`dev-push.md`](robot/dev-push.md) | Build on your machine and install on the board over ssh, with no CI run. |
 | [`simulation.md`](robot/simulation.md) | The simulated duck: `scripts/duck-sim`, the real daemons against a MuJoCo body, one duck or several in containers. |

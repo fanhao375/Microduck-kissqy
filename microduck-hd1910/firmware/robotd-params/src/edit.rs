@@ -1,4 +1,4 @@
-// Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; see IMU-MODULE.md at the repository root.
+// Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; UDP pad ([netpad]); see IMU-MODULE.md at the repository root.
 //! Editing `robotd.toml` without disturbing it.
 //!
 //! The lossless writer for this crate's own schema: parse with `toml_edit`, set or remove exactly
@@ -1092,7 +1092,9 @@ mod tests {
                 // Last, and the editor shows sections in this order: the pad is what a robot's
                 // buttons do, which is the thing somebody browses for rather than tunes.
                 "pad",
-                "pad_imu_head_control"
+                "pad_imu_head_control",
+                // Where the pad comes from, after what it does.
+                "netpad"
             ]
         );
     }

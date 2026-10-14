@@ -1,3 +1,4 @@
+# Modified 2026-10 by fanhao375 (microduck-replica): AF_INET for the UDP pad ([netpad]); see IMU-MODULE.md at the repository root.
 # padd — the gamepad, as an intent client.
 #
 # Install to /etc/systemd/system/padd.service.
@@ -66,6 +67,9 @@ RestartSec=5s
 # AF_NETLINK is load-bearing and easy to miss: gilrs enumerates and *watches* devices through
 # libudev, which is a netlink socket. Without it a pad connected after startup is never noticed,
 # which presents as "the pad works only if it was on before the robot booted".
+#
+# AF_INET is the UDP pad (`[netpad] enabled`, `src/udp.rs`): one IPv4 datagram socket, bound only
+# when that is switched on. Without it the bind fails with EAFNOSUPPORT and `padd` exits saying so.
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
@@ -74,7 +78,7 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
-RestrictAddressFamilies=AF_UNIX AF_NETLINK
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET
 RestrictNamespaces=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes

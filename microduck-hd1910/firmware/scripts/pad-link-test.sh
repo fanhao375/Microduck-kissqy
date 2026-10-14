@@ -1,4 +1,5 @@
 #!/bin/sh
+# Modified 2026-10 by fanhao375 (microduck-replica): history counts padd's 'pad gone —' lines only (UDP pad); see IMU-MODULE.md at the repository root.
 # How reliable is the radio between the pad and the robot?
 #
 # Run this on the robot, with the pad switched on and `padd` doing whatever it normally does. It
@@ -178,7 +179,7 @@ if [ "$MODE" = history ]; then
         exit 0
     fi
 
-    drops="$(printf '%s\n' "$lines" | grep -c 'pad gone' || true)"
+    drops="$(printf '%s\n' "$lines" | grep -c 'pad gone —' || true)"
     ups="$(printf '%s\n' "$lines" | grep -c 'pad connected' || true)"
     echo "padd journal since ${SINCE}"
     echo "  connects   ${ups}"
