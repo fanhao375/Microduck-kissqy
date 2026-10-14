@@ -1,5 +1,5 @@
-import {showFeedback} from './feedback.js';
-import {readTiming,isLateRead,acceptedLateRead,failureText} from './read-timing.js';
+import {showFeedback} from './feedback.js?demo=20261013';
+import {readTiming,isLateRead,acceptedLateRead,failureText} from './read-timing.js?demo=20261013';
 
 const finite=v=>typeof v==='number'&&Number.isFinite(v);
 const fmt=(v,n=1)=>finite(v)?v.toFixed(n):'—';
@@ -49,12 +49,12 @@ export class DeviceInspection {
   paint(){
     if(!this.s)return;
     const s=this.s,b=s.bus||{},options=this.options,loop=isLoop(b);
-    const displayOnly=options.replay||options.paused||options.offline;
+    const displayOnly=options.replay||options.offline;
     const live=s.channels?.bus?.status==='live'&&!options.offline;
     const counters=finite(b.total_cycles)&&finite(b.total_communication_failures);
     this.$('start').disabled=!!(loop||this.manual||this.pending||displayOnly||!live||!counters);
     this.$('stop').disabled=!this.manual||this.pending||!!displayOnly;
-    const context=options.replay?'历史回放':options.paused?'显示已暂停':!live?'反馈已中断':'';
+    const context=options.replay?'历史回放':!live?'反馈已中断':'';
     this.$('source').textContent=loop?'运动循环 · 自动接入':this.manual?'手动检测':'手动检测 · 待启动';
     this.$('source').className='badge '+(context?'warn':loop?'inspection-auto':'neutral');
     // A mode change ends the old manual interval; never subtract counters from
@@ -72,17 +72,17 @@ export class DeviceInspection {
       const sync=b.native?.sync;
       const counts=totals?` · 本次服务读取 ${totals.total_reads} 轮 · 异常 ${totals.failed_reads} 轮${finite(totals.complete_but_late)?` · 收齐但超时 ${totals.complete_but_late} 轮${finite(totals.accepted_complete_but_late)?`（已接纳 ${totals.accepted_complete_but_late} 轮）`:''}`:''}`:' · 当前服务未提供累计计数';
       this.$('status').textContent=`${context||'使用现有运动循环数据'} · 第 ${b.cycle} 轮${finite(sync?.elapsed_us)?` · 本轮 ${(sync.elapsed_us/1000).toFixed(2)} ms`:''}${counts}`;
-      this.paintDevices(s,{loop:true,live:live&&!options.paused});
+      this.paintDevices(s,{loop:true,live:live});
     }else if(this.manual&&this.base&&counters&&b.session===this.base.session){
       const rounds=Math.max(0,b.total_cycles-this.base.cycle),failed=Math.max(0,b.total_communication_failures-this.base.failures);
       this.summary=`读取 ${rounds} 轮 · 成功 ${Math.max(0,rounds-failed)} 轮 · 异常 ${failed} 轮`;
       this.$('status').textContent=`${context||'检测中'} · ${this.summary}`;
-      this.paintDevices(s,{rounds,live:live&&!options.paused});
+      this.paintDevices(s,{rounds,live:live});
     }else{
       this.loopCycle=undefined;this.lastLoopFailure=null;
       this.$('status').textContent=context||this.summary&&`已停止 · ${this.summary} · 保留本次结果`||'未启动运动循环，点击“开始检测”测试通信';
       // A loop that just stopped must not leave a row labelled live/normal.
-      this.paintDevices(s,{live:live&&!options.paused});
+      this.paintDevices(s,{live:live});
     }
     const deviceStats=deviceStatsOf(b);
     if(deviceStats){

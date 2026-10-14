@@ -2928,6 +2928,7 @@ mod hd1910_transport_tests {
         writes: Arc<Mutex<Vec<(u8, u8, Vec<u8>)>>>,
         /// Every request that is not a write: instruction, address, the IDs it addressed.
         requests: Requests,
+        reads: Arc<Mutex<Vec<(u8, usize)>>>,
         thread: Option<std::thread::JoinHandle<()>>,
     }
     impl Drop for Emulator {
@@ -2959,6 +2960,8 @@ mod hd1910_transport_tests {
         let done = Arc::new(AtomicBool::new(false));
         let writes = Arc::new(Mutex::new(Vec::new()));
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let read_log = reads.clone();
         let (d, r, w, q) = (done.clone(), regs.clone(), writes.clone(), requests.clone());
         let thread = std::thread::spawn(move || {
             let mut seq = 0u8;
@@ -2989,6 +2992,7 @@ mod hd1910_transport_tests {
                     }
                     continue;
                 }
+                read_log.lock().unwrap().push((addr, len));
                 let ids = if body[0] == SYNC_READ {
                     body[3..body.len() - 1].to_vec()
                 } else {
@@ -3051,6 +3055,7 @@ mod hd1910_transport_tests {
                 regs,
                 writes,
                 requests,
+                reads,
                 thread: Some(thread),
             },
         )
@@ -3665,7 +3670,7 @@ mod hd1910_transport_tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .all(|(_, address, _)| [40, 42, 50].contains(address))
+                .all(|(_, address, _)| [40, 42, 48, 50, 51].contains(address))
         );
         // A different raw revolution on re-arm or service restart never changes HOME.
         io.set_torque(false).unwrap();
@@ -3764,7 +3769,7 @@ mod hd1910_transport_tests {
         assert!(bus.last_sync.complete_but_late);
     }
     #[test]
-    fn hd1910_contract_p_arm_and_relax_preserve_d_limit_acceleration_and_eeprom() {
+    fn hd1910_model_p_arm_writes_d0_limit1000_preserving_acceleration_and_eeprom() {
         let (mut bus, device) = emulator(false);
         // Same writer used by commissioning before switching to the motion loop.
         // Every servo retains its own existing acceleration, not a fixed test value.
@@ -3772,6 +3777,7 @@ mod hd1910_transport_tests {
             let mut registers = device.regs.lock().unwrap();
             registers[id as usize][41] = id * 3;
             registers[id as usize][51] = id * 2;
+            registers[id as usize][52] = id;
             registers[id as usize][48..50].copy_from_slice(&(800u16 + id as u16).to_le_bytes());
             drop(registers);
             bus.positions(&[(id, 2048)]).unwrap();
@@ -3781,13 +3787,31 @@ mod hd1910_transport_tests {
         for _ in 0..30 {
             io.read().unwrap();
         }
+        device.reads.lock().unwrap().clear();
         io.set_torque(true).unwrap();
+        assert_eq!(
+            *device.reads.lock().unwrap(),
+            vec![
+                (40, 1),
+                (21, 3),
+                (33, 1),
+                (50, 3),
+                (41, 7),
+                (50, 1),
+                (56, 15),
+                (42, 2),
+                (40, 1),
+                (56, 15)
+            ],
+            "arming must retain V164 reads without a new runtime readback"
+        );
         io.write(&JointTargets::new([0.1; NUM_JOINTS])).unwrap();
         for id in crate::model::JOINT_IDS {
             let reg = device.regs.lock().unwrap()[id as usize];
             assert_eq!(reg[50], crate::deployment::firmware_p());
-            assert_eq!(reg[51], id * 2);
-            assert_eq!(&reg[48..50], &(800u16 + id as u16).to_le_bytes());
+            assert_eq!(reg[51], 0);
+            assert_eq!(reg[52], id);
+            assert_eq!(&reg[48..50], &1000u16.to_le_bytes());
         }
         io.set_torque(false).unwrap();
         for id in crate::model::JOINT_IDS {
@@ -3795,12 +3819,44 @@ mod hd1910_transport_tests {
             assert_eq!(reg[40], 0);
             assert_eq!(reg[41], id * 3);
             assert_eq!(&reg[21..24], &[32, 40, 0]);
-            assert_eq!(&reg[50..53], &[32, id * 2, 0]);
-            assert_eq!(&reg[48..50], &(800u16 + id as u16).to_le_bytes());
+            assert_eq!(&reg[50..53], &[32, 0, id]);
+            assert_eq!(&reg[48..50], &1000u16.to_le_bytes());
             assert_eq!(&reg[46..48], &[0, 0]);
         }
         let writes = device.writes.lock().unwrap();
-        assert!(writes.iter().all(|(_, a, _)| [40, 42, 50].contains(a)));
+        let first_on = writes
+            .iter()
+            .position(|(_, a, v)| *a == 40 && v[0] == 1)
+            .unwrap();
+        for id in crate::model::JOINT_IDS {
+            assert!(
+                writes[..first_on]
+                    .iter()
+                    .any(|(target, a, v)| *target == id && *a == 51 && v == &[0])
+            );
+            assert!(
+                writes[..first_on]
+                    .iter()
+                    .any(|(target, a, v)| *target == id && *a == 48 && v == &1000u16.to_le_bytes())
+            );
+        }
+        assert!(
+            writes
+                .iter()
+                .filter(|(_, a, _)| *a == 51)
+                .all(|(_, _, v)| v == &[0])
+        );
+        assert!(
+            writes
+                .iter()
+                .filter(|(_, a, _)| *a == 48)
+                .all(|(_, _, v)| v == &1000u16.to_le_bytes())
+        );
+        assert!(
+            writes
+                .iter()
+                .all(|(_, a, _)| [40, 42, 48, 50, 51].contains(a))
+        );
         assert!(
             writes
                 .iter()
@@ -3835,7 +3891,7 @@ mod hd1910_transport_tests {
                 let reg = device.regs.lock().unwrap()[id as usize];
                 assert_eq!(
                     &reg[48..52],
-                    &[0xe8, 0x03, crate::deployment::firmware_p(), 40]
+                    &[0xe8, 0x03, crate::deployment::firmware_p(), 0]
                 );
                 assert_eq!(&reg[21..24], &[32, 40, 0]);
                 assert_eq!(reg[52], 0);
@@ -3846,7 +3902,7 @@ mod hd1910_transport_tests {
             io.set_torque(false).unwrap();
             for id in crate::model::JOINT_IDS {
                 let reg = device.regs.lock().unwrap()[id as usize];
-                assert_eq!(&reg[48..53], &[0xe8, 0x03, 32, 40, 0]);
+                assert_eq!(&reg[48..53], &[0xe8, 0x03, 32, 0, 0]);
             }
             assert!(!io.hd1910.diagnostics().restore_pending);
         }
@@ -3856,7 +3912,7 @@ mod hd1910_transport_tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .all(|(_, a, p)| [40, 42, 50].contains(a) && (*a != 50 || p.len() == 1))
+                .all(|(_, a, p)| [40, 42, 48, 50, 51].contains(a) && (*a != 50 || p.len() == 1))
         );
     }
 
@@ -3885,6 +3941,42 @@ mod hd1910_transport_tests {
                 &[32, 40, 0]
             );
         }
+    }
+
+    #[test]
+    fn nonfive_model_contract_p_is_used_with_fixed_d_and_limit() {
+        // Deployment is process-scoped, so exercise an alternate P in a child
+        // test process instead of changing the other tests' installed model.
+        const CHILD: &str = "MICRODUCK_TEST_ALTERNATE_MODEL_P";
+        if std::env::var_os(CHILD).is_none() {
+            let result=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","feetech::hd1910_transport_tests::nonfive_model_contract_p_is_used_with_fixed_d_and_limit","--test-threads=1"])
+                .env(CHILD,"1").output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../packaging/models/1cbf8730eadd75a5704332c9f3c10f60/policy.onnx");
+        let mut contract = crate::deployment::Contract::load(&path).unwrap();
+        contract.firmware_p = 7;
+        crate::deployment::install(&contract).unwrap();
+        let (bus, device) = emulator(false);
+        let mut io = FeetechIo::from_bus(bus, calibration()).unwrap();
+        for _ in 0..30 {
+            io.read().unwrap();
+        }
+        io.set_torque(true).unwrap();
+        for id in crate::model::JOINT_IDS {
+            assert_eq!(
+                &device.regs.lock().unwrap()[id as usize][48..52],
+                &[0xe8, 0x03, 7, 0]
+            );
+        }
+        io.set_torque(false).unwrap();
     }
 
     fn set_positions(device: &Emulator, raw: u16) {
@@ -4133,6 +4225,13 @@ mod hd1910_transport_tests {
             "opening/restarting must be read-only"
         );
         io.set_torque(true).unwrap();
+        for id in crate::model::JOINT_IDS {
+            let reg = device.regs.lock().unwrap()[id as usize];
+            assert_eq!(
+                &reg[48..52],
+                &[0xe8, 0x03, crate::deployment::firmware_p(), 0]
+            );
+        }
         assert!(
             !device
                 .writes

@@ -30,7 +30,7 @@ window.renderJointTraining=()=>{
   const resuming=joint&&!!chosen('resume').source_job;
   $('joint-training-teachers').hidden=!joint||resuming;
   const legacySelected=['walk','stand'].some(role=>records.find(c=>c.job.id===chosen(role+'-teacher').source_job)?.job.compatibility_label);
-  $('joint-training-note').textContent=resuming?'续训沿用原来的两位老师。':[(legacySelected?'使用既有 V2 老师原权重；本次联合训练继续启用官方摩擦随机化。':''),'可选择前面的队列老师，联合任务用“添加到队列”，老师完成后自动取最新PT。两位老师需与本次动作系数、头腿滤波一致；普通老师可用于齿隙学生，地形可不同。'].filter(Boolean).join(' ');
+  $('joint-training-note').textContent=resuming?'续训沿用原来的两位老师。':[(legacySelected?'使用既有 V2 老师原权重；本次联合训练继续启用官方摩擦随机化。':''),'可选择前面的队列老师，老师完成后自动取最新PT。新训练不加头腿滤波；两位老师需与本次P、动作映射和机器人合同一致，历史滤波模型会核对其原设置。普通老师可用于齿隙学生，地形可不同。'].filter(Boolean).join(' ');
   const running=state.jobs.find(j=>j.op==='train'&&j.request.task===task&&active(j));
   const job=running||(current()?.request?.task===task?current():null),receipt=job?.effective_config?.joint||job?.validation?.joint;
   $('joint-training-runtime').hidden=!joint||!receipt;

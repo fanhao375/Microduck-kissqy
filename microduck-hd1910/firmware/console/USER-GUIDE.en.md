@@ -1,15 +1,15 @@
 [简体中文](README.zh-CN.md) | **English**
 
-# Microduck R17 V164 / control.40 user guide
+# Microduck R17 V167 / control.43 user guide
 
-The console is `1.0.164`, bundled firmware is `1fa8438-feetech-ft6-control.40`, and the paired official system is `0.15.1`. The physical gamepad uses the native padd → robotd path for walking and roller models. Four roller ONNX models install with the firmware.
+The console is `1.0.167`, bundled firmware is `1fa8438-feetech-ft6-control.43`, and the paired official system is `0.15.1`. The physical gamepad uses the native padd → robotd path for walking and roller models. Four roller ONNX models install with the firmware.
 
 Project: [Microduck-kissqy](https://github.com/kissqy/Microduck-kissqy). Links appear at the top of the page and in the Windows launch window.
 
 ## Startup and installation
 
-1. Fully extract `Microduck-Console-R17-V164.zip`. On Windows run `start.cmd`; on macOS run `start.command`; on Linux use `python3 console.py --dashboard --feetech --open`.
-2. Connect to ZERO over SSH in the page and verify console `1.0.164` and actual robot firmware `control.40`. If ZERO already has control.40, replace only the computer-side console folder. For first installation use **系统维护 → 随包固件** (System Maintenance → Bundled Firmware).
+1. Fully extract `Microduck-Console-R17-V167.zip`. On Windows run `start.cmd`; on macOS run `start.command`; on Linux use `python3 console.py --dashboard --feetech --open`.
+2. Connect to ZERO over SSH in the page and verify console `1.0.167` and actual robot firmware `control.43`. If ZERO already has control.43, replace only the computer-side console folder. For first installation use **系统维护 → 随包固件** (System Maintenance → Bundled Firmware).
 3. Wait for all robotd startup steps 1/4–4/4, then check live feedback and gamepad connection. Connection alone does not trigger movement.
 4. If the service shows `commissioning`, click **切到运动模式** (Switch to Movement Mode) and wait for four-step startup. Commissioning does not load movement policies.
 

@@ -11,3 +11,15 @@
 .official-pad .control-actions{margin-top:9px}.control-action-status:empty{display:none}
 
 .pad-voices{display:flex;flex-wrap:wrap;gap:5px;margin:6px 0}.pad-voices .button{min-height:28px;padding:4px 8px;font-size:12px}
+.gamepad-repair{margin:0 16px 16px;padding:14px;border:1px solid var(--line,#394151);border-radius:10px;background:var(--panel,#151b25)}
+.gamepad-repair[hidden]{display:none}
+.gamepad-repair [hidden]{display:none!important}
+.gamepad-repair-heading{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.gamepad-repair p{line-height:1.7;margin:8px 0}
+.gamepad-repair-fields{display:grid;gap:10px;margin:12px 0}
+.gamepad-repair-fields>label:first-child{display:grid;gap:6px;max-width:360px}
+.gamepad-repair-fields input[type=text]{width:100%;padding:8px;border:1px solid var(--line,#394151);border-radius:6px;background:var(--panel,#151b25);color:inherit}
+#gamepad-repair-status{white-space:pre-wrap;overflow-wrap:anywhere}
+#gamepad-repair-evidence{line-height:1.7;margin-top:8px;overflow-wrap:anywhere}
+#gamepad-repair-steps{white-space:pre-wrap;line-height:1.7;overflow-wrap:anywhere}
+#control-panel>.panel-head{gap:12px;flex-wrap:wrap}

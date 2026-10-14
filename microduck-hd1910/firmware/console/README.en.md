@@ -1,12 +1,12 @@
 [简体中文](README.md) | **English**
 
-# 🎮 Microduck Robot Console · R17 V164
+# 🎮 Microduck Robot Console · R17 V167
 
 A Chinese-language console for a real robot duck: view pose and device feedback, calibrate joints and IMU, use a gamepad, manage movement models, and maintain robot firmware.
 
-**Current pairing: Radxa ZERO 3 W · Feetech HD1910 · Official Microduck 0.15.1 · control.40 firmware.**
+**Current pairing: Radxa ZERO 3 W · Feetech HD1910 · Official Microduck 0.15.1 · control.43 firmware.**
 
-[⬇️ Download the complete V164 console](https://github.com/kissqy/Microduck-kissqy/raw/refs/heads/main/release-assets/Microduck-Console-R17-V164.zip) · [Detailed user and gamepad guide](USER-GUIDE.en.md) · [Project homepage](../../../README.en.md)
+[⬇️ Download the complete V167 console](https://github.com/kissqy/Microduck-kissqy/raw/refs/heads/main/release-assets/Microduck-Console-R17-V167.zip) · [Detailed user and gamepad guide](USER-GUIDE.en.md) · [Project homepage](../../../README.en.md)
 
 ## Features
 
@@ -20,7 +20,7 @@ A Chinese-language console for a real robot duck: view pose and device feedback,
 | System maintenance | Inspect ZERO status, change volume, install bundled firmware, reboot, or shut down. |
 | Recording and replay | Export observations and review debugging sessions in joint curves and the 3 D view. |
 
-V164's firmware includes **10 movement models: 6 regular and 4 roller models**. The [detailed guide](USER-GUIDE.en.md) owns the button mappings, mode changes, action conditions, and deployment parameters.
+V167's firmware includes **10 movement models: 6 regular and 4 roller models**. The [detailed guide](USER-GUIDE.en.md) owns the button mappings, mode changes, action conditions, and deployment parameters.
 
 ## Download and start
 
@@ -45,7 +45,7 @@ Source in this directory uses the same launchers. For ordinary use, download the
 5. After initial assembly or servo replacement, check your own zero positions, directions, limits, and IMU in the joint workbench, then perform HOME.
 6. After HOME completes, enable the movement policy and use the gamepad. Physical gamepad input takes priority over page input.
 
-The released integrated image already includes robot services. To install or upgrade services on another existing system, use **系统维护 → 随包固件** (System Maintenance → Bundled Firmware). If ZERO already runs control.40, follow the version guide when updating only the computer-side console.
+The released integrated image already includes robot services. To install or upgrade services on another existing system, use **系统维护 → 随包固件** (System Maintenance → Bundled Firmware). If ZERO already runs control.43, follow the version guide when updating only the computer-side console.
 
 ## Daily use
 
@@ -56,8 +56,11 @@ The released integrated image already includes robot services. To install or upg
 
 ## Related guides
 
+- [Standalone compiled firmware and installation](../../../release-assets/README.en.md)
 - [Detailed user guide](USER-GUIDE.en.md)
 - [Robot firmware source and version guide](../README-R17.en.md)
 - [Firmware build guide](../../docs/BUILD.en.md)
 - [Independent Training Studio](../../training-console/README.en.md)
 - [License](LICENSE) · [Third-party notices](THIRD_PARTY_NOTICES.en.md)
+
+If ZERO still runs control.40 or an older build, install V167 bundled firmware to upgrade to control.43.

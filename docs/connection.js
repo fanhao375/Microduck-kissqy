@@ -7,10 +7,6 @@ export class SSHConnection {
     this.$('ssh-target').disabled=!cfg.connection_ui;
     this.$('ssh-form').onsubmit=e=>{e.preventDefault();this.submit('connect');};
     this.$('ssh-disconnect').onclick=()=>this.submit('disconnect');
-    const notices=this.$('connection-notices'),service=document.querySelector('.service-status');
-    if(service)notices.prepend(service);
-    const gait=document.querySelector('.service-gait-preflight');
-    if(gait)notices.append(gait);
     this.paint();
   }
   async submit(action){

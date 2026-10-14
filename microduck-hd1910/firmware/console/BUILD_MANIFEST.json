@@ -1,11 +1,11 @@
 {
-  "console_version": "1.0.164",
+  "console_version": "1.0.167",
   "official_baseline": "1fa84386f07884e27866411bc1ba166977bced95",
-  "service_build": "1fa8438-feetech-ft6-control.40",
+  "service_build": "1fa8438-feetech-ft6-control.43",
   "hardware_verified": false,
   "hardware_base": "R17 v1.0.95",
-  "service_package_sha256": "cba2a3d1fa486713c72f1155fed42d102c2fe3aea9bb3aaf0aad337e046b9afd",
-  "source_distribution": "Microduck-Source-R17-V163-control40-compiled.tar.gz",
+  "service_package_sha256": "bcfd5c183c697b9c4e0fdbd563d995eda6a48331a7c49b9e76d20bd156c65cce",
+  "source_distribution": "Microduck-Source-R17-V167-control43-compiled.tar.gz",
   "models": {
     "walk": {
       "id": "1cbf8730eadd75a5704332c9f3c10f60",
@@ -15,14 +15,14 @@
       "source_iteration": 9599,
       "num_envs": 2560,
       "source_policy_directory": "policies/walk",
-      "trained_action_scale": 1,
-      "trained_head_alpha": 1,
-      "trained_legs_alpha": 1,
+      "trained_action_scale": 1.0,
+      "trained_head_alpha": 1.0,
+      "trained_legs_alpha": 1.0,
       "execution_profile": {
         "schema": "microduck-runtime-execution/v1",
         "model_sha256": "1cbf8730eadd75a5704332c9f3c10f60bfa9412135b907831c9dbd731ce1795f",
         "mode": "uniform",
-        "action_scale": 1,
+        "action_scale": 1.0,
         "head_lowpass": 0.5,
         "legs_lowpass": 0.7
       },
@@ -40,9 +40,9 @@
       "epochs": 10000,
       "source_iteration": 9999,
       "num_envs": 4096,
-      "base_action_scale": 1,
-      "head_alpha": 1,
-      "legs_alpha": 1,
+      "base_action_scale": 1.0,
+      "head_alpha": 1.0,
+      "legs_alpha": 1.0,
       "target_filter": "passthrough",
       "deployment_verified": false,
       "source_policy_directory": "policies/ground_pick"
@@ -54,9 +54,9 @@
       "epochs": 10000,
       "source_iteration": 9999,
       "num_envs": 4096,
-      "base_action_scale": 1,
-      "head_alpha": 1,
-      "legs_alpha": 1,
+      "base_action_scale": 1.0,
+      "head_alpha": 1.0,
+      "legs_alpha": 1.0,
       "target_filter": "passthrough",
       "deployment_verified": false,
       "source_policy_directory": "policies/roulade"
@@ -67,9 +67,9 @@
       "task": "Mjlab-BallKick-Flat-MicroDuck",
       "epochs": 10000,
       "num_envs": 4096,
-      "base_action_scale": 1,
-      "head_alpha": 1,
-      "legs_alpha": 1,
+      "base_action_scale": 1.0,
+      "head_alpha": 1.0,
+      "legs_alpha": 1.0,
       "target_filter": "passthrough",
       "duration_seconds": 0.5,
       "deployment_verified": false
@@ -114,18 +114,53 @@
     "stale_action_replay": false,
     "input_lease_seconds": 0.6
   },
-  "generated_at_utc": "2026-10-11T03:55:24.370673+00:00",
-  "firmware_reinstall_required": false,
+  "generated_at_utc": "2026-10-14T06:58:52.344924+00:00",
+  "firmware_reinstall_required": true,
   "files": [
+    {
+      "path": "LICENSE",
+      "bytes": 2779,
+      "sha256": "74009f8060dfb296c31aa3f853dabaac8cc02556b08952b26f75b5be15d9793b"
+    },
+    {
+      "path": "PUBLICATION-NOTE.en.md",
+      "bytes": 451,
+      "sha256": "9e5b9f866aab3499ea203896b45751e8d5c92080aa95c8a62521ca0bfa2e02ee"
+    },
+    {
+      "path": "PUBLICATION-NOTE.txt",
+      "bytes": 368,
+      "sha256": "3534e870b4b0fa40223612ecb818dc4eb7c24d990f15910784f7343d944c2808"
+    },
+    {
+      "path": "README.en.md",
+      "bytes": 4682,
+      "sha256": "9032ab232767a48d9f9ef38236ff2ef18513a28ad1f3c3b18461e506650b94f5"
+    },
+    {
+      "path": "README.md",
+      "bytes": 4361,
+      "sha256": "fd378345b899f160410f0bdf8f7934231b4814f48429fef51d9cf964cdb84085"
+    },
     {
       "path": "README.zh-CN.md",
       "bytes": 6940,
-      "sha256": "422ee0dd98c732d0d5717c786fc8862041a55f040165aadae1d59d5031473254"
+      "sha256": "47ebbac894fd5b2fc76b5111be0f8e806a16cb44825fff8df415a59dede56185"
+    },
+    {
+      "path": "THIRD_PARTY_NOTICES.en.md",
+      "bytes": 5875,
+      "sha256": "5dc8151866e26f6b8449921e6b0c17e127ba112065d354ac294f018130954da9"
     },
     {
       "path": "THIRD_PARTY_NOTICES.md",
       "bytes": 5821,
       "sha256": "e7da4b354edb65dedbf93e4de723c157a2f8187d3dc2769340ceb9dab731c4bc"
+    },
+    {
+      "path": "USER-GUIDE.en.md",
+      "bytes": 7849,
+      "sha256": "38ab2437a62366a105fab5720d54883c9dbe020736e4288f1c5cbf1845b8c001"
     },
     {
       "path": "agent.py",
@@ -151,6 +186,11 @@
       "path": "controls.py",
       "bytes": 17300,
       "sha256": "5e92fbcc313b3dfa4972e194d6a3f843abf7d55da2c915db5e34c099f6e20e19"
+    },
+    {
+      "path": "docs/joint-scale-design148.en.md",
+      "bytes": 16952,
+      "sha256": "177b4cd9592e7cc60bc1d67c07ee121c3b80a6605ebfb27a72232a05cfc54d51"
     },
     {
       "path": "docs/joint-scale-design148.md",
@@ -193,6 +233,11 @@
       "sha256": "bfe119ea4fd413f5f7ca3fcd63adb0c4a073ed39daa2fe7d3e6b769e21272601"
     },
     {
+      "path": "logs/system-20261007-003807-694cd2.log",
+      "bytes": 113,
+      "sha256": "2eacc17a53fa2c4310aa460dd2e389a8d82779f29de4fd6a3c4b4e92d8d68327"
+    },
+    {
       "path": "management-profile.json",
       "bytes": 3701,
       "sha256": "e7b5c34b726b0707685b119333c5d2c9b57ecd378a52cafb18eed525a7470e97"
@@ -220,7 +265,7 @@
     {
       "path": "release_identity.py",
       "bytes": 157,
-      "sha256": "063da9dc6399fa39fdf47163461da3107588136cdc8012afbabe0960448fb26f"
+      "sha256": "8d993dfc56412e05d45c48e2d284578dbdd288165cdb1495e68f19acec6e7e66"
     },
     {
       "path": "remote_audio.py",
@@ -534,8 +579,8 @@
     },
     {
       "path": "updates/Microduck-Robotd-FT6-R17.tar.gz",
-      "bytes": 34554759,
-      "sha256": "cba2a3d1fa486713c72f1155fed42d102c2fe3aea9bb3aaf0aad337e046b9afd"
+      "bytes": 34138802,
+      "sha256": "bcfd5c183c697b9c4e0fdbd563d995eda6a48331a7c49b9e76d20bd156c65cce"
     },
     {
       "path": "updates/imu_to_feetech_ReVA_FT6_SYNC15_UART_IRQ_v1.bin",
@@ -546,6 +591,11 @@
       "path": "verification/3d-audit147.json",
       "bytes": 14055,
       "sha256": "226a3e16d4b3a711e1ac918f424bde6cbde9a0ef502387d50aeeacffbee9ce52"
+    },
+    {
+      "path": "verification/README.en.md",
+      "bytes": 1071,
+      "sha256": "d615fd4e6478df94b425a094a2bcac8357dddcfcc3b0405d461841900bf8239a"
     },
     {
       "path": "verification/README.md",
@@ -943,12 +993,52 @@
       "sha256": "9437ab14089fb7685293b0eb50eab297df783b59328cb88f074006db70a17f75"
     },
     {
+      "path": "verification/v167/arm64-build.log",
+      "bytes": 490,
+      "sha256": "24529821252c972543dc430ca50bbc729dc2165dfbcc0d54ac5233d17f9fa88d"
+    },
+    {
+      "path": "verification/v167/arm64-models.json",
+      "bytes": 4008,
+      "sha256": "2efec88f0c62e805d31ad79475b78719ef655c8ff740db9a724634be296d7652"
+    },
+    {
+      "path": "verification/v167/package-verification.json",
+      "bytes": 1170,
+      "sha256": "0cb3144f3a8da7ba331e5c7f8420990e28ffc95dab7e1ec2ec9ce5c238d645e0"
+    },
+    {
+      "path": "verification/v167/python-tests.json",
+      "bytes": 126,
+      "sha256": "ab4a391a5d8c27b0dbb3960a5cfffd0be0122f54942242dcc3a5e4d50c679c99"
+    },
+    {
+      "path": "verification/v167/python-tests.log",
+      "bytes": 5377,
+      "sha256": "b23e968e4b992e29465341442ead6bc57af86be78155222d9296e9765b2afe7e"
+    },
+    {
+      "path": "verification/v167/release-tests.json",
+      "bytes": 1367,
+      "sha256": "fbe4003838e8eba0f9c3b40ff4edf93df3c6c567c07b209c044bdf389f17e297"
+    },
+    {
+      "path": "verification/v167/release-tests.log",
+      "bytes": 19654,
+      "sha256": "539b5c34fe9de5cce5ad12f509bef333cd3104a91c7ad3191d4dd837115b2eba"
+    },
+    {
+      "path": "verification/v167/source-diff.json",
+      "bytes": 1069,
+      "sha256": "5435212962f3781f1db80668fea22b9a0f63e45db1ec4a7f885adcbf4327714d"
+    },
+    {
       "path": "voice_preferences.py",
       "bytes": 589,
       "sha256": "d6ce960abafb21dc9cc2406df4659797ff842fb2ff67f8cf8d5929cbb1367b14"
     }
   ],
-  "release_changes": "Roller model display names: bilingual titles; checkpoint names below titles",
+  "release_changes": "Keep model-contract P; explicitly write RAM D=0 and 48=1000 in the existing arm flow",
   "media_build": "1fa8438-feetech-media-demand.1",
   "roller_experiment": {
     "installed": true,
@@ -967,12 +1057,13 @@
     ],
     "unbound_models": [],
     "standup_trigger": "physical_L3_guarded_manual_test",
-    "standup_test_duration_s": 5
+    "standup_test_duration_s": 5.0
   },
   "release_status": "compiled-unverified-hardware",
   "package_baseline": {
-    "name": "Microduck-Console-R17-V163.zip",
-    "sha256": "ccf97e549ba1a6d8d3715b073d587a2f2b9e40de7dfc9fe257163f9d1ce1586b"
+    "name": "Microduck-Console-R17-V164.zip",
+    "sha256": "5c9313b2aba04b89c5dc608644ba7d814771623597d11ddc6a10373528272d31",
+    "calibration": "authorized calibration preserved byte-for-byte"
   },
   "baseline_tests_run_in_release": {
     "robot_hardware_tested": false,
@@ -1065,26 +1156,69 @@
     "validation_console_version": "1.0.163"
   },
   "tests_run_in_release": {
-    "model_card_render": "passed: six action cards and four roller cards",
-    "firmware_byte_comparison": "passed: unchanged control.40 archive",
-    "webpad_byte_comparison": "passed: all webpad and transport files unchanged",
+    "robot_hardware_tested": false,
+    "rust_passed": 237,
+    "rust_failed": 0,
+    "rust_ignored": 0,
     "full_regression_run": false,
-    "robot_hardware_tested": false
+    "release_scope_passed": true,
+    "release_scope_description": "duck-control unit; duck-ipc-proto unit; padd unit; robotd roller::tests",
+    "python_passed": 18,
+    "arm64_model_loads_passed": 10,
+    "arm64_release_compiled": true,
+    "logs": [
+      {
+        "path": "verification/v167/arm64-build.log",
+        "sha256": "24529821252c972543dc430ca50bbc729dc2165dfbcc0d54ac5233d17f9fa88d"
+      },
+      {
+        "path": "verification/v167/release-tests.json",
+        "sha256": "fbe4003838e8eba0f9c3b40ff4edf93df3c6c567c07b209c044bdf389f17e297"
+      },
+      {
+        "path": "verification/v167/release-tests.log",
+        "sha256": "539b5c34fe9de5cce5ad12f509bef333cd3104a91c7ad3191d4dd837115b2eba"
+      },
+      {
+        "path": "verification/v167/python-tests.json",
+        "sha256": "ab4a391a5d8c27b0dbb3960a5cfffd0be0122f54942242dcc3a5e4d50c679c99"
+      },
+      {
+        "path": "verification/v167/python-tests.log",
+        "sha256": "b23e968e4b992e29465341442ead6bc57af86be78155222d9296e9765b2afe7e"
+      },
+      {
+        "path": "verification/v167/arm64-models.json",
+        "sha256": "2efec88f0c62e805d31ad79475b78719ef655c8ff740db9a724634be296d7652"
+      },
+      {
+        "path": "verification/v167/source-diff.json",
+        "sha256": "5435212962f3781f1db80668fea22b9a0f63e45db1ec4a7f885adcbf4327714d"
+      }
+    ]
   },
-  "repository_documentation_cleanup": {
-    "date": "2026-10-12",
-    "omitted_legacy_release_notes": 21,
-    "shipped_archive_unchanged": true
+  "hd1910_runtime_settings": {
+    "p": {
+      "source": "model_contract",
+      "address": 50,
+      "bytes": 1,
+      "restore_on_relax": true,
+      "existing_readback_preserved": true
+    },
+    "d": {
+      "value": 0,
+      "address": 51,
+      "bytes": 1
+    },
+    "torque_limit": {
+      "value": 1000,
+      "address": 48,
+      "bytes": 2,
+      "byte_order": "little"
+    },
+    "write_trigger": "V164 explicit arm flow",
+    "fixed_settings_readback_added": false,
+    "eeprom_changed": false
   },
-  "repository_documentation_translation": {
-    "date": "2026-10-12",
-    "languages": [
-      "zh-CN",
-      "en"
-    ],
-    "guide": "README.en.md",
-    "detailed_guide": "USER-GUIDE.en.md",
-    "shipped_archives_unchanged": true,
-    "application_ui_unchanged": true
-  }
+  "repository_documentation_adjusted": true
 }

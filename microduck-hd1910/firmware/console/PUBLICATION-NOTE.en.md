@@ -1,11 +1,9 @@
 [简体中文](PUBLICATION-NOTE.txt) | **English**
 
-# Microduck Robot Console R17 V164 publication note
+# Microduck R17 V167 / control.43
 
-Program source in this directory comes from `Microduck-Console-R17-V164.zip`. Bundled robot firmware is `1fa8438-feetech-ft6-control.40`, compiled for V163 and reused by V164.
+Update: Fixed body jitter.
 
-Firmware source is one directory above; Training Studio source is in `../../training-console/`. See [the user guide](USER-GUIDE.en.md) and [firmware compilation](../../docs/BUILD.en.md).
+Current robot firmware: `1fa8438-feetech-ft6-control.43`. Complete console ZIP and standalone firmware preserve the delivered bytes. Image R1 still contains control.40; install V167 bundled firmware to upgrade.
 
-Runtime ZIP downloads are on the [project homepage](../../../README.en.md).
-
-The directory includes the existing LICENSE for the author's original console. Third-party content retains its own licenses.
+Duplicate compiled resources are restored and verified by `prepare-V167.py`; see [the build guide](../BUILDING-V167.en.md).

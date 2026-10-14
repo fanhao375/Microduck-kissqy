@@ -2,8 +2,42 @@ let configOverridesText="[]";
 'use strict';
 let studioData=null,studioDraft=null,studioDirty=false,studioTab='servo-mass',studioPage=0,studioBody=null,studioStamp='',studioBusy=false,followStamp='';
 const bodyNames={trunk_base:'躯干总成',yaw2roll:'左髋偏航连接件',hip_l:'左髋侧摆连接件',upper_leg_left:'左大腿',leg:'左小腿',ankle_left:'左脚踝与脚掌',neck:'颈部底座',neck_pitch:'颈部连接件',yaw_roll_motion:'头部转向连接件',jaw_soft:'头部与鸭嘴总成',bearing_roll:'右髋偏航连接件',hip_l_2:'右髋侧摆连接件',upper_leg_right:'右大腿',leg_2:'右小腿',ankle_right:'右脚踝与脚掌'};
-const jointNames={trunk_base_freejoint:'躯干自由运动',left_hip_yaw:'左髋转向',left_hip_roll:'左髋侧摆',left_hip_pitch:'左髋前后摆',left_knee:'左膝',left_ankle:'左脚踝',right_hip_yaw:'右髋转向',right_hip_roll:'右髋侧摆',right_hip_pitch:'右髋前后摆',right_knee:'右膝',right_ankle:'右脚踝',neck_pitch:'颈部俯仰',head_pitch:'头部俯仰',head_yaw:'头部左右转',head_roll:'头部左右歪',mouth:'鸭嘴开合'};
+const jointNames={trunk_base_freejoint:'躯干自由运动',left_hip_yaw:'左髋旋转',left_hip_roll:'左髋侧摆',left_hip_pitch:'左髋俯仰',left_knee:'左膝',left_ankle:'左踝',right_hip_yaw:'右髋旋转',right_hip_roll:'右髋侧摆',right_hip_pitch:'右髋俯仰',right_knee:'右膝',right_ankle:'右踝',neck_pitch:'颈部俯仰',head_pitch:'头部俯仰',head_yaw:'头部转向',head_roll:'头部侧倾',mouth:'嘴巴'};
 const bilingual=(name,names)=>`<strong>${esc(names[name]||'模型部件')}</strong><small class="model-name">${esc(name)}</small>`;
+// Match the running R17 console's telemetry names. The number is the physical bus servo ID.
+const servoJointLabel=(name,id)=>`<strong>${esc(jointNames[name]||name)}</strong>${Number.isInteger(id)?`<span class="calibration-servo-id">（ID ${esc(id)}）</span>`:''}<small class="model-name">${esc(name)}</small>`;
+// UI only: training and calibration data remain in radians; show angles in degrees.
+function jointDegrees(value){
+ if(typeof value!=='number'||!Number.isFinite(value))return val(value);
+ const abs=Number((Math.abs(value)*180/Math.PI).toFixed(2));
+ return (abs===0?'':value<0?'−':'+')+abs+'°';
+}
+function jointDegreeRange(range){
+ return Array.isArray(range)&&range.length===2
+  ?`${jointDegrees(range[0])} ～ ${jointDegrees(range[1])}`:val(range);
+}
+// Each changed scalar is emphasized independently; unchanged neighbors remain unstyled.
+function calibrationField(key,value,change){
+ const previous=change?.fields?.[key];
+ const text=v=>key==='direction'?(v===1?'+1':v===-1?'−1':val(v))
+   :key==='calibrated'?(v===true?'已标定':v===false?'未标定':val(v))
+   :['min_rad','max_rad'].includes(key)?jointDegrees(v):val(v);
+ const fmt=v=>`<span title="${esc(val(v))}${['min_rad','max_rad'].includes(key)&&typeof v==='number'?' rad':''}">${esc(text(v))}</span>`;
+ return `<span class="calibration-value${previous?' calibration-value-changed':''}" data-calibration-field="${key}">${fmt(value)}</span>`
+   +(previous?`<small class="calibration-old">原 ${fmt(previous.before)}</small>`:'');
+}
+function calibrationJointRow(j,current,change){
+ const source=current||j;
+ const id=source.id??j.id;
+ const label=`<strong>${esc(jointNames[j.name]||j.name)}</strong> <span class="calibration-servo-id">（ID ${calibrationField('id',id,change)}）</span><small class="model-name">${esc(j.name)}</small>`;
+ return row([label,
+   calibrationField('direction',source.direction??j.direction_historical,change),
+   calibrationField('zero_raw',source.zero_raw??j.zero_raw_inferred,change),
+   calibrationField('min_rad',source.min_rad??null,change),
+   calibrationField('max_rad',source.max_rad??null,change),
+   calibrationField('calibrated',source.calibrated??null,change)]);
+}
+
 function setExpertSettings(enabled){
  document.body.classList.toggle('expert-settings',enabled);
  for(const [id,active] of [['settings-basic',!enabled],['settings-expert',enabled]]){$(id).classList.toggle('selected',active);$(id).setAttribute('aria-pressed',String(active));}
@@ -95,7 +129,13 @@ function renderActuators(m){
  const ref=studioData.servo_references,official=ref?.official_training;
  const number=v=>v===undefined?'未记录':v===null?'未单独设置':`<span title="${esc(configValue(v))}">${esc(typeof v==='number'?Number(v.toPrecision(8)):configValue(v))}</span>`;
  const label=(k,h)=>`<strong>${esc(h?.title||k)}</strong><small lang="en">${esc(h?.english||k)}</small><code class="field-path">${esc(k)}</code>`;
- const run=training(),actual=run?.effective_config?.resolved?.model?.actuators||[];
+ // A training readback is a persisted, per-task simulator snapshot; it is
+ // neither the current page draft nor a live read from the physical robot.
+ // Do not show values from a different (possibly concurrently running) task.
+ const candidate=training(),run=candidate?.request?.task===$('task').value?candidate:null;
+ const actual=run?.effective_config?.resolved?.model?.actuators||[];
+ const showControllerReadback=!!actual[0]?.runtime_properties;
+ const showBamReadback=actual.some(a=>!!a?.parameter_file?.data);
  const planned=structuredClone(m.actuators[0]||{});
  const edits=studioDraft.task_overrides?.[$('task').value]||[];
  for(const edit of edits){const p=edit.path;if(p?.slice(0,6).join('.')==='env.scene.entities.robot.articulation.actuators'&&Number(p[6])===0&&p.length===8)planned[p[7]]=edit.value;}
@@ -103,14 +143,16 @@ function renderActuators(m){
  output+=table(['配置项 / Parameter','单位','官方 XL330 基线','本页 HD1910 配置','训练用途'],Object.entries(ref.actuator_fields).map(([k,h])=>row([label(k,h),esc(h.unit),number(official?.actuators?.[0]?.[k]),number(planned[k]),esc(h.explanation)])));
  output+='<p class="servo-source-note">页面编辑用于下次启动；正在运行的任务保留启动时配置。XL330 实物电压上限为 6 V，表中的仿真电压不是实物供电建议。</p>';
  output+='<div class="servo-section-title">实际加载的控制模型 / Loaded controller</div>';
- output+=`<p class="servo-source-note">运行读回：${esc(run?runName(run):'尚无训练记录')}。旧记录未采集的值显示“未记录”。</p>`;
- output+=table(['控制参数 / Parameter','单位','XL330 基线读回','HD1910 基线读回','本次训练读回','用途'],Object.entries(ref.runtime_fields).map(([k,h])=>row([label(k,h),esc(h.unit),number(official?.actuators?.[0]?.runtime_properties?.[k]),number(m.actuators[0]?.runtime_properties?.[k]),number(actual[0]?.runtime_properties?.[k]),esc(h.explanation)])));
+ if(showControllerReadback||showBamReadback){
+  output+=`<p class="servo-source-note">训练仿真配置读回：${esc(runName(run))}（来自该任务的启动记录，非真机读数）。</p>`;
+ }
+ output+=table(['控制参数 / Parameter','单位','XL330 基线读回','HD1910 基线读回',...(showControllerReadback?['本次训练读回']:[]),'用途'],Object.entries(ref.runtime_fields).map(([k,h])=>row([label(k,h),esc(h.unit),number(official?.actuators?.[0]?.runtime_properties?.[k]),number(m.actuators[0]?.runtime_properties?.[k]),...(showControllerReadback?[number(actual[0]?.runtime_properties?.[k])]:[]),esc(h.explanation)])));
  for(const [i,a] of m.actuators.entries()){
   const source=a.parameter_file?.data||{},reference=official?.parameter_file?.data||{};
   output+='<div class="servo-section-title">BAM 辨识参数 / Identified parameters · 20 项</div>';
-  output+=table(['参数与用途 / Parameter','单位','官方 XL330','HD1910 基线','本页 HD1910 值','本次训练读回','操作'],[...new Set([...Object.keys(source),...Object.keys(reference)])].map(k=>{
+  output+=table(['参数与用途 / Parameter','单位','官方 XL330','HD1910 基线','本页 HD1910 值',...(showBamReadback?['本次训练读回']:[]),'操作'],[...new Set([...Object.keys(source),...Object.keys(reference)])].map(k=>{
    const v=source[k],h=ref.bam_fields[k]||studioData.baseline.bam_help[k],fitOnly=['q_offset','command_delay'].includes(k);
-   return row([label(k,h)+`<small class="servo-usage ${fitOnly?'reference-only':''}">${esc(h?.usage)}</small><small>${esc(h?.explanation)}</small>`,esc(h?.unit||'—'),number(reference[k]),number(v),number(studioDraft.robot.actuator_parameters?.[i]?.[k]??v),number(actual[i]?.runtime_properties?actual[i]?.parameter_file?.data?.[k]:undefined),typeof v==='number'&&!fitOnly?`<button class="text-button" data-bam="${i}" data-key="${esc(k)}">修改</button>`:fitOnly?'仅辨识记录':'来源标识']);
+   return row([label(k,h)+`<small class="servo-usage ${fitOnly?'reference-only':''}">${esc(h?.usage)}</small><small>${esc(h?.explanation)}</small>`,esc(h?.unit||'—'),number(reference[k]),number(v),number(studioDraft.robot.actuator_parameters?.[i]?.[k]??v),...(showBamReadback?[number(actual[i]?.parameter_file?.data?.[k])]:[]),typeof v==='number'&&!fitOnly?`<button class="text-button" data-bam="${i}" data-key="${esc(k)}">修改</button>`:fitOnly?'仅辨识记录':'来源标识']);
   }));
  }
  if(ref){
@@ -138,14 +180,18 @@ function renderStudioTables(){
  for(const button of document.querySelectorAll('[data-studio-tab]')){const selected=button.dataset.studioTab===studioTab;button.classList.toggle('selected',selected);button.setAttribute('aria-pressed',String(selected));}
  let output='';
  if(m&&studioTab==='servo-mass')output=renderServoMass(m);
- if(m&&studioTab==='joints')output=table(['关节 · 中英对照','所属刚体','刚体质量 / g','Home / °','模型范围 / rad','关节轴','锚点 / m'],m.joints.map(j=>row([bilingual(j.name,jointNames),bilingual(j.body,bodyNames),...cells([(m.bodies.find(b=>b.name===j.body)?.mass_g??j.body_mass_g).toFixed(4),j.home_deg.toFixed(5),j.limited?j.range:'无限位',j.axis,j.pos])])));
+ if(m&&studioTab==='joints')output=table(['关节名称（舵机 ID）','所属刚体','刚体质量 / g','Home / °','模型范围 / °','关节轴','锚点 / m'],m.joints.map(j=>row([servoJointLabel(j.name,h.joints.find(x=>x.name===j.name)?.id),bilingual(j.body,bodyNames),...cells([(m.bodies.find(b=>b.name===j.body)?.mass_g??j.body_mass_g).toFixed(4),j.home_deg.toFixed(5),j.limited?jointDegreeRange(j.range):'无限位',j.axis,j.pos])])));
  if(m&&studioTab==='actuators')output=renderActuators(m);
  $('robot-table').classList.toggle('servo-mass-view',studioTab==='servo-mass');
  $('robot-table').innerHTML=output||'<p class="empty">无数据。</p>';
  const imported=studioDraft.calibration,c=imported||h.current_calibration;
  $('calibration-source').textContent=imported?(imported.zero_target?`已从 ${imported.zero_target} 获取 · ${new Date(imported.imported_at*1000).toLocaleString('zh-CN',{hour12:false})} · 15关节 + IMU`:'15关节标定已载入当前实验 · '+imported.source):'尚未载入本实验标定';
  const real=c?.data?.joints;
- $('calibration-table').innerHTML=table(['关节 · 中英对照','ID','方向','零点 / counts','机械限位 / rad'],h.joints.map(j=>{const q=real?.find(x=>x.name===j.name),change=c?.changes?.joints?.find(x=>x.name===j.name);const tr=row([bilingual(j.name,jointNames),...cells([j.id,q?.direction??j.direction_historical]),esc(q?.zero_raw??j.zero_raw_inferred)+(change?.fields.zero_raw?`<small class="calibration-old">原 ${esc(val(change.fields.zero_raw.before))}</small>`:''),esc(val(q?[q.min_rad,q.max_rad]:'历史° '+sj(j.limits_deg_historical)))]);return change?tr.replace('<tr>','<tr class="calibration-changed">'):tr;}));
+ const changeRows=c?.changes?.joints||[];
+ const deltaCount=changeRows.reduce((n,j)=>n+Object.keys(j.fields||{}).length,0);
+ const note=deltaCount?`<p class="calibration-compare-note">与本次导入前标定相比，<strong>${deltaCount} 项字段不同</strong>。仅高亮变化的具体数值，灰字“原”是导入前保存的数值；未变化的字段不高亮。</p>`
+   :'<p class="calibration-compare-note">当前无导入差异记录；仅在从 ZERO 获取或导入标定、与之前保存的标定存在差异时标亮具体字段。</p>';
+ $('calibration-table').innerHTML=note+table(['关节名称（舵机 ID）','方向','零点 / counts','机械下限 / °','机械上限 / °','标定状态'],h.joints.map(j=>calibrationJointRow(j,real?.find(x=>x.name===j.name),changeRows.find(x=>x.name===j.name))));
  $('hardware-summary').innerHTML=`<p><span>IMU安装 · wxyz</span><code>${esc(c?val(c.data.imu_mount_quat):'未取得')}</code></p>`;
  renderConfigTable();
 }
@@ -174,8 +220,8 @@ async function saveStudio(){
  if(zeroFetchPromise&&!(await zeroFetchPromise))return false;
  if(savePromise){const okay=await savePromise;if(!okay)return false;if(studioDirty)return saveStudio();return true;}
  savePromise=(async()=>{await Promise.resolve();try{
-  do {const version=editVersion,snapshot=structuredClone(gatherStudio());await post('/api/recipe',{recipe:snapshot});
-   if(version===editVersion){studioDirty=false;studioData.recipe=snapshot;studioData.frozen=null;$('studio-status').textContent='页面参数已同步 · 用于下次启动';}
+  do {const version=editVersion,snapshot=structuredClone(gatherStudio());const saved=await post('/api/recipe',{recipe:snapshot});
+   if(version===editVersion){studioDirty=false;studioData.recipe=saved.recipe||snapshot;if(saved.recipe)studioDraft=structuredClone(saved.recipe);studioData.frozen=null;$('studio-status').textContent='页面参数已同步 · 用于下次启动';}
   } while(studioDirty);
   return true;
  }catch(e){studioDirty=true;$('studio-status').textContent='参数未同步：'+e.message;tell(e.message);return false;}finally{savePromise=null;window.workflowRender?.();}})();
@@ -247,7 +293,7 @@ $('train-form').addEventListener('input',()=>{if(studioData?.frozen){studioData.
 let contactSettingsStamp='';
 const contactGroups=[
  {title:'接触面 / Contact surface',fields:[
-  ['足底摩擦随机范围','Foot friction range',['env','events','foot_friction','params','ranges'],'按事件安排抽样的绝对摩擦系数；不是舵机摩擦倍率。'],
+  ['足底摩擦随机范围','Foot friction range',['env','events','foot_friction','params','ranges'],'官方事件只随机滑动摩擦分量，按绝对值抽样；不同时改变扭转、滚动摩擦。轮滑任务可能移除此事件。'],
   ['足底摩擦抽样时机','Foot friction sampling mode',['env','events','foot_friction','mode'],'startup：创建环境时抽样；reset：每次环境复位时抽样。'],
   ['左右脚共用抽样','Shared foot friction',['env','events','foot_friction','params','shared_random'],'同一环境的两只脚使用同一次抽样。'],
   ['足底接触维度','Foot contact dimension',['env','scene','entities','robot','collisions',0,'condim','^(left|right)_foot_collision$'],'1：法向；3：加入滑动摩擦；4/6：再加入扭转/滚动摩擦。'],
@@ -264,6 +310,7 @@ const contactGroups=[
  ]},
  {title:'相关随机化 / Domain randomization',fields:[
   ['舵机摩擦倍率','BAM friction scale range',['env','events','randomize_joint_friction','params','scale_range'],'每次复位随机缩放 BAM 摩擦，和足底接触摩擦分开。'],
+  ['滑轮轴摩擦范围','Wheel bearing friction range',['env','events','randomize_wheel_friction','params','ranges'],'被动滑轮轴的摩擦力矩范围；不是轮胎与地面的接触摩擦。'],
   ['转子惯量倍率','Armature scale range',['env','events','randomize_armature','params','ranges'],'每次复位缩放关节转子惯量。'],
   ['编码器零位误差 / rad','Encoder bias range / rad',['env','events','encoder_bias','params','bias_range'],'模拟反馈零位误差；不会修改本机舵机标定。']
  ]}
@@ -281,7 +328,8 @@ function renderContactSettings(){
  }
  const run=state?.jobs.find(j=>j.op==='train'&&active(j));
  const actual=run?.effective_config?.resolved;
- const key=JSON.stringify([task,schema?.sha256,overrides,run?.id,actual?.sha256,actual]);
+ const sampled=run?.friction_readback;
+ const key=JSON.stringify([task,schema?.sha256,overrides,run?.id,actual?.sha256,actual,sampled]);
  if(key===contactSettingsStamp)return;
  if(document.activeElement?.matches('[data-contact-input]'))return;
  contactSettingsStamp=key;
@@ -301,22 +349,40 @@ function renderContactSettings(){
   return '<h4>'+group.title+'</h4>'+table(['参数 / Parameter','下次加入队列的值','正在训练的配置','用途'],rows);
  }).join('');
  const terrains=planned.env?.scene?.terrain?.terrain_generator?.sub_terrains;
- const terrainNames={flat:'平地 / Flat',pyramid_stairs:'台阶 / Stairs',random_grid:'随机凸起 / Random grid',pyramid_slope:'斜坡 / Slope'};
+ const terrainNames={flat:'平地 / Flat',pyramid_stairs:'台阶 / Stairs',random_grid:'随机凸起 / Random grid',pyramid_slope:'斜坡 / Slope',flat_ramp:'平地—下坡—缓冲区 / Ramp'};
  html+='<h4>地形组成 / Terrain composition</h4>';
  if(!terrains)html+='<p class="form-note">本动作使用平地 / Plane，没有粗糙地形高度课程。</p>';
  else html+=table(['地形 / Terrain','比例','高度 / 坡度范围','用途'],Object.entries(terrains).map(([k,t])=>{
   const range=t.step_height_range||t.grid_height_range||t.slope_range;
-  return row([esc(terrainNames[k]||k),esc((t.proportion*100).toFixed(0)+'%'),range?esc(JSON.stringify(range)+(t.slope_range?'（坡度比）':' m')):'0 m','源自所选官方任务配方']);
+  const extent=range?JSON.stringify(range)+(t.slope_range?'（坡度比）':' m'):(finite(t.deg_min)&&finite(t.deg_max)?`${t.deg_min}°～${t.deg_max}°；水平坡长 ${JSON.stringify(t.ramp_length_range)} m`:'0 m');
+  return row([esc(terrainNames[k]||k),esc((t.proportion*100).toFixed(0)+'%'),esc(extent),'源自所选官方任务配方']);
  }));
+ if(terrains){const generator=planned.env.scene.terrain.terrain_generator;html+='<p class="form-note">地形构建：'+esc(generator.num_rows)+' 行 × '+esc(generator.num_cols)+' 列 · '+(generator.curriculum?'按行递增难度':'随机分布难度')+'。以实际配置为准，Rough 名称本身不代表按难度逐级训练。</p>';}
  const geoms=actual?.model?.entity_compiled?.geoms;
- html+='<h4>足底编译基线与运行读回 / Compiled foot contacts</h4>';
+ html+='<h4>接触面编译基线与运行读回 / Compiled contacts</h4>';
  const referenceGeoms=schema.model?.entity_compiled?.geoms;
- html+=table(['脚掌 / Foot','摩擦 [滑动, 扭转, 滚动]','维度','solref','solimp'],['left_foot_collision','right_foot_collision'].map(n=>{
-  const g=geoms?.find(g=>g.name===n);
-  const ref=referenceGeoms?.find(g=>g.name===n);
-  return row([esc(n.startsWith('left')?'左脚 / Left':'右脚 / Right'),...['friction','condim','solref','solimp'].map(k=>'<span>'+esc(ref?contactValue(ref[k]):'基线未采集')+'</span><small>运行：'+esc(g?contactValue(g[k]):'未采集')+'</small>')]);
+ const surfaces=(referenceGeoms||[]).filter(g=>(g.contype||g.conaffinity)&&/foot|wheel/i.test((g.name||'')+' '+(g.body_name||'')));
+ html+=table(['接触部件 / Surface','摩擦 [滑动, 扭转, 滚动]','维度','solref','solimp'],surfaces.map(ref=>{
+  const g=geoms?.find(g=>ref.name?g.name===ref.name:g.body_name===ref.body_name&&g.id===ref.id);
+  return row([esc(ref.name||`${ref.body_name} #${ref.id}`),...['friction','condim','solref','solimp'].map(k=>'<span>'+esc(contactValue(ref[k]))+'</span><small>运行：'+esc(g?contactValue(g[k]):'未采集')+'</small>')]);
  }));
- html+='<p class="form-note">运行配置显示启动时的范围与模型构建值，不是每只鸭子当前抽到的摩擦值。编辑只影响下一次加入队列，已加入或正在训练的方案保留原值。</p>';
+ const actuator=planned.env?.scene?.entities?.robot?.articulation?.actuators?.[0],step=planned.env?.sim?.mujoco?.timestep;
+ if(actuator){html+='<h4>舵机供电与延迟 / Actuator voltage & delay</h4>'+table(['项目','本次模型设置'],[
+  row(['电压随机范围 / V',esc(contactValue(actuator.vin_range))]),
+  row(['负载压降系数 / V/(N·m)',esc(contactValue(actuator.vin_drop_gain_range))]),
+  row(['压降模型下限 / V',esc(contactValue(actuator.vin_min))]),
+  row(['动作传输延迟',esc(`${actuator.delay_min_lag}～${actuator.delay_max_lag} 个物理步`+(finite(step)?` = ${fmt(actuator.delay_min_lag*step*1000)}～${fmt(actuator.delay_max_lag*step*1000)} ms`:''))]),
+ ]);}
+ if(sampled){
+  const range=s=>s&&finite(s.min)&&finite(s.max)?`${fmt(s.min)} ～ ${fmt(s.max)}`:'未采集';
+  const foot=sampled.foot_or_wheel_contact;
+  const sampledRows=[row(['脚/轮接触滑动摩擦',esc(range(foot?.sliding)),esc(foot?.available?`实际模型参数；${sampled.num_envs}个环境`:(foot?.reason||'未采集'))])];
+  for(const motor of sampled.motor||[])sampledRows.push(row([`舵机${motor.actuator_index+1}组 · BAM摩擦倍率`,esc(range(motor.friction_scale)),esc(motor.available?'实际倍率；与接触系数独立':motor.reason||'未采集')]));
+  const bearings=sampled.wheel_bearings;
+  if(bearings?.joint_names?.length)sampledRows.push(row(['被动轮轴阻力 / N·m',esc(range(bearings.actual_frictionloss_nm)),'实际dof摩擦阻力；不是地面系数']));
+  html+='<h4>启动后摩擦实际读回 / First-step readback</h4>'+table(['部位','各环境实际范围','含义'],sampledRows)+'<p class="form-note">第'+esc(sampled.step)+'个仿真步的一次读回，不代表整次训练覆盖、求解器合成摩擦或接触力。完整数据随运行记录保存。</p>';
+ }
+ html+='<p class="form-note">上方配置栏显示启动范围与模型编译值；首步实际读回在收到数据后单独显示。编辑只影响下一次加入队列，已加入或正在训练的方案保留原值。</p>';
  $('contact-settings-table').innerHTML=html;
 }
 $('contact-settings-table').onclick=e=>{
@@ -337,7 +403,7 @@ $('contact-settings-table').onchange=async e=>{
   if(['nconmax','njmax','contact_sensor_maxmatch','ccd_iterations','condim'].some(k=>path.includes(k))&&(!Number.isInteger(value)||value<1))throw Error('请输入正整数。');
   if(path.includes('condim')&&![1,3,4,6].includes(value))throw Error('接触维度只支持 1、3、4、6。');
   if(path.at(-1)==='ranges'||path.at(-1)==='scale_range'||path.at(-1)==='bias_range'){
-   if(!Array.isArray(value)||value.length!==2||!value.every(Number.isFinite)||value[0]>value[1]||(path.at(-1)!=='bias_range'&&value[0]<=0))throw Error('请输入有序范围，例如 [0.7,1.3]。');
+   if(!Array.isArray(value)||value.length!==2||!value.every(Number.isFinite)||value[0]>value[1]||(path.at(-1)!=='bias_range'&&value[0]<0))throw Error('请输入非负有序范围，例如 [0.7,1.3]；零轮轴摩擦可填 [0,0]。');
   }
   input.setCustomValidity('');
   const overrides=(studioDraft.task_overrides?.[$('task').value]||[]).filter(p=>sj(p.path)!==sj(path));

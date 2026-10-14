@@ -1,6 +1,6 @@
 /** One browser socket for input; no polling, reconnect replay, or idle motor frames. */
 export class ControlSocket {
-  constructor(token,disconnected){this.token=token;this.disconnected=disconnected;this.ws=null;this.pending=new Map();this.id=0;}
+  constructor(token,disconnected,statusChanged){this.statusChanged=statusChanged;this.token=token;this.disconnected=disconnected;this.ws=null;this.pending=new Map();this.id=0;}
   async open(){
     this.close();
     const ws=new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/api/control/socket`,['r17-control','r17-auth.'+this.token]);this.ws=ws;
@@ -10,9 +10,9 @@ export class ControlSocket {
       ws.onopen=()=>{opened=true;clearTimeout(timer);resolve();};
       ws.onmessage=e=>{
         try{
-          const row=JSON.parse(e.data),entry=this.pending.get(row.id);if(!entry)return;
+          const row=JSON.parse(e.data);if(row.event==='input-status'){this.statusChanged?.(row.result);return;}const entry=this.pending.get(row.id);if(!entry)return;
           this.pending.delete(row.id);clearTimeout(entry.timer);
-          if(row.error)entry.reject(Error(row.error));
+          if(row.error){const error=Error(row.error);error.status=row.status;entry.reject(error);}
           else entry.resolve({...row.result,browser_rtt_ms:performance.now()-entry.at,dispatch_ms:row.elapsed_ms});
         }catch{this.close();this.disconnected('手柄长连接回执无效；动作不重发');}
       };

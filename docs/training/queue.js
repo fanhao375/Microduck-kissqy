@@ -38,7 +38,7 @@ window.renderTrainingQueue=()=>{
  const key=JSON.stringify([online,queueSending,entries]);if(key===queueListStamp)return;queueListStamp=key;
  $('queue-list').innerHTML=entries.length?entries.map((e,i)=>{
   const p=e.request,t=taskCatalog.tasks.find(t=>t.id===p.task),progress=e.progress,f=p.action_filter;
-  const metadata=`${p.num_envs.toLocaleString()} 环境 · ${p.iterations.toLocaleString()} 轮 · ${t?.terrain==='Rough'?'粗糙':'平地'} · ${t?.backlash?'齿隙 ±1°':'无齿隙'} · 动作 ${p.training_action_scale} · ${f?.enabled?'滤波 '+f.head_alpha+'/'+f.legs_alpha:'滤波关闭'}`;
+  const metadata=`${p.num_envs.toLocaleString()} 环境 · ${p.iterations.toLocaleString()} 轮 · ${t?.terrain==='Rough'?'粗糙':t?.terrain==='Slope'?'下坡':'平地'} · ${t?.backlash?'齿隙 ±1°':'无齿隙'} · P ${p.training_firmware_p??5} · 动作 ${p.training_action_scale} · ${f?.enabled?'历史滤波 '+f.head_alpha+'/'+f.legs_alpha:'目标直通'}${t?.hardware==='rollers'?' · 需要滑轮':''}`;
   const off=!online||queueSending,mutable=e.status==='waiting';
   return `<article class="queue-row ${e.status}"><b class="queue-index">${i+1}</b><div class="queue-info"><strong>${esc(queueName(e))}</strong><small>${esc(metadata)}</small>${queueTeacherText(e)?`<small>${esc(queueTeacherText(e))}</small>`:''}${e.status==='failed'||e.status==='stopped'?`<p class="queue-error">${esc((e.message||'').split('\n')[0])}</p>`:''}</div><div class="queue-state"><strong>${esc(queueWords[e.status]||e.status)}</strong><small>${progress?progress.done.toLocaleString()+' / '+progress.total.toLocaleString()+' 轮 · '+Math.floor(progress.percent)+'%':'机器人/标定快照 '+esc(e.recipe_sha256?.slice(0,8))}</small></div><div class="queue-row-controls">${e.job_id?`<button type="button" data-queue-view="${esc(e.job_id)}" class="text-button">查看训练</button>`:''}${mutable?`<button type="button" data-queue-action="move" data-entry="${e.id}" data-queue-direction="-1" ${off||i===0||entries[i-1].status!=='waiting'?'disabled':''} aria-label="上移任务">↑</button><button type="button" data-queue-action="move" data-entry="${e.id}" data-queue-direction="1" ${off||i===entries.length-1||entries[i+1].status!=='waiting'?'disabled':''} aria-label="下移任务">↓</button>`:''}${['failed','stopped'].includes(e.status)?`<button type="button" data-queue-action="retry" data-entry="${e.id}" ${off?'disabled':''}>重新训练</button>`:''}${!['starting','running','stopping'].includes(e.status)?`<button type="button" class="text-button danger" data-queue-action="remove" data-entry="${e.id}" ${off?'disabled':''}>移除</button>`:''}</div></article>`;
  }).join(''):'<p class="hint queue-empty">在“本次训练参数”中选择参数，点击“加入队列”，再点击“开始训练”。单个任务也使用此流程。</p>';
@@ -54,7 +54,7 @@ $('queue-add').onclick=async()=>{
  queueSending=true;window.renderTrainingQueue();
  try{
   while(studioBusy)await new Promise(resolve=>setTimeout(resolve,100));
-  if(!(await saveStudio()))throw Error('参数未同步，请检查页面输入。');
+  if(!(await saveStudio()))throw Error($('studio-status').textContent||'参数同步失败，请检查页面输入。');
   const parameters=readParameters(true);
   queueAddRequest=queueAddRequest||crypto.randomUUID();
   await post('/api/queue/add',{...parameters,execution_profile:executionProfileForTask(),client_id:queueAddRequest});

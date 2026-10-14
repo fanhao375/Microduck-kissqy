@@ -6,8 +6,8 @@ Microduck 当前公开发布
 项目：https://github.com/kissqy/Microduck-kissqy
 首页 README.md 提供系统镜像、两个中控 ZIP 和源码入口。
 
-机器人中控：R17 V164（1.0.164）
-机器人固件：官方 0.15.1 / control.40 / API40
+机器人中控：R17 V167（1.0.167）
+机器人固件：官方 0.15.1 / control.43 / API40
 训练中控：R1.5.27
 系统镜像：Public Image R1；首次配网 R5
 
@@ -17,7 +17,9 @@ Microduck 当前公开发布
 两个运行 ZIP：仓库根目录 release-assets/
 系统镜像：public-image-r1 Release
 
-V164 沿用 V163 编译的 control.40 固件；源码原包名中的 V163 是编译来源。
+V167 配套 control.43 固件，更新：修复鸭身抖动的问题。
 日常使用无需编译；从源码编译见 microduck-hd1910/docs/BUILD.md。
 首次运动前核对本机标定，按 HOME → 保持 → 行走 使用。
 分项授权见 microduck-hd1910/LICENSE；第三方内容保留原许可。
+
+系统镜像 R1 仍预装 control.40；通过 V167 中控安装随包固件升级到 control.43。

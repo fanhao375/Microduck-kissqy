@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Portable local build of the control.40 Zero programs shipped with R17 V164.
+# Portable local build of the control.43 Zero programs shipped with R17 V167.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -121,12 +121,12 @@ expected = {
 }
 found = {p["package"]: p for p in record["packages"]}
 if set(found) != set(expected):
-    raise SystemExit("ARM64 依赖清单与 control.40 发布记录不一致。")
+    raise SystemExit("ARM64 依赖清单与 control.43 发布记录不一致。")
 for name, (version, digest) in expected.items():
     item = found[name]
     url = f"https://deb.debian.org/debian/pool/main/s/systemd/{name}_{version}_arm64.deb"
     if (item["version"], item["sha256"], item["url"]) != (version, digest, url):
-        raise SystemExit(f"{name} 的版本、来源或 SHA256 与 control.40 发布记录不一致。")
+        raise SystemExit(f"{name} 的版本、来源或 SHA256 与 control.43 发布记录不一致。")
 print("ARM64 libudev 固定版本、下载地址和 SHA256 记录一致。")
 PY
     then fail_check '固定 ARM64 依赖记录'; fi
@@ -211,7 +211,7 @@ for name in programs:
     records[name] = {"sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "bytes": path.stat().st_size,
                      "architecture": "AArch64", "glibc_versions": glibc}
 manifest = {
-    "kind": "local-source-build", "source_version": "R17-V164/control.40",
+    "kind": "local-source-build", "source_version": "R17-V167/control.43",
     "created_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     "rust": "1.99.0", "cargo_zigbuild": "0.23.4", "zig": "0.15.1",
     "target": "aarch64-unknown-linux-gnu.2.31", "programs": records,

@@ -1,10 +1,10 @@
 {
   "schema": "microduck-publication/v2",
-  "publication_revision": "public-image-r1-source-sync",
-  "date": "2026-10-12",
-  "firmware_console_version": "1.0.164",
-  "firmware_build": "1fa8438-feetech-ft6-control.40",
-  "firmware_compilation_console_version": "1.0.163",
+  "publication_revision": "v167-control43-published",
+  "date": "2026-10-14",
+  "firmware_console_version": "1.0.167",
+  "firmware_build": "1fa8438-feetech-ft6-control.43",
+  "firmware_compilation_console_version": "1.0.167",
   "api_version": 40,
   "training_console_version": "1.5.27",
   "upstream_firmware": {
@@ -19,13 +19,17 @@
     "retrieval": "first environment preparation uses pinned git checkout and uv sync --frozen --python 3.12"
   },
   "source_archive": {
-    "name": "Microduck-Source-R17-V163-control40-compiled.tar.gz",
-    "bytes": 210356082,
-    "sha256": "cd0bd2421d7c6bd774c90c074f0913d563625962baf6c13d4c1496619aa20ff0",
+    "name": "Microduck-Source-R17-V167-control43-clean.tar.gz",
     "firmware_source_location": "firmware/",
+    "original_compiled_archive": {
+      "name": "Microduck-Source-R17-V167-control43-compiled.tar.gz",
+      "sha256": "d6e2e0c48adb565f0b31f70f9c6d0b628ebedcb50cac827be257294e62561119"
+    },
     "omitted": [
-      "base/ historical V160, V161 and V162 installer ZIPs"
-    ]
+      "duplicate compiled binaries and packaged model binaries",
+      "nested V164 baseline ZIP"
+    ],
+    "preparation": "firmware/prepare-V167.py"
   },
   "models": {
     "walk": {
@@ -114,7 +118,7 @@
     "standup": "roller/standup/policy.onnx"
   },
   "binary_sha256": {
-    "robotd": "464dde28e0be939237fdd1b7e9a4087d751b5c495b896cf25b6c8e44ba3c0fe9",
+    "robotd": "da2bab2320554124e8925c3880962da535dc5b6a414f15dada0c5ca773218647",
     "robotctl": "a5034efaf6d26aaecc4a1b477c947abb7cf59d157288b9ad661706f00a700da7",
     "padd": "356ed712b97c5c073cc9c691ede802a72704c7ece42d69c626f3c69fab0af241",
     "sounds": "00360318eb10509e65cbb0f1be7ef8725b00b0edbb2e0b3d779149ae61284103",
@@ -123,12 +127,12 @@
     "onnxruntime/libonnxruntime_providers_shared.so": "3b6be288fbfb7dff8770d08a23defdde18e8f7e0f5a2b344a0e5e238c999ea88",
     "mediad": "0417c8c2dc5a63dd2e1c2a65d652f31609c232abab95d50e4acbd1faab0f742b"
   },
-  "firmware_payload_sha256": "cba2a3d1fa486713c72f1155fed42d102c2fe3aea9bb3aaf0aad337e046b9afd",
+  "firmware_payload_sha256": "bcfd5c183c697b9c4e0fdbd563d995eda6a48331a7c49b9e76d20bd156c65cce",
   "runtime_archives": [
     {
-      "name": "Microduck-Console-R17-V164.zip",
-      "bytes": 40270716,
-      "sha256": "5c9313b2aba04b89c5dc608644ba7d814771623597d11ddc6a10373528272d31"
+      "name": "Microduck-Console-R17-V167.zip",
+      "bytes": 39865662,
+      "sha256": "7e2d70bac58464f67d3e71e8761f515068322bb419cec0c29f57810a7132bffa"
     },
     {
       "name": "Microduck-Training-Studio-R1.5.27.zip",
@@ -140,12 +144,14 @@
     "package_BUILD_exact_match": true,
     "padd_source_matches_shipped_BUILD": true,
     "padd_roller_source_matches_shipped_BUILD": true,
-    "Rust_sources_preserved_from_control40_archive": true,
-    "console_program_sources_preserved_from_V164_zip": true,
+    "Rust_sources_preserved_from_control40_archive": false,
+    "console_program_sources_preserved_from_V164_zip": false,
     "training_program_sources_preserved_from_R1527_zip": true,
-    "training_sample_source_metadata_cleared": []
+    "training_sample_source_metadata_cleared": [],
+    "Rust_sources_preserved_from_control43_archive": true,
+    "console_program_sources_preserved_from_V167_zip": true
   },
-  "validation_scope": "Source and archive byte comparison, published BUILD/source hashes, syntax and documentation checks; no new firmware build or hardware/GPU test.",
+  "validation_scope": "Directory cleanup, source and release-byte comparison, pinned archive verification and runtime-resource restoration; no new firmware compilation or robot operation.",
   "system_image": {
     "release": "public-image-r1",
     "name": "microduck-zero3w-0.15.1-R1.img.xz",
@@ -161,13 +167,88 @@
   },
   "repository_documentation_translation": {
     "date": "2026-10-12",
-    "english_guides": 58,
+    "english_guides": 59,
     "language_switch": "Paired Markdown links at the top of each guide",
     "homepage": "../README.en.md",
     "documentation_index": "../docs/README.en.md",
     "scope": "Documentation only; English editions preserve version-specific history and original technical identifiers. Existing upstream English documentation is retained.",
     "application_interfaces": "Existing Chinese interfaces unchanged",
     "firmware_binaries_models_and_runtime_archives_unchanged": true,
-    "revalidated_hardware_in_translation": false
+    "revalidated_hardware_in_translation": false,
+    "updated": "2026-10-13"
+  },
+  "standalone_compiled_firmware": {
+    "published": "2026-10-14",
+    "path": "firmware/console/updates/Microduck-Robotd-FT6-R17.tar.gz",
+    "name": "Microduck-Robotd-FT6-R17.tar.gz",
+    "bytes": 34138802,
+    "sha256": "bcfd5c183c697b9c4e0fdbd563d995eda6a48331a7c49b9e76d20bd156c65cce",
+    "build": "1fa8438-feetech-ft6-control.43",
+    "architecture": "AArch64",
+    "source": "firmware/console/updates/Microduck-Robotd-FT6-R17.tar.gz",
+    "recompiled": false,
+    "install_guides": {
+      "zh-CN": "../release-assets/README.md",
+      "en": "../release-assets/README.en.md"
+    },
+    "byte_identical_to_V167_bundled_payload": true
+  },
+  "online_demos": {
+    "updated": "2026-10-14",
+    "source_commit": "a07cfd0644227be8c55c76e1dc73f623f4a38027",
+    "robot_console_version": "1.0.167",
+    "robot_firmware_display": "1fa8438-feetech-ft6-control.43",
+    "training_console_version": "1.5.27",
+    "robot_url": "https://kissqy.github.io/Microduck-kissqy/",
+    "training_url": "https://kissqy.github.io/Microduck-kissqy/training/",
+    "data": "Simulated telemetry, training curves and job history; published task and hardware reference snapshots",
+    "isolation": "Static same-origin assets only; no robot, SSH, CUDA, training, firmware writes or camera connections; recipe drafts exist only in the current tab",
+    "source_frontends_runtime_archives_and_firmware_unchanged": true
+  },
+  "release_notes": {
+    "zh-CN": "修复鸭身抖动的问题",
+    "en": "Fixed body jitter."
+  },
+  "repository_layout": {
+    "base_commit": "7a52d297a9adfe6d2315481953dc64060252d142",
+    "generated_runtime_files": 32,
+    "duplicate_bytes_removed": 61487165,
+    "baseline": "release-assets/build-baselines/Microduck-Console-R17-V164.zip"
+  },
+  "publication_state": {
+    "published": true,
+    "initial_commit": "8f6060711f38ce9bf2aa67cb21054d32c0abddf2",
+    "changes": "修复鸭身抖动的问题"
+  },
+  "repository_cleanup": {
+    "date": "2026-10-14",
+    "base_commit": "a07cfd0644227be8c55c76e1dc73f623f4a38027",
+    "removed_reference_files": 34,
+    "removed_model_alias_files": 12,
+    "extra_generated_resources": 2,
+    "removed_duplicate_bytes": 5292726,
+    "retained": [
+      "Static online-demo resource copies needed by GitHub Pages",
+      "Original compiled console and firmware archives",
+      "Pinned V164 build baseline",
+      "Original archive evidence and training configuration data"
+    ],
+    "robot_runtime_source_changed": false,
+    "compiled_archives_changed": false,
+    "fixed_snapshot_relative_links": 9,
+    "online_demo_console_version": "1.0.167",
+    "online_demo_build_display": "1fa8438-feetech-ft6-control.43",
+    "removed_unused_legacy_test": "packaging/test_rough_stand_import.py",
+    "removed_unused_build_and_docs": [
+      "build-V160.sh",
+      "package-V160.py",
+      "build-V162.sh",
+      "package-V162.py",
+      "build-V163.sh",
+      "package-V163.py",
+      "verification/package147.py",
+      "V163-构建说明.md",
+      "V163-BUILD.en.md"
+    ]
   }
 }

@@ -1,6 +1,8 @@
 [原文 / Original](README.md) | **English**
 
-> **Current published source: Microduck 0.15.1 / HD1910 control.40, paired with R17 V164.** V164 reuses firmware compiled for V163. Start with [current firmware / console notes](README-R17.en.md), [source compilation](../docs/BUILD.en.md), and [release baseline](../docs/BASELINE.en.md). The upstream introduction is retained below.
+> **Compiled HD1910 firmware:** control.43 is an AArch64 package ready to install. See [download and installation](../../release-assets/README.en.md); compiling source is optional.
+
+> **Current published source: Microduck 0.15.1 / HD1910 control.43, paired with R17 V167.** V167 is paired with control.43. Update: Fixed body jitter.
 
 <p align="center">
   <img src="https://github.com/user-attachments/assets/c2f7c245-8217-46a1-8d1e-e0ba967cd969" alt="microduck" width="820">

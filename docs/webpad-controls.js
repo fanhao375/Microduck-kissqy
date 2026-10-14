@@ -22,6 +22,7 @@ export class PadControls {
     this.root.querySelector('[data-pad-center]').onclick=()=>{this.reset();panel.change(false);};
   }
   applyButton(button,pressed){
+    if(pressed&&(button.disabled||button.dataset.unavailable==='true'||this.panel.disabled))return;
     if(button.dataset.trigger){this.axes[button.dataset.trigger]=pressed?1:0;}
     else if(button.dataset.button){if(pressed)this.buttons.add(button.dataset.button);else this.buttons.delete(button.dataset.button);}
     else {const [axis,value]=button.dataset.dpad.split(':');this.axes[axis]=pressed?Number(value):0;}

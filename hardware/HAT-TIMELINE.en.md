@@ -6,6 +6,8 @@ All dates below are in 2026. This records the process from studying the official
 
 **Current status, confirmed October 12, 2026: validated through extended use in the complete robot; operating normally with no identified issues.**
 
+**Current procurement, October 13, 2026:** TH1 can use the original Murata **PRG18BB101MB1RB (100Ω PTC, 0603)**; R33 uses **0Ω**. The 22Ω TH1 value below is an earlier physical-board tuning record. See the [PCB shopping guide](README.en.md#shopping-list) for the current purchase variants.
+
 ## Why build this board?
 
 The official HAT was relatively expensive to fabricate and included functions this duck did not need yet. Each official component's role and surrounding circuit was reviewed before deciding what to keep and simplify.
@@ -38,3 +40,4 @@ Source-data review on October 12, 2026 found:
 - **R33** is already marked 0Ω in the project, on `DXL_DATA_INT → DXL_DATA_CLAMPED`.
 - **TH1** is still marked **100 R PTC** in the project, on `DXL_DATA_CLAMPED → DXL_DATA`. The **22Ω** value in the timeline describes physical-board tuning and has not been copied into that project's BOM.
 - R33 and TH1 are on the servo data line.
+

@@ -35,7 +35,19 @@ body{font-size:16px}h2{font-size:18px}h3{font-size:20px;font-weight:500;margin:0
 @media(max-width:650px){.filter-title{flex-wrap:wrap}.filter-fields{gap:8px}.filter-fields input,.filter-fields select{padding:8px;font-size:18px}.filter-fields label>span{font-size:12px}}
 
 .filter-fields select:disabled{opacity:.65}.filter-fields .action-scale-field select option{background:#1f1f1f;color:#dce1d9}
-.filter-fields{grid-template-columns:repeat(4,minmax(0,1fr))}
+.filter-fields{grid-template-columns:repeat(2,minmax(0,1fr))}
 .filter-fields .servo-p-field input{background:#1b2b21;color:#c1f577;border:1px solid #759553;font-weight:700}
 .filter-fields .servo-p-field>span{color:#c1f577}
 @media(max-width:650px){.filter-fields{grid-template-columns:repeat(2,minmax(0,1fr))}}
+
+.target-limit-card{margin:0 22px 22px;padding:18px 20px;border:1px solid var(--line,#334239);border-radius:8px;background:var(--panel,#152019)}
+.target-limit-heading{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap}.target-limit-heading .form-actions{margin:0;gap:8px}.target-limit-heading .section-heading{margin:0 0 6px}.target-limit-card .hint{line-height:1.65;overflow-wrap:anywhere;margin-top:10px}.target-limit-status{margin:14px 0;font-size:14px;color:var(--text,#dce8cf)}.target-limit-error{padding:10px 12px;border:1px solid #8c4c3b;border-radius:5px;background:#382522;color:#f5bcab;overflow-wrap:anywhere}.target-limit-validation{font-size:13px;line-height:1.6;color:#e5bd84;margin:12px 0}.target-limit-validation[data-valid="true"]{color:#b8dba0}.target-limit-table-wrap{overflow-x:auto}.target-limit-table{width:100%;min-width:500px;border-collapse:collapse;table-layout:fixed;font-size:13px;text-align:left}.target-limit-table th,.target-limit-table td{padding:10px 12px;border-bottom:1px solid var(--line,#334239);vertical-align:middle;overflow-wrap:anywhere}.target-limit-table thead th{color:#c9dfb7;background:#1d2a23;font-weight:600}.target-limit-table thead th:first-child{width:36%}.target-limit-table tbody th{font-weight:400;color:#aabca2}.target-limit-table td{font-variant-numeric:tabular-nums;color:#d4e1c9}.target-limit-table small{font-weight:400;color:#9cae93}.target-limit-card a.train-button{display:inline-flex;align-items:center;text-decoration:none}.target-limit-card [hidden]{display:none!important}
+@media(max-width:650px){.target-limit-card{margin:0 12px 16px;padding:14px}.target-limit-heading .form-actions{width:100%}.target-limit-table th,.target-limit-table td{padding:9px}}
+
+/* Official: published official roller references; links only, no automatic model replacement. */
+.official-reference-panel{margin:12px 0 0;padding:9px 12px;border:1px solid #36463a;border-radius:6px;background:#141e1c;color:#a8bda9;min-width:0}
+.official-reference-panel summary{cursor:pointer;font-size:12px;color:#b9d39f;font-weight:600}
+.official-reference-panel .hint{padding:6px 0;line-height:1.65;overflow-wrap:anywhere}
+.official-reference-panel .hint p{margin:8px 0}
+.official-reference-panel .hint a{text-decoration:underline;text-underline-offset:3px;color:#bddd9b}
+.official-reference-panel .hint small{color:#90a494;font-size:11px}

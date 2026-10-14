@@ -6,22 +6,24 @@
 
 **源码公开；作者原创部分仅供个人非商业使用。第三方内容保留原许可证，范围见 [LICENSE](LICENSE)。**
 
+**已有编译好的固件。** control.43 已随 V167 中控提供；系统镜像 R1 仍预装 control.40；单独使用见[固件安装与下载说明](../release-assets/README.md)。
+
 ## 当前版本与源码
 
 | 内容 | 当前版本 | 源码位置 |
 | --- | --- | --- |
-| 机器人固件与设备服务 | 官方 0.15.1 · control.40 · API40 | [firmware/](firmware/) |
-| 机器人中控 | R17 V164（1.0.164） | [firmware/console/](firmware/console/) |
+| 机器人固件与设备服务 | 官方 0.15.1 · control.43 · API40 | [firmware/](firmware/) |
+| 机器人中控 | R17 V167（1.0.167） | [firmware/console/](firmware/console/) |
 | 训练中控 | R1.5.27 | [training-console/](training-console/) |
 | 公开系统镜像 | Public Image R1 · 首次配网 R5 | [镜像发布页](https://github.com/kissqy/Microduck-kissqy/releases/tag/public-image-r1) |
 
-V164 中控沿用 V163 编译的 **control.40** 固件。原固件源码包名为 `Microduck-Source-R17-V163-control40-compiled.tar.gz`；V163 是编译来源版本。当前 `firmware/BUILD.json` 与 V164 随包固件的 BUILD 记录一致，两个中控的程序源码与各自 ZIP 同步。
+V167 中控配套已编译的 **control.43** 固件。更新：**修复鸭身抖动的问题**。当前 `firmware/BUILD.json` 与 V167 随包固件的 BUILD 记录一致，两个中控的程序源码与各自 ZIP 同步。
 
 ## 下载与使用
 
 1. [下载系统镜像 R1](https://github.com/kissqy/Microduck-kissqy/releases/download/public-image-r1/microduck-zero3w-0.15.1-R1.img.xz)，用 [Armbian Imager](https://imager.armbian.com/) 刷入 TF 卡。
 2. 首次开机连接 `Microduck-kissqy` 热点（密码 `12345678`），设置家庭 Wi-Fi 和新的系统登录密码。未自动弹出页面时访问 `http://10.42.0.1:8088`。
-3. [下载机器人中控 V164](https://github.com/kissqy/Microduck-kissqy/raw/refs/heads/main/release-assets/Microduck-Console-R17-V164.zip)，完整解压后运行 `start.cmd`；macOS/Linux 运行 `bash start.command`。页面地址为 `http://127.0.0.1:8090`。
+3. [下载机器人中控 V167](https://github.com/kissqy/Microduck-kissqy/raw/refs/heads/main/release-assets/Microduck-Console-R17-V167.zip)，完整解压后运行 `start.cmd`；macOS/Linux 运行 `bash start.command`。页面地址为 `http://127.0.0.1:8090`。
 4. 填写自己的 `用户名@机器人IP` 和 SSH 登录信息，连接后核对本机标定，按 **HOME → 保持 → 行走** 使用。镜像已预装机器人服务；已有系统需要升级时，可在中控“系统维护”安装随包固件。
 5. 需要训练时，[下载训练中控 R1.5.27](https://github.com/kissqy/Microduck-kissqy/raw/refs/heads/main/release-assets/Microduck-Training-Studio-R1.5.27.zip)，运行 `start-training.cmd` 或 `bash start-training.command`，打开 `http://127.0.0.1:8092`。
 

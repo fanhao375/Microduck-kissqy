@@ -1,8 +1,8 @@
 [简体中文](README.zh-CN.md) | **English**
 
-# Microduck R17 V164 / control.40 bundled firmware
+# Microduck R17 V167 / control.43 bundled firmware
 
-Build `1fa8438-feetech-ft6-control.40` pairs with console `1.0.164` and official system `0.15.1`. robotd and padd are ARM64 programs compiled for this build; robotctl, mediad, input bridge, and installation use the paired package configuration.
+Build `1fa8438-feetech-ft6-control.43` pairs with console `1.0.164` and official system `0.15.1`. robotd and padd are ARM64 programs compiled for this build; robotctl, mediad, input bridge, and installation use the paired package configuration.
 
 Install via **系统维护 → 随包固件** (System Maintenance → Bundled Firmware). Complete four-step service startup, switch to movement mode, perform HOME, and enable the policy before motion. See the [console user guide](../console/USER-GUIDE.en.md) for buttons.
 

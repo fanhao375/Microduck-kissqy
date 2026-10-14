@@ -7,8 +7,8 @@
 ## 已发布内容
 
 - `public-image-r1` Release：公开系统镜像 `microduck-zero3w-0.15.1-R1.img.xz`。
-- 根目录 `release-assets/`：机器人中控 `Microduck-Console-R17-V164.zip`、训练中控 `Microduck-Training-Studio-R1.5.27.zip`。
-- `microduck-hd1910/firmware/`：control.40 固件源码；其中 `console/` 是 V164 中控源码。
+- 根目录 `release-assets/`：机器人中控 `Microduck-Console-R17-V167.zip`、训练中控 `Microduck-Training-Studio-R1.5.27.zip`。
+- `microduck-hd1910/firmware/`：control.43 固件源码；其中 `console/` 是 V167 中控源码。
 - `microduck-hd1910/training-console/`：R1.5.27 训练中控源码。
 
 首页的两个 ZIP 入口直接下载仓库中的文件，不依赖它们是否另行放进 Release 附件。当前源码位于 main 分支；旧镜像标签的自动 Source code 附件不会随 main 更新。

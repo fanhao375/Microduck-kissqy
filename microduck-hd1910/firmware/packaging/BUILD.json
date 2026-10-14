@@ -117,13 +117,13 @@
     "8fdaf12c7478a8314a63647a466bfa34",
     "d11f8430712c35cb2416ce3948e9f8b7"
   ],
-  "build": "1fa8438-feetech-ft6-control.40",
-  "console_version": "1.0.163",
+  "build": "1fa8438-feetech-ft6-control.43",
+  "console_version": "1.0.167",
   "hardware_verified": false,
-  "source_distribution": "Microduck-Source-R17-V163-control40-compiled.tar.gz",
+  "source_distribution": "Microduck-Source-R17-V167-control43-compiled.tar.gz",
   "built_binaries": {
     "robotd": {
-      "sha256": "464dde28e0be939237fdd1b7e9a4087d751b5c495b896cf25b6c8e44ba3c0fe9",
+      "sha256": "da2bab2320554124e8925c3880962da535dc5b6a414f15dada0c5ca773218647",
       "machine": "AArch64",
       "needed": [
         "libm.so.6",
@@ -140,7 +140,7 @@
         "2.29",
         "2.30"
       ],
-      "bytes": 6793032
+      "bytes": 5788168
     },
     "robotctl": {
       "sha256": "a5034efaf6d26aaecc4a1b477c947abb7cf59d157288b9ad661706f00a700da7",
@@ -277,8 +277,7 @@
     }
   },
   "rebuilt_binaries": [
-    "robotd",
-    "padd"
+    "robotd"
   ],
   "reused_binaries": [
     "gamepad-r7/gamesir-xboxd",
@@ -289,8 +288,8 @@
     "sounds"
   ],
   "toolchain": "Rust 1.99.0 / cargo-zigbuild 0.23.4 / Zig 0.15.1; aarch64-unknown-linux-gnu.2.31",
-  "generated_at_utc": "2026-10-11T03:12:43.754826+00:00",
-  "release_changes": "Physical L3 guarded manual roller stand-up test through the existing skill API",
+  "generated_at_utc": "2026-10-14T06:58:52.344924+00:00",
+  "release_changes": "V164 control flow with only explicit RAM D=0 and address48=1000 writes; model-contract P unchanged",
   "startup_flow": {
     "steps": [
       "configuration_and_ipc",
@@ -339,9 +338,8 @@
   "uart_telemetry_unchanged": true,
   "official_filter_algorithm_unchanged": true,
   "native_production_changes": [
-    "padd/src/main.rs",
-    "padd/src/roller_test.rs",
-    "robotd/src/feetech_commissioning.rs: build identity only"
+    "duck-control/src/hd1910.rs",
+    "robotd/src/feetech_commissioning.rs: build identity"
   ],
   "padd_source_sha256": "42e334cf44adba39cff19e3afd6b089116cb6e9b5428a12f513bd9c79e4a28ff",
   "gamepad_binary_sha256": "6f8d78d2bdcb85c2e216013c66e1af25b38813cb86d0e88a7722ef98df5d4b30",
@@ -349,12 +347,12 @@
     "robot_hardware_tested": false,
     "windows_native_tested": false,
     "browser_pixel_rendered": false,
-    "rust_release_scope_passed": 235,
+    "rust_release_scope_passed": 237,
     "rust_release_scope_failed": 0,
-    "python_current_scope_passed": 6,
+    "python_current_scope_passed": 18,
     "arm64_qemu_models_passed": 10,
     "full_workspace_regression_run": false,
-    "source_records": "verification/v163/"
+    "source_records": "verification/v167/"
   },
   "previous_native_build": "verification/native-build157fix2.json",
   "media_build": "1fa8438-feetech-media-demand.1",
@@ -366,12 +364,12 @@
   },
   "release_status": "compiled-unverified-hardware",
   "package_baseline": {
-    "name": "Microduck-Console-R17-V162.zip",
-    "sha256": "9e8d82ea6a57dfbfa15592fab980e57a1e67fb2dff1b6e7bfb63f773a2283a5e",
+    "name": "Microduck-Console-R17-V164.zip",
+    "sha256": "5c9313b2aba04b89c5dc608644ba7d814771623597d11ddc6a10373528272d31",
     "calibration": "authorized calibration preserved byte-for-byte"
   },
   "release_scope_tests": {
-    "passed": 235,
+    "passed": 237,
     "failed": 0,
     "scope": "duck-control unit; duck-ipc-proto unit; padd unit; robotd roller::tests"
   },
@@ -417,5 +415,35 @@
   },
   "historical_diagnostics_record": "source distribution: verification/v160/rust-tests.json",
   "baseline_verification_report": "verification/changes157fix10.json",
-  "padd_roller_test_sha256": "94d10284837eef693cd5470a52cc49bca0d27a362c361ddaed466e6c6a85e32b"
+  "padd_roller_test_sha256": "94d10284837eef693cd5470a52cc49bca0d27a362c361ddaed466e6c6a85e32b",
+  "unchanged_binaries": [
+    "padd",
+    "robotctl",
+    "mediad",
+    "sounds",
+    "gamepad-r7/gamesir-xboxd"
+  ],
+  "hd1910_runtime_settings": {
+    "p": {
+      "source": "model_contract",
+      "address": 50,
+      "bytes": 1,
+      "restore_on_relax": true,
+      "existing_readback_preserved": true
+    },
+    "d": {
+      "value": 0,
+      "address": 51,
+      "bytes": 1
+    },
+    "torque_limit": {
+      "value": 1000,
+      "address": 48,
+      "bytes": 2,
+      "byte_order": "little"
+    },
+    "write_trigger": "V164 explicit arm flow",
+    "fixed_settings_readback_added": false,
+    "eeprom_changed": false
+  }
 }

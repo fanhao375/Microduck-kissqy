@@ -75,8 +75,7 @@ footer{padding:6px 0 18px;font-size:10px}#toast{font-size:12px;padding:10px 15px
 #calibration-zero-status.error{color:#edb4a0}
 #calibration-bundled.calibration-action:not(.applied){background:#22342e;border-color:#425d50;color:#bdcdbf;font-weight:400}
 .calibration-old{display:block;color:#97ab9c;font-size:11px;margin-top:4px}
-#calibration-table tr.calibration-changed{background:#293c29}
-#calibration-table tr.calibration-changed td:nth-child(4){color:#dbedb0;font-weight:650}
+/* Per-field calibration highlighting lives below; never color a fixed table column. */
 .train-button.danger{background:#482b31;border-color:#aa5b62;color:#ffccd0}
 .train-button:disabled,.text-button:disabled{cursor:not-allowed;opacity:.45}
 .train-button:not(:disabled):hover,.text-button:not(:disabled):hover{filter:brightness(1.18)}
@@ -446,8 +445,7 @@ progress::-moz-progress-bar{background:var(--green)}
 .field-state.pending{background:#29271c;color:var(--warm)}
 #calibration-zero-status{color:#bee4a2}
 #calibration-zero-status.error{color:var(--red)}
-#calibration-table tr.calibration-changed{background:var(--selected)}
-#calibration-table tr.calibration-changed td:nth-child(4){color:var(--green)}
+/* Per-field calibration highlighting lives below; never color a fixed table column. */
 .calibration-old{color:var(--muted)}
 .run-list button:hover,.run-list button.selected{background:var(--selected)}
 .run-list button,.run-list button small,.job-message{border-color:var(--line)}
@@ -571,3 +569,18 @@ progress::-moz-progress-bar{background:var(--green)}
 /* Current action profiles: one row per action, physical variants beside it. */
 #parameters .primary-training-fields #task-physics-note{grid-column:1/-1;margin:0;font-size:12px;color:var(--muted);line-height:1.45}
 #parameters #task-terrain,#parameters #task-backlash{font-size:13px}
+
+/* R1.5.21 UI-fix1: highlight ONLY changed calibration field values, not the zero column or entire row. */
+#calibration-table .calibration-value{display:inline-block;white-space:nowrap;font-variant-numeric:tabular-nums}
+#calibration-table .calibration-value-changed{background:#37472a;border:1px solid #789d59;border-radius:4px;color:#e1f8bc;font-weight:750;padding:1px 5px}
+#calibration-table .calibration-old{display:block;margin-top:4px;color:var(--muted);font-size:11px;font-weight:400;white-space:nowrap}
+#calibration-table .calibration-servo-id{font-variant-numeric:tabular-nums;white-space:nowrap;color:var(--secondary)}
+#calibration-table .calibration-servo-id .calibration-value-changed{color:#e1f8bc}
+#calibration-table .calibration-compare-note{padding:10px 18px;margin:0;color:var(--secondary);font-size:12px;line-height:1.65}
+#calibration-table .calibration-compare-note strong{color:var(--green)}
+
+/* The project's public source is a prominent action in the top header. */
+.train-top .github-source-link{display:inline-flex;align-items:center;justify-content:center;min-height:35px;padding:6px 13px;border:1px solid #b7d67d;border-radius:6px;background:#b7d67d;color:#182516;font-size:13px;font-weight:700;line-height:1.35;white-space:nowrap;transition:background-color .15s,border-color .15s}
+.train-top .github-source-link:hover{background:#d3efa2;border-color:#d3efa2;color:#14200f}
+.train-top .github-source-link:focus-visible{outline:2px solid #f1ffce;outline-offset:3px}
+@media(max-width:650px){.train-top .github-source-link{min-height:32px;padding:6px 11px;font-size:12px}}

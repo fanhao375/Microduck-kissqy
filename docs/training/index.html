@@ -2,12 +2,12 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="dark">
-<title>Microduck · 独立训练台</title>
-<link rel="stylesheet" href="./training.css">
-<link rel="stylesheet" href="./studio.css">
-<script src="./demo-api.js"></script><script src="./tasks.js" defer=""></script><script src="./sample_alignment.js" defer=""></script><script src="./training.js" defer=""></script><script src="./studio.js" defer=""></script><link rel="stylesheet" href="./workflow.css">
-<script src="./workflow.js" defer=""></script><script src="./teachers.js" defer=""></script><script src="./queue.js" defer=""></script><link rel="stylesheet" href="./queue.css">
-<link rel="stylesheet" href="./remote.css"><script src="./remote.js" defer></script>
+<title>Microduck · 训练中控 R1.5.27 在线演示</title>
+<link rel="stylesheet" href="./training.css?demo=20261013">
+<link rel="stylesheet" href="./studio.css?demo=20261013">
+<script src="../demo-guard.js?demo=20261013"></script><script src="./demo-api.js?demo=20261013"></script><script src="./tasks.js?demo=20261013" defer=""></script><script src="./sample_alignment.js?demo=20261013" defer=""></script><script src="./training.js?demo=20261013" defer=""></script><script src="./studio.js?demo=20261013" defer=""></script><link rel="stylesheet" href="./workflow.css?demo=20261013">
+<script src="./workflow.js?demo=20261013" defer=""></script><script src="./teachers.js?demo=20261013" defer=""></script><script src="./queue.js?demo=20261013" defer=""></script><link rel="stylesheet" href="./queue.css?demo=20261013">
+<link rel="stylesheet" href="./remote.css?demo=20261013"><script src="./remote.js?demo=20261013" defer></script>
 </head>
 <body>
 <aside class="train-sidebar"><div>
@@ -15,14 +15,14 @@
 <nav><a href="#training-server">训练服务器</a><a href="#workspace" class="active">训练监控</a><a href="#training-queue">训练队列</a><a href="#history">任务与日志</a><a href="#results-details">训练成果</a><a href="#parameters">本次训练设置</a><a href="#reference-details">高级参数</a></nav>
 </div>
 <div class="sidebar-foot">
-<span class="status-dot"></span>独立训练系统<small>本机仿真 · 无需连接机器人</small><small id="version" data-ui-revision="R1.5.17">Studio R1.5.17 · 固件 0.15.1</small>
+<span class="status-dot"></span>独立训练系统<small>本机仿真 · 无需连接机器人</small><small id="version" data-ui-revision="R1.5.27">Studio R1.5.27 · 固件 0.15.1</small>
 </div></aside><main id="workspace">
 <header class="train-top"><div>
 <h1>训练中控台</h1>
 <span class="hint" id="workspace-name">目标固件 0.15.1 · 官方训练 + HD1910</span>
 </div>
 <div>
-<span id="env-badge" class="pill muted">本机检查缓存</span><a class="text-button" href="#parameters">修改设置 ↓</a>
+<a class="github-source-link" href="https://github.com/kissqy/Microduck-kissqy" target="_blank" rel="noopener noreferrer" aria-label="在 GitHub 打开 Microduck-kissqy 开源项目">GitHub 开源项目 ↗</a><span id="env-badge" class="pill muted">本机检查缓存</span><a class="text-button" href="#parameters">修改设置 ↓</a>
 </div></header><div id="connection-error" class="notice bad" hidden="">训练台后台已断开。当前内容为最后一次收到的记录，请检查独立启动窗口。</div>
 <div id="render-error" class="notice bad" role="status" hidden=""></div>
 <section id="training-server" class="panel remote-panel" aria-label="训练位置与SSH服务器">
@@ -70,10 +70,10 @@
 <label>行走老师 PT<select id="walk-teacher"><option value="">选择已验证能走的 HD1910 检查点</option></select></label>
 <label>起身老师 PT<select id="stand-teacher"><option value="">选择已验证能起身的 HD1910 检查点</option></select></label>
 </div><p id="joint-training-note" class="form-note" role="status"></p><div id="joint-training-runtime" class="joint-training-runtime" hidden=""></div></section></div>
-<section class="action-filter-settings" aria-label="舵机P、动作系数与滤波">
-<div class="filter-title"><h3 class="section-heading">舵机 P 与动作映射</h3><label class="inline-check"><input id="action-filter-enabled" type="checkbox" checked>启用头腿滤波 / Filter</label></div>
-<div class="filter-fields"><label class="servo-p-field"><span>舵机 P<small>Servo P · 原始整数</small></span><input id="training-firmware-p" type="number" min="1" max="32" step="1" value="3" aria-label="训练舵机P增益"></label><label class="action-scale-field"><span>动作系数<small>Action scale</small></span><select id="training-action-scale" aria-label="当前训练动作系数"><option value="1.0">1.0</option><option value="0.9" selected>0.9</option><option value="0.8">0.8</option><option value="0.7">0.7</option><option value="0.6">0.6</option><option value="0.5">0.5</option><option value="0.4">0.4</option><option value="0.3">0.3</option><option value="0.2">0.2</option><option value="0.1">0.1</option></select></label><label><span>头颈滤波 α<small>Head filter</small></span><input id="head-filter-alpha" type="number" min="0.01" max="1" step="0.01" value="0.5"></label><label><span>腿部滤波 α<small>Leg filter</small></span><input id="legs-filter-alpha" type="number" min="0.01" max="1" step="0.01" value="0.7"></label></div>
-<p id="action-filter-note" class="form-note">50Hz · 新目标×α＋上次滤波目标×(1−α) · 1 为直通。仿真与导出沿用训练记录。</p>
+<section class="action-filter-settings" aria-label="舵机P与动作系数">
+<div class="filter-title"><h3 class="section-heading">舵机 P 与动作映射</h3></div>
+<div class="filter-fields"><label class="servo-p-field"><span>舵机 P<small>Servo P · 原始整数</small></span><input id="training-firmware-p" type="number" min="1" max="32" step="1" value="5" aria-label="训练舵机P增益"></label><label class="action-scale-field"><span>动作系数<small>Action scale</small></span><select id="training-action-scale" aria-label="当前训练动作系数"><option value="1.0" selected>1.0</option><option value="0.9">0.9</option><option value="0.8">0.8</option><option value="0.7">0.7</option><option value="0.6">0.6</option><option value="0.5">0.5</option><option value="0.4">0.4</option><option value="0.3">0.3</option><option value="0.2">0.2</option><option value="0.1">0.1</option></select></label></div>
+<p id="action-mapping-note" class="form-note">新训练默认 P=5、动作系数=1，关节目标直通。仿真与导出沿用模型的训练记录。</p>
 </section><section id="contact-settings" class="contact-settings" aria-label="接触面与物理训练参数"><h3 class="section-heading">接触面与物理参数 <small>Contact & physics</small></h3><p id="contact-settings-source" class="form-note"></p><div id="contact-settings-table"></div></section>
 <section class="advanced network-settings"><h3 class="section-heading">学习算法与网络 <span>留空使用官方默认值</span></h3><div class="form-grid">
 <label>学习率<input id="learning-rate" type="number" min="0.000001" max="0.01" step="any" placeholder="官方默认"></label><label>随机种子<input id="seed" type="number" min="0" max="2147483647" placeholder="官方默认"></label><label>折扣系数 γ<input id="gamma" type="number" min="0.5" max="0.99999" step="any" placeholder="官方默认"></label><label>探索强度<input id="entropy" type="number" min="0" max="0.5" step="any" placeholder="官方默认"></label><label>PPO 裁剪范围<input id="clip" type="number" min="0.01" max="0.5" step="any" placeholder="官方默认"></label><label>激活函数<select id="activation"><option value="">沿用官方</option>
@@ -146,26 +146,28 @@
 <div class="sim-workbench"><div class="sim-controls control-card"><h3 class="section-heading">模型与验证</h3>
 <label class="sim-picker">选择模型<select id="checkpoint"><option value="">请选择模型存档或 ONNX</option></select></label><small id="selected-action-scale" class="model-action-scale"></small><button id="delete-model" type="button" class="train-button danger" disabled="">删除所选模型</button>
 <div class="form-actions">
-<button id="preview-start" class="train-button action-blue" type="button" disabled="">查看初始模型</button><button id="play-start" class="train-button primary action-blue" type="button" disabled="">查看所选策略</button><button id="recovery-eval-start" class="train-button action-amber" type="button" title="选择倒地起身老师，在平地检查背朝地、左右侧躺和趴地起身" disabled="">翻身检查</button><button id="export-model" class="train-button action-teal" type="button" disabled="">导出 ONNX</button><button id="play-stop" class="train-button danger" type="button" disabled="">停止仿真</button><a id="viewer-link" class="text-button" href="#" target="_blank" rel="noopener" hidden="">单独打开 ↗</a>
+<button id="preview-start" class="train-button action-blue" type="button" disabled="">查看初始模型</button><button id="play-start" class="train-button primary action-blue" type="button" disabled="">查看所选策略</button><button id="export-model" class="train-button action-teal" type="button" disabled="">导出 ONNX</button><button id="play-stop" class="train-button danger" type="button" disabled="">停止仿真</button><a id="viewer-link" class="text-button" href="#" target="_blank" rel="noopener" hidden="">单独打开 ↗</a>
 </div>
-<p id="recovery-eval-note" class="hint" hidden="">翻身检查从完全背朝地开始；在仿真内切换左右侧躺、趴地或训练最终混合，查看各姿态的起身记录。</p>
+
+<details id="official-policy-references" class="official-reference-panel"><summary>官方已训练参考模型（不会覆盖自训检查点）</summary><div id="official-reference-detail" class="hint">选择轮滑行走或轮滑蹲下后显示官方模型链接及适配说明。</div></details>
 <label class="inline-check eval-push"><input id="follow-latest" type="checkbox">自动查看新检查点（周期评估）</label><label class="inline-check eval-push"><input id="eval-pushes" type="checkbox">启动时开启官方随机推扰 <span class="hint">默认关闭，便于比较动作</span></label><p id="viewer-state" class="viewer-state">尚未启动物理仿真。</p>
 
 </div><section class="drive-details control-card"><h3 class="section-heading">仿真遥控</h3><div class="remote-column"><div class="simulation-drive" id="sim-drive" tabindex="0" aria-label="仿真遥控区，WASD 移动，QE 转向，空格停止">
 <div class="drive-main">
 
 <p id="drive-status">加载行走策略后启用遥控。</p>
+
 <div class="form-actions">
 <button id="sim-pause" class="train-button action-amber" type="button" disabled="">暂停仿真</button><button id="sim-reset" class="train-button action-blue" type="button" disabled="">重置姿态</button>
 </div>
 <p id="drive-speed-note" class="drive-speed-note">仿真目标速度沿用任务默认指令范围。</p>
 </div>
-<div class="direction-pad">
+<div class="direction-pad" id="walking-direction-pad">
 <button data-direction="turn_left" disabled="">↶<small>左转 Q</small></button><button data-direction="forward" disabled="">↑<small>前进 W</small></button><button data-direction="turn_right" disabled="">↷<small>右转 E</small></button><button data-direction="left" disabled="">←<small>左移 A</small></button><button id="sim-zero" class="stop-key" disabled="">■<small>归零</small></button><button data-direction="right" disabled="">→<small>右移 D</small></button><span></span><button data-direction="back" disabled="">↓<small>后退 S</small></button><span></span>
 </div>
-</div><p id="drive-feedback" class="drive-feedback" role="status">尚未发送移动指令。</p><p class="drive-note">按住屏幕箭头，或点击遥控区后用 ↑ ↓ ← → / WASD 移动，QE 转向；松开归零，空格停止移动。</p></div></section><section class="telemetry-card control-card"><h3 class="section-heading">实时姿态</h3><div class="sim-readouts">
+</div><p id="drive-feedback" class="drive-feedback" role="status">尚未发送移动指令。</p><p class="drive-note" id="drive-guide">按住屏幕箭头，或点击遥控区后用 ↑ ↓ ← → / WASD 移动，QE 转向；松开归零，空格停止移动。</p></div></section><section class="telemetry-card control-card"><h3 class="section-heading">实时姿态</h3><div class="sim-readouts">
 <div>
-<span>仿真收到 · 前 / 左 / 转</span><strong id="sim-command">— / — / —</strong><small>m/s · m/s · rad/s</small>
+<span id="sim-command-label">仿真收到 · 前 / 左 / 转</span><strong id="sim-command">— / — / —</strong><small id="sim-command-unit">m/s · m/s · rad/s</small>
 </div>
 <div>
 <span>实际速度 · 前 / 左 / 转</span><strong id="sim-actual">— / — / —</strong><small>机器人自身坐标</small>
@@ -174,10 +176,11 @@
 <span>横滚 / 俯仰</span><strong id="sim-tilt">— / —</strong><small>实时物理姿态</small>
 </div>
 <div>
-<span>连续直立 / 非超时结束</span><strong id="sim-outcome">— / —</strong><small title="连续直立按机身倾角小于 45° 计时；非超时结束按官方任务终止条件计数，重置清零。">倾角 &lt;45° · 重置清零</small>
+<span id="sim-outcome-label">连续直立 / 非超时结束</span><strong id="sim-outcome">— / —</strong><small id="sim-outcome-note" title="连续直立按机身倾角小于 45° 计时；非超时结束按官方任务终止条件计数，重置清零。">倾角 &lt;45° · 重置清零</small>
 </div>
 </div>
 </section></div>
+
 </section>
 </div>
 

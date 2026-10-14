@@ -64,6 +64,6 @@ export class Camera {
     if(this.pc){this.pc.onconnectionstatechange=null;this.pc.close();this.pc=null;}
     if(this.ws){this.ws.onclose=null;this.ws.onerror=null;this.ws.close();this.ws=null;}
     this.video.srcObject=null;this.sessionId=null;this.sessionRequested=false;this.previous=null;this.pendingICE=[];
-    if(report)this.onStatus('idle','通过官方 mediad 接入局域网视频流');
+    if(report)this.onStatus('idle','点击连接唤醒采集；最后一个视频会话退出后自动休眠');
   }
 }

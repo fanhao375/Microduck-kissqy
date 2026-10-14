@@ -1,40 +1,39 @@
 [简体中文](BASELINE.md) | **English**
 
-# Release baseline and validation scope
+# Release baseline and verification scope
 
-The current public baseline is **Public Image R1 + R17 V164 / control.40 + Training R1.5.27**. Source was synchronized with the corresponding delivery packages; see [PUBLICATION-MANIFEST.json](../PUBLICATION-MANIFEST.json) for identities and hashes.
+Published version: **R17 V167 / control.43 + Training R1.5.27**, based on official **0.15.1**. See [PUBLICATION-MANIFEST.json](../PUBLICATION-MANIFEST.json) for identities and hashes.
 
-| Component | Current version |
+**V167 update: Fixed body jitter.**
+
+| Component | Version |
 | --- | --- |
 | Official firmware | daemon-v0.15.1, `1fa84386f07884e27866411bc1ba166977bced95` |
-| HD1910 firmware | `1fa8438-feetech-ft6-control.40`, API40; compiled for V163, reused by V164 |
-| Robot Console | R17 V164, `1.0.164` |
-| Training Studio | R1.5.27; 14 action categories, 35 recipes |
+| HD1910 firmware | `1fa8438-feetech-ft6-control.43`, API40 |
+| Robot Console | R17 V167, `1.0.167` |
+| Training Studio | R1.5.27; 14 action classes and 35 recipes |
 | Training engine | microduck_rl `8d0db74916a4f833d1d9b95d6a1d7f4d13b9d5ec` |
-| System image | Public Image R1, first-boot setup R5 |
+| System image | Public Image R1, first-boot Wi-Fi R5; still includes control.40 |
 
-## Source and downloads
+## File locations
 
-- `firmware/`: upstream Rust workspace, Feetech adaptation, device services, gamepad bridge, HAT / IMU source, installation scripts, models, and original verification records.
-- `firmware/console/`: Python, web pages, launchers, assets, and firmware upgrade payload synchronized with the V164 ZIP.
-- `training-console/`: console, task configuration, adaptation code, tests, and licensing synchronized with the R1.5.27 ZIP. The training engine and GPU dependencies are downloaded during initial preparation.
-- Repository root `release-assets/`: the user-uploaded V164 and R1.5.27 ZIPs; their original bytes were preserved.
-- System image: the `public-image-r1` Release. Its automatically generated Source code attachments refer to the original tag snapshot. Use `main` or the homepage repository ZIP for the synchronized current source.
+- `firmware/`: firmware source, installer scripts, models, tests and licenses.
+- `firmware/console/`: V167 console source and bundled firmware payload.
+- `training-console/`: unchanged R1.5.27 release content.
+- `release-assets/`: complete V167 console and R1.5.27 training ZIPs.
+- `release-assets/build-baselines/`: one V164 ZIP retained for reproducible packaging.
+- System image: the existing `public-image-r1` Release; after flashing, install V167 bundled firmware to upgrade to control.43.
 
-The original firmware source archive also contained three historical console ZIPs under `base/`. They are not source files and are not duplicated in the current source directory. Original `build-V163.sh` / `package-V163.py` remain as build records; running them requires the corresponding V162 base package and original test environment. For compilation on a new machine, use [BUILD.md](BUILD.en.md).
+Source no longer embeds an old complete installer ZIP or a second binary copy of compiled programs, ONNX libraries and packaged models. `firmware/prepare-V167.py` verifies and restores required resources; Git ignores generated copies. See [the V167 build guide](../firmware/BUILDING-V167.en.md).
 
-## Validation scope
+## Verification
 
-The public image previously passed a fresh-card test covering Wi-Fi setup, SSH, robot communication, and R17 recognition.
+The image was previously verified by reflashing, first Wi-Fi setup, SSH, robot communication and R17 recognition. The author reports the currently running robot build as `1fa8438-feetech-ft6-control.43`.
 
-Source synchronization compared the V164 embedded firmware with the control.40 source package's BUILD, native programs, and key source hashes. Rust source and both consoles' program sources were compared byte for byte with delivered files, and the current documentation, manifests, and build-script syntax were checked. Stale version values in the top-level BUILD and source index were corrected using actual release records; originals remain in `firmware/verification/source-package-original-*`.
+`firmware/verification/v167/` contains prior compilation records: 237 Rust tests, 18 Python tests and ten ARM64/QEMU model loads and first inferences. This cleanup checks delivered archives, source, resource restoration and checksums without rebuilding firmware or operating the robot.
 
-`firmware/verification/v163/` retains original build-stage records: 235 targeted Rust checks, 6 Python checks, and loading / first inference for 10 ARM64/QEMU models passed. These are original records, not claims that synchronization rebuilt or reran them. Real roller recovery and model movement results remain subject to their individual physical test records.
+## Known-Good and next task
 
-Source synchronization did not recompile firmware, connect to ZERO to change services, or run long GPU training. It did not change robot control logic, mechanics, electronics, or policies.
+Current release reference: **0.15.1 + R17 V167 / control.43 + Training R1.5.27**, with the reflash-verified **Public Image R1**. Action-specific acceptance remains governed by the corresponding real-robot records.
 
-## Known-Good and next step
-
-Known-Good software references: official **0.15.1**, **R17 V164 / control.40**, **Training R1.5.27**, and reflash-tested **Public Image R1**. Acceptance scope for individual actions remains defined by the original records.
-
-**The next single main task is to reproduce a new user's first installation and local calibration using the public instructions.** Continue validating one variable at a time.
+**Single next task: reproduce V167 installation and local calibration from the published downloads.** Validate one variable at a time.

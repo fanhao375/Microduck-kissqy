@@ -1,8 +1,8 @@
 **简体中文** | [English](BUILD.en.md)
 
-# 从源码编译 control.40
+# 从源码编译 control.43
 
-日常使用可直接下载系统镜像及 V164 中控，无需编译。本页用于修改源码后重新构建 Zero 程序。当前固件为 **control.40**，由 V163 编译并随 V164 中控分发。
+日常使用可直接下载系统镜像及 V167 中控，无需编译。本页用于修改源码后重新构建 Zero 程序。当前固件为 **control.43**，已随 V167 中控分发。
 
 Windows 用户在 VS Code 的 WSL / Linux 终端执行以下命令。克隆本仓库后，先进入 `microduck-hd1910` 目录。
 
@@ -35,7 +35,7 @@ bash tools/build-firmware.sh --check
 bash tools/build-firmware.sh
 ```
 
-`--check` 检查已安装工具和固定依赖记录，不下载或编译。正式构建使用 `Cargo.lock`、Rust **1.99.0**、cargo-zigbuild **0.23.4**、Zig **0.15.1**，目标为 `aarch64-unknown-linux-gnu.2.31`；与 control.40 的记录一致，为 `robotd` 和 `pet-detect` 指定 release codegen-units 为 1。
+`--check` 检查已安装工具和固定依赖记录，不下载或编译。正式构建使用 `Cargo.lock`、Rust **1.99.0**、cargo-zigbuild **0.23.4**、Zig **0.15.1**，目标为 `aarch64-unknown-linux-gnu.2.31`；与 control.43 的记录一致，为 `robotd` 和 `pet-detect` 指定 release codegen-units 为 1。
 
 输出在 **`.build/firmware/bin/`**：
 
@@ -56,9 +56,9 @@ bash tools/build-firmware.sh
 
 ### 与交付程序的关系
 
-原编译身份及原生程序哈希见 [`firmware/BUILD.json`](../firmware/BUILD.json)；原 control.40 编译和定点验证记录见 [`verification/v163/`](../firmware/verification/v163/)。原版构建环境、235 项 Rust 定点测试及十个 ARM64/QEMU 模型的范围见 [V163 构建说明](../firmware/V163-构建说明.md)。
+当前编译身份及原生程序哈希见 [`firmware/BUILD.json`](../firmware/BUILD.json)。V167 发布复现说明与此前测试记录见 [BUILDING-V167.md](../firmware/BUILDING-V167.md) 和 [`verification/v167/`](../firmware/verification/v167/)。测试记录包含 237 项 Rust 测试、18 项 Python 测试及十个 ARM64/QEMU 模型。
 
-`firmware/build-V163.sh` 和 `package-V163.py` 是原版复现入口，需要 V162 基础 ZIP、QEMU 和相应运行库。三个历史基础 ZIP 没有重复放入当前仓库。普通源码编译使用本页的 `tools/build-firmware.sh`。
+旧版 V160/V162/V163 构建与打包脚本已删除，当前完整发布复现使用 `firmware/build-V167.sh` 和 `package-V167.py`，见 [V167 构建指南](../firmware/BUILDING-V167.md)。普通源码编译仍使用本页的 `tools/build-firmware.sh`。
 
 本次同步没有重新下载编译环境或重建固件；新增入口更新已检查 shell 语法、帮助输出及固定记录，不声称重新编译通过或与原程序逐字节相同。运行构建后会记录输出 ELF 架构、GLIBC 符号上限和 SHA256。
 

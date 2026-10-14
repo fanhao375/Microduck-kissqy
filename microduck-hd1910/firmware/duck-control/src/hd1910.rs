@@ -1,4 +1,4 @@
-//! HD1910 a6dc9f9 position payload and model-contract P. No EEPROM writes.
+//! HD1910 position payload, model-contract P, RAM D=0 and torque limit=1000.
 //! Local joint calibration and FT6/SFLP body frame remain authoritative.
 use crate::feetech::{Bus, Calibration};
 use crate::io::{IoError, Result, Sensors};
@@ -115,10 +115,13 @@ impl State {
             .collect();
         if !off {
             verify_gains(bus, &desired)?;
+            write_fixed_settings(bus, &ids)?;
             // Existing gains are already correct; do not interrupt torque to
             // reapply them, and do not invent restoration data from another run.
             self.applied = true;
-            tracing::warn!("HD1910 existing temporary gains verified; torque preserved");
+            tracing::warn!(
+                "HD1910 existing P verified; RAM D=0 and limit=1000 written; torque preserved"
+            );
             return Ok(());
         }
         let restore: Vec<_> = self
@@ -131,9 +134,10 @@ impl State {
         self.restore = Some(restore);
         bus.sync_write(50, &desired)?;
         verify_gains(bus, &desired)?;
+        write_fixed_settings(bus, &ids)?;
         self.applied = true;
         tracing::warn!(
-            "HD1910 temporary P confirmed from model contract on all joints; native D, torque limit and acceleration preserved"
+            "HD1910 temporary P confirmed from model contract; RAM D=0 and limit=1000 written; acceleration preserved"
         );
         Ok(())
     }
@@ -193,6 +197,18 @@ fn verify_gains(bus: &mut Bus, rows: &[(u8, Vec<u8>)]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn write_fixed_settings(bus: &mut Bus, ids: &[u8]) -> Result<()> {
+    // Separate register widths preserve model P at 50, I at 52 and speed at 46.
+    // Use the existing broadcast writer, without adding a read transaction.
+    let d = ids.iter().map(|id| (*id, vec![0])).collect::<Vec<_>>();
+    let limit = ids
+        .iter()
+        .map(|id| (*id, 1000u16.to_le_bytes().to_vec()))
+        .collect::<Vec<_>>();
+    bus.sync_write(51, &d)?;
+    bus.sync_write(48, &limit)
 }
 
 #[cfg(test)]

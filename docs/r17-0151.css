@@ -27,7 +27,7 @@
 .webpad-content>p{min-height:18px;margin:10px 0 0;line-height:1.5;overflow-wrap:anywhere}
 .webpad-content #control-feedback{padding:7px 0;margin:0;white-space:pre-wrap}
 .model-management-anchor{margin-top:10px}.model-management-anchor .service-management{padding:10px 0 0;border-top:1px solid var(--line);margin:0}
-.management-model-actions{display:flex;align-items:center;gap:7px;flex-wrap:wrap}.management-model-actions select{min-width:0;max-width:100%;font-size:12px}.management-model-actions .management-model-select{flex:1}
+.management-model-actions{display:flex;align-items:center;gap:7px;flex-wrap:wrap}
 .management-tools{margin-top:8px;font-size:12px;color:var(--muted)}.management-tools>summary{cursor:pointer}.management-tools .service-action-row{margin-top:8px}
 #management-hat-status{white-space:pre-wrap;max-height:180px;overflow:auto}
 @media(min-width:1800px){.r17-three-columns>.panel{height:1180px}.pad-stick{width:120px;height:120px}.xbox-body{gap:24px 15px;padding:25px}.pad-abxy,.pad-dpad{grid-template-columns:repeat(3,38px);grid-template-rows:repeat(3,38px)}}
@@ -53,7 +53,8 @@
 @media(max-width:1100px){.official-pad .pad-stick{width:100px;height:100px}.official-pad .xbox-body{max-width:440px;margin:12px auto 18px}.pad-shoulders,.pad-brand{max-width:440px;margin-left:auto;margin-right:auto}}
 .firmware-upload{display:flex;align-items:center;gap:12px;padding:8px;border:1px solid #354044;border-radius:6px;background:#101719}.firmware-upload #firmware-filename{overflow-wrap:anywhere;min-width:0}.firmware-upload .button{flex-shrink:0}
 /* v1.0.98: compact console; desktop cards share rows and heights. */
-.metrics{grid-template-columns:repeat(5,minmax(0,1fr))}
+main{--health-columns:5;--health-gap:16px}
+.metrics{grid-template-columns:repeat(var(--health-columns),minmax(0,1fr));column-gap:var(--health-gap)}
 .r17-three-columns>.panel{height:980px;min-height:0}
 .webpad-content{padding:10px 12px;overflow:visible;font-size:11px}
 #control-panel .panel-head{padding:10px 12px;min-height:46px}
@@ -89,8 +90,8 @@
 .runtime-parameters{margin:7px 0;border-radius:6px}.parameter-heading{padding:5px 7px;font-size:11px}.parameter-heading span{font-size:9px}
 .parameter-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.parameter-grid>div{padding:5px 7px;border-right:1px solid #2d3930}.parameter-grid>div:nth-child(3n){border-right:0}
 .parameter-grid span{font-size:10px;line-height:1.4}.parameter-grid b{font-size:15px;line-height:1.6}.parameter-grid small{font-size:9px;line-height:1.35}.runtime-parameters>p{font-size:9px;line-height:1.4;padding:4px 7px}
-.model-management-anchor{margin-top:5px}.model-management-anchor .service-management{padding:5px 0 0}.management-model-actions{display:flex;gap:5px;flex-wrap:wrap}.model-buttons{display:flex;gap:5px;min-width:0;flex:1;flex-wrap:wrap}
-.model-choice.selected,.firmware-sources .selected{border-color:#98b96f;background:#293b23;color:#c7ec9b}.model-choice{max-width:100%;overflow:hidden;text-overflow:ellipsis}
+.model-management-anchor{margin-top:5px}.model-management-anchor .service-management{padding:5px 0 0}.management-model-actions{display:flex;gap:5px;flex-wrap:wrap}.model-status-list{display:flex;gap:5px;min-width:0;flex:1;flex-wrap:wrap}
+.firmware-sources .selected{border-color:#98b96f;background:#293b23;color:#c7ec9b}
 .global-scale-row{display:grid;grid-template-columns:auto minmax(55px,1fr) 32px auto;gap:6px;align-items:center;margin:6px 0;font-size:11px}
 .global-scale-row input{padding:0;height:18px}.global-scale-row output{font:11px ui-monospace,monospace;color:#d3e9bb}.management-tools{margin-top:3px;font-size:10px}.management-tools .text-button{font-size:10px}.management-tools .service-action-row{margin:4px 0}
 #management-tools-body{padding:5px;border:1px solid #364134;background:#121b15}#management-live-scale{display:block;font-size:9px;line-height:1.4}
@@ -112,8 +113,9 @@
 #diagnostics .panel-head{padding:12px;min-height:48px}#diagnostics .events,#diagnostics>section>pre{height:420px}.firmware-body>.service-action-row{gap:6px;flex-wrap:wrap}
 @media(min-width:1800px){.r17-three-columns>.panel{height:920px}.official-pad .pad-stick{width:94px;height:94px}.official-pad .xbox-body{padding:12px 14px}.official-pad .pad-abxy,.official-pad .pad-dpad{grid-template-columns:repeat(3,29px);grid-template-rows:repeat(3,29px)}}
 @media(min-width:1101px) and (max-width:1400px){.r17-three-columns>.panel{height:1090px}.parameter-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.parameter-grid>div:nth-child(3n){border-right:1px solid #2d3930}.parameter-grid>div:nth-child(2n){border-right:0}.pad-help-grid{column-gap:6px}.global-scale-row{grid-template-columns:auto minmax(45px,1fr) 30px auto;font-size:10px}}
-@media(max-width:1100px){.metrics{grid-template-columns:repeat(3,minmax(0,1fr))}#diagnostics{grid-template-columns:1fr}.r17-three-columns>.panel{height:1040px}#service-joint-row{grid-template-columns:1fr}.service-joint-chart{min-height:420px}.official-pad .pad-stick{width:86px;height:86px}}
-@media(max-width:500px){.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.metric{padding:12px}.metric-title{font-size:11px}.metric-value{font-size:28px}.parameter-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.parameter-grid>div:nth-child(2n){border-right:0}.global-scale-row{font-size:10px}.pad-help-grid{column-gap:7px}.official-pad .pad-abxy,.official-pad .pad-dpad{grid-template-columns:repeat(3,24px);grid-template-rows:repeat(3,24px)}}
+@media(max-width:1220px){main{--health-gap:10px}}
+@media(max-width:1100px){main{--health-columns:3}#diagnostics{grid-template-columns:1fr}.r17-three-columns>.panel{height:1040px}#service-joint-row{grid-template-columns:1fr}.service-joint-chart{min-height:420px}.official-pad .pad-stick{width:86px;height:86px}}
+@media(max-width:500px){main{--health-columns:2}.metric{padding:12px}.metric-title{font-size:11px}.metric-value{font-size:28px}.parameter-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.parameter-grid>div:nth-child(2n){border-right:0}.global-scale-row{font-size:10px}.pad-help-grid{column-gap:7px}.official-pad .pad-abxy,.official-pad .pad-dpad{grid-template-columns:repeat(3,24px);grid-template-rows:repeat(3,24px)}}
 #control-panel .official-pad{width:min(100%,440px);margin:0 auto!important}
 #control-panel .pad-control-column>p{margin:4px 0 0;font-size:10px;line-height:1.4}
 #control-panel .pad-configuration-column{min-width:0}
@@ -196,6 +198,8 @@
 .firmware-authorization input{width:170px;max-width:100%;font-size:11px}
 .firmware-authorization .service-credentials span{font-size:10px;flex:1;min-width:130px}
 .firmware-body{gap:6px}
+#firmware-progress{width:100%;height:10px;accent-color:#98b96f}
+#firmware-progress-text{margin:3px 0;overflow-wrap:anywhere}
 #service-editor .service-confirm-row{justify-content:flex-start;gap:8px;flex-wrap:wrap;margin:6px 0}
 #service-editor .service-confirm-row h3{margin:0}
 #service-editor .service-center{padding-top:6px;margin-top:6px}
@@ -238,7 +242,7 @@
 #control-panel .pad-status-row #control-model{margin-left:auto}
 #control-panel .service-management{display:flex;align-items:center;flex-wrap:wrap;gap:5px 12px}
 #control-panel .management-model-actions{flex:0 1 auto;align-items:center}
-#control-panel .model-buttons{flex:0 1 auto}
+#control-panel .model-status-list{flex:0 1 auto}
 #control-panel .global-scale-row{flex:1;min-width:230px;margin:0}
 #control-panel .management-tools{flex:1 1 100%;display:flex;align-items:center;flex-wrap:wrap;gap:5px 10px}
 #control-panel #management-status{flex-basis:100%}
@@ -303,15 +307,8 @@
 #diagnostics .maintenance-events .events,#diagnostics .maintenance-events #raw-json{flex:1;height:0;min-height:0;max-height:none;overflow:auto;margin:0;padding:8px;border:1px solid var(--line);border-radius:5px;white-space:pre-wrap;overflow-wrap:anywhere;scrollbar-color:#667b55 #18221c;scrollbar-gutter:stable;font-size:10px;line-height:1.5}
 @media(max-width:600px){.maintenance-streams{grid-template-columns:1fr}.maintenance-streams>div{min-height:100px}#diagnostics>.panel{height:720px}}
 
-/* Official action slots share one import entry; empty slots remain selectable. */
+/* Read-only installed model status; no selection or import controls. */
 #control-panel #management-model{display:contents}
-#control-panel .action-slot{font-size:10px;padding:5px 7px}
-#control-panel .action-slot.empty{background:#1b2223;border-color:#384146;color:#8b9698}
-#control-panel .action-slot.configured{color:#c7ec9b}
-#control-panel .action-slot.selected{border-color:#b9db80;background:#293b23}
-#control-panel .action-slot.empty.selected{color:#bac4c6}
-#control-panel #management-import{font-size:11px;padding:5px 8px}
-#control-panel #management-target{font-size:10px;display:block}
 .service-console #motors th.model-limit,.service-console #motors th.saved-limit,.service-console #motors th.target-angle{color:#7c977e;font-weight:500}
 .service-console #motors td.model-limit,.service-console #motors td.saved-limit,.service-console #motors td.target-angle{color:#d8e8bd;font-weight:600}
 .service-console #motors tr.old-sample td.model-limit,.service-console #motors tr.old-sample td.target-angle{opacity:1}
@@ -321,20 +318,44 @@
 #control-panel .runtime-parameters .global-scale-row button{font-size:10px;padding:4px 7px}
 #control-panel .runtime-parameters #management-live-scale,#control-panel .runtime-parameters #management-scale-status{display:block;font-size:9px}
 
-/* Dashboard SSH connection sits directly above the camera, beside notifications. */
-.connection-toolbar{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px;margin:0 0 12px;align-items:start}
-#connection-notices{grid-column:span 2;min-width:0}
-#connection-notices .service-status{margin:0 0 4px;padding:8px 10px;min-height:0;font-size:11px}
-#connection-notices .service-status h2{font-size:12px}
-#connection-notices .banner{margin:4px 0 0;padding:7px 10px;font-size:11px}
-#connection-notices .service-gait-preflight{margin:4px 0 0;padding:7px 10px;min-height:0;font-size:11px}
-#connection-notices .service-gait-preflight strong{font-size:12px}
-#connection-notices .service-gait-preflight .button{padding:4px 7px;min-height:0;font-size:10px}
+/* Recording controls live in the topbar; SSH shares the health-card tracks. */
+.top-actions #last-update{font-size:12px;white-space:nowrap;font-variant-numeric:tabular-nums;min-width:8ch}
+.page-heading{display:grid;grid-template-columns:repeat(var(--health-columns),minmax(0,1fr));column-gap:var(--health-gap);align-items:start}
+.page-heading>:first-child{grid-column:1/-3;min-width:0}
+.page-heading .heading-actions{display:block;grid-column:-3/-1;min-width:0;margin-top:0}
+.heading-actions .ssh-form{width:100%;max-width:none}
+@media(min-width:2400px){.page-heading>:first-child{grid-column:1/-2}.page-heading .heading-actions{grid-column:-2/-1}}
+@media(max-width:1100px){.page-heading>:first-child,.page-heading .heading-actions{grid-column:1/-1}}
+@media(max-width:800px){.topbar{height:auto;min-height:54px;flex-wrap:wrap;gap:8px;padding-block:10px}.topbar .breadcrumb{width:100%}.top-actions{width:100%;justify-content:flex-end;flex-wrap:wrap}.top-actions #last-update{margin-right:auto}}
+#connection-notices{min-width:0;margin-bottom:12px}
+#connection-notices:has(>.banner[hidden]){margin-bottom:0}
+.ssh-status-row #connection-banner{margin:0;padding:0;border:0;background:none;font-size:10px;line-height:1.4;color:var(--muted)}
+.ssh-status-row #connection-banner.warning{color:var(--warm)}
+.ssh-status-row #connection-banner.error{color:var(--red)}
 .ssh-form{display:grid;grid-template-columns:minmax(95px,1.3fr) minmax(90px,1fr) auto auto;gap:6px;align-items:end;padding:9px 10px;border:1px solid var(--line);border-radius:8px;background:var(--panel);min-width:0}
 .ssh-form label{font-size:11px;color:var(--muted);min-width:0}
 .ssh-form input{display:block;width:100%;min-width:0;padding:6px 7px;font-size:11px;margin-top:3px}
 .ssh-form>.button{padding:6px 8px;font-size:11px;min-height:30px}
 .ssh-status-row{grid-column:1/-1;display:flex;align-items:center;flex-wrap:wrap;gap:3px 8px;color:var(--muted);font-size:10px;line-height:1.4;overflow-wrap:anywhere}
 .ssh-status-row .text-button{margin-left:auto;white-space:nowrap;font-size:10px;padding:0}
-@media(max-width:1300px){.connection-toolbar{grid-template-columns:minmax(0,1fr) minmax(350px,1fr)}#connection-notices{grid-column:auto}}
-@media(max-width:800px){.connection-toolbar{grid-template-columns:minmax(0,1fr)}.ssh-form{grid-template-columns:minmax(95px,1.3fr) minmax(90px,1fr) auto auto}}
+@media(max-width:500px){.ssh-form{grid-template-columns:minmax(0,1.3fr) minmax(0,1fr)}}
+
+#control-panel .model-slot{display:block;font-size:10px;padding:5px 7px;border:1px solid #384146;border-radius:6px;background:#1b2223;color:#8b9698;max-width:240px}
+#control-panel .model-slot.configured{color:#c7ec9b;border-color:#536b47}
+#control-panel .model-slot strong{font-weight:500}
+#control-panel .model-slot-name{display:block;color:#8b9698;overflow-wrap:anywhere}
+
+/* V159: GitHub link in the existing topbar; no control layout or IDs changed. */
+.top-actions .github-source-link{display:inline-flex;align-items:center;justify-content:center;min-height:30px;padding:5px 12px;border:1px solid #7fab54;border-radius:7px;background:#27391e;color:#d9ffa3;font-size:12px;font-weight:700;white-space:nowrap;line-height:1.35;text-decoration:none;flex-shrink:0}
+.top-actions .github-source-link:hover,.top-actions .github-source-link:focus-visible{background:#365126;border-color:#c1f577;color:#f0ffda;box-shadow:0 0 0 1px #c1f57744}
+@media(max-width:1100px){.topbar{height:auto;min-height:54px;flex-wrap:wrap;gap:5px;padding-block:8px}.top-actions{flex-wrap:wrap;justify-content:flex-end;gap:6px}}
+
+/* Models and live parameters share one column opposite the key reference. */
+#control-panel .pad-configuration-column{align-items:stretch}
+#control-panel .pad-model-parameters{display:flex;flex-direction:column;gap:8px;min-width:0}
+#control-panel .pad-model-parameters .runtime-parameters{flex:1;margin:0}
+#control-panel .pad-model-parameters .service-management{padding:0;display:block}
+#control-panel .pad-model-parameters .model-status-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px}
+#control-panel .pad-model-parameters .model-slot{max-width:none;min-width:0}
+#control-panel .pad-help{height:auto}
+@media(max-width:650px){#control-panel .pad-configuration-column{grid-template-columns:1fr}}

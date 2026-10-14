@@ -7,8 +7,8 @@ Project: [kissqy / Microduck-kissqy](https://github.com/kissqy/Microduck-kissqy)
 ## Published content
 
 - `public-image-r1` Release: `microduck-zero3w-0.15.1-R1.img.xz` public system image.
-- Root `release-assets/`: `Microduck-Console-R17-V164.zip` and `Microduck-Training-Studio-R1.5.27.zip`.
-- `microduck-hd1910/firmware/`: control.40 source; `console/` contains V164 console source.
+- Root `release-assets/`: `Microduck-Console-R17-V167.zip` and `Microduck-Training-Studio-R1.5.27.zip`.
+- `microduck-hd1910/firmware/`: control.43 source; `console/` contains V167 console source.
 - `microduck-hd1910/training-console/`: R1.5.27 source.
 
 The homepage ZIP links download repository files directly and do not depend on separate Release attachments. Current source lives on `main`; the old image tag's automatic Source code attachments do not follow updates to `main`.

@@ -44,11 +44,13 @@ function renderTaskVariants(){
  taskVariantsStamp=stamp;
  const all=p.variants.map(id=>taskCatalog.tasks.find(t=>t.id===id));
  const terrains=[...new Set(all.map(t=>t.terrain))];
- $('task-terrain').innerHTML=terrains.map(t=>`<option value="${t}">${t==='Rough'?'粗糙地形 / Rough':'平地 / Flat'}</option>`).join('');$('task-terrain').value=info.terrain;
+ $('task-terrain').innerHTML=terrains.map(t=>`<option value="${t}">${t==='Rough'?'粗糙地形 / Rough':t==='Slope'?'下坡地形 / Slope':'平地 / Flat'}</option>`).join('');$('task-terrain').value=info.terrain;
  const plays=[...new Set(all.filter(t=>t.terrain===info.terrain).map(t=>t.backlash))];
  $('task-backlash').innerHTML=plays.map(v=>`<option value="${v?'on':'off'}">${v?'±1° · 总间隙2° / Backlash':'不模拟齿隙 / No backlash'}</option>`).join('');$('task-backlash').value=info.backlash?'on':'off';
  $('task-terrain').disabled=resume||terrains.length===1;$('task-backlash').disabled=resume||plays.length===1;
- $('task-physics-note').textContent=info.backlash?'14个关节 · 电机角＋齿隙角作为编码器反馈 · 训练、仿真和导出一致':info.role==='roulade'?'官方前滚翻当前仅有平地普通版本。':info.hardware==='rollers'?'滑轮模型：需安装滑轮。官方成品运行动作系数0.8；新训练按页面动作系数执行。':'沿用所选官方动作配方；训练、仿真和导出记录实际配置。';
+ const notes=[info.hardware==='rollers'?'需要滑轮硬件，不能按普通脚掌部署。':'',info.terrain==='Slope'?'实际为带坡角课程的下坡地形，任务ID中的Flat是上游旧命名。':'',info.backlash?'14个驱动关节各有±1°串联齿隙，编码器读取电机角＋齿隙角。':['roulade','roller_stand','spin'].includes(info.role)?'官方没有注册此动作的齿隙版本。':'当前选择不模拟齿隙，可在支持的动作中切换。','新训练默认P=5、动作系数=1，接触面与舵机内部摩擦分别核对。'];
+ if(info.deployment_note)notes.push(info.deployment_note);
+ $('task-physics-note').textContent=notes.filter(Boolean).join(' ');
 }
 async function changeTaskVariant(){
  if(window.workflowBusy){renderTaskVariants();return;}

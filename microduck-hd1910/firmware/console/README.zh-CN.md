@@ -1,15 +1,15 @@
 **简体中文** | [English](USER-GUIDE.en.md)
 
-# Microduck R17 V164 / control.40 使用说明
+# Microduck R17 V167 / control.43 使用说明
 
-当前中控版本为 `1.0.164`，随包机器人固件为 `1fa8438-feetech-ft6-control.40`，配套官方系统为 `0.15.1`。实体手柄使用原生 padd → robotd 通道，可控制行走和滑轮模型；四个滑轮 ONNX 随固件安装。
+当前中控版本为 `1.0.167`，随包机器人固件为 `1fa8438-feetech-ft6-control.43`，配套官方系统为 `0.15.1`。实体手柄使用原生 padd → robotd 通道，可控制行走和滑轮模型；四个滑轮 ONNX 随固件安装。
 
 开源地址：[Microduck-kissqy](https://github.com/kissqy/Microduck-kissqy)。网页顶部和 Windows 启动窗口均提供入口。
 
 ## 启动与安装
 
-1. 完整解压 `Microduck-Console-R17-V164.zip`。Windows 运行 `start.cmd`，macOS 运行 `start.command`；Linux 可执行 `python3 console.py --dashboard --feetech --open`。
-2. 在网页连接 Zero 的 SSH，核对中控 `1.0.164` 和机器人实际运行 `control.40`。Zero 已安装 `control.40` 时只需更换电脑上的中控目录；首次安装可通过“系统维护 → 随包固件”安装。
+1. 完整解压 `Microduck-Console-R17-V167.zip`。Windows 运行 `start.cmd`，macOS 运行 `start.command`；Linux 可执行 `python3 console.py --dashboard --feetech --open`。
+2. 在网页连接 Zero 的 SSH，核对中控 `1.0.167` 和机器人实际运行 `control.43`。Zero 已安装 `control.43` 时只需更换电脑上的中控目录；首次安装可通过“系统维护 → 随包固件”安装。
 3. 等待 robotd 启动 1/4～4/4 全部成功，再确认实时反馈与实体手柄连接。连接成功本身不触发运动。
 4. 如服务显示 `commissioning`，点击“切到运动模式”，等待四步启动完成。标定模式不加载运动策略。
 

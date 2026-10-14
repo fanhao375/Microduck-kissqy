@@ -2,6 +2,8 @@
 
 # IMU build timeline
 
+🎬 **[Watch the complete IMU build (Bilibili)](https://www.bilibili.com/video/BV1qapz6PERs/)**
+
 All dates below are in 2026. The process first established independent IMU hardware and real pose readings, then connected it to the bus. After the original Dynamixel version worked, the same hardware was adapted for Feetech.
 
 **Current status, confirmed October 12, 2026: validated through extended use in the complete robot; operating normally with no identified issues.**

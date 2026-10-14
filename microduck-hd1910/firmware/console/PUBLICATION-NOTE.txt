@@ -1,14 +1,7 @@
-中文：PUBLICATION-NOTE.txt
-English: https://github.com/kissqy/Microduck-kissqy/blob/main/microduck-hd1910/firmware/console/PUBLICATION-NOTE.en.md
+Microduck R17 V167 / control.43
 
-Microduck 机器人中控 R17 V164
+更新：修复鸭身抖动的问题。
 
-本目录程序源码来自 Microduck-Console-R17-V164.zip。
-随包机器人固件为 1fa8438-feetech-ft6-control.40，由 V163 编译，V164 沿用。
-固件源码位于上一级目录，训练中控源码位于 ../../training-console/。
-使用说明见 README.zh-CN.md；固件编译说明见 ../../docs/BUILD.md。
+当前固件：1fa8438-feetech-ft6-control.43。完整中控 ZIP 与独立固件按交付包原样提供。系统镜像 R1 仍预装 control.40，需通过 V167 中控安装随包固件升级。
 
-运行 ZIP 的下载入口见 GitHub 项目首页：
-https://github.com/kissqy/Microduck-kissqy
-
-本目录补入作者原创中控的现有 LICENSE；第三方内容保留原许可证。
+源码整理：重复二进制由 prepare-V167.py 校验并恢复，详见 ../BUILDING-V167.md。

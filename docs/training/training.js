@@ -11,9 +11,22 @@ let frameJob=null,frameDetach=null;
 let renderedTasks='',renderedModels='',renderedRuns='',renderedPresets='',renderedSchema='',renderedCompare='';
 const rewardDrafts={};
 const actionScaleDrafts={};
-let firmwarePDraft=3; // Nearest writable HD1910 P to the theoretical 2.69.
+let firmwarePDraft=5;
 const rewardNames={"track_linear_velocity": "平移速度跟踪", "track_angular_velocity": "转向速度跟踪", "upright": "保持直立", "pose": "关节姿态约束", "body_ang_vel": "抑制机身晃动", "angular_momentum": "抑制角动量", "dof_pos_limits": "避免关节越界", "action_rate_l2": "动作连续性", "air_time": "抬脚节奏", "foot_clearance": "脚离地间隙", "foot_swing_height": "摆动脚高度", "foot_slip": "避免打滑", "self_collisions": "避免自碰撞", "head_pose_tracking": "头部跟随", "body_pose_tracking": "身体姿态跟随", "head_pose_bias": "抑制头部长期偏差", "expert_bc": "双教师模仿损失", "stand_height": "站立高度", "head_height": "头部高度", "orientation": "机身朝向", "joint_pos": "关节姿态", "feet_air_time": "足部腾空时间", "termination": "回合终止", "stand_still": "静止站立", "tracking_lin_vel": "线速度跟踪", "tracking_ang_vel": "角速度跟踪", "joint_torques": "关节扭矩", "joint_acc": "关节加速度", "feet_slip": "足部打滑", "roulade_progress": "翻滚进度", "roulade_overspeed": "翻滚超速惩罚", "roulade_head_pivot": "翻滚头部支点", "roulade_landing_composite": "翻滚落地综合表现", "roulade_upright_after_roll": "翻滚后恢复直立", "roulade_height_after_roll": "翻滚后恢复高度", "roulade_landing_sharp": "翻滚精确落地", "roulade_stand_tax": "翻滚中的站立惩罚", "roulade_rise_velocity": "翻滚起身速度", "roulade_sagittal": "翻滚偏离矢状面惩罚", "roulade_lateral_vel": "翻滚侧向速度惩罚", "roulade_flatness": "翻滚平躺惩罚", "joint_torque_rate_l2": "扭矩变化惩罚", "arrival_damping": "达到高度后抑制晃动", "gentle_landing": "落地冲击惩罚", "ball_forward_velocity": "球向前运动", "ball_speed_overshoot": "球速超调惩罚", "support_foot_grounded": "支撑脚着地", "pose_stand_legs": "站立腿部姿态", "pose_stand_neck": "站立颈部姿态", "height_stand": "站立目标高度", "crouch_glide_pose": "下蹲滑行姿态", "crouch_glide_pose_l1": "下蹲滑行姿态偏差", "forward_speed": "前向速度", "crouch_forward_lean": "下蹲前倾", "feet_flat": "脚掌平放偏差", "neck_action_rate_l2": "颈部动作变化惩罚", "joint_torques_l2": "关节扭矩惩罚", "pose_stand_l1": "站姿偏差惩罚", "height_stand_sharp": "精确站立高度", "height_stand_l1": "站立高度偏差", "com_upward_velocity": "重心向上速度", "gentle_rise": "起身冲击惩罚", "upright_linear": "机身直立程度", "upright_sharp": "精确直立姿态", "standing_composite": "站立综合表现", "posture_pose_legs": "目标腿部姿态", "posture_pose_l1": "目标姿态偏差", "posture_height": "目标姿态高度", "posture_height_sharp": "精确姿态高度", "posture_height_l1": "姿态高度偏差", "rise_bootstrap": "起身动作引导", "descent_speed": "下降速度惩罚", "rise_speed": "上升速度惩罚", "gentle_motion": "垂直冲击惩罚", "upright_while_tall": "高位保持直立", "posture_stillness": "姿态静止程度", "posture_composite": "姿态综合表现", "com_height_target": "重心目标高度", "neck_joint_pos_l2": "颈部关节位置惩罚", "action_over_limit": "动作越界惩罚", "hip_roll_neutral": "髋侧倾中立偏差", "wheel_speed": "轮子速度", "braking": "制动表现", "skating_air_time": "轮滑腾空节奏", "glide": "滑行表现", "single_support": "单脚支撑", "gait_symmetry": "步态不对称惩罚", "forward_lean": "机身前倾", "heading_hold": "保持航向", "leg_symmetry": "双腿对称", "grounded": "着地状态", "heading_tracking": "目标航向跟踪", "mouth_ground_proximity": "鸭嘴接近地面", "mouth_perpendicular_to_ground": "鸭嘴垂直地面", "ground_pick_return_pose_legs": "拾取后腿部姿态恢复", "ground_pick_return_pose_neck": "拾取后颈部姿态恢复", "return_upright": "拾取后恢复直立", "neck_vel_descent": "下降阶段颈部速度惩罚", "mouth_payload_force": "鸭嘴负载力", "feet_grounded": "双脚着地", "head_impact_penalty": "头部碰撞惩罚", "upright_progress": "直立恢复进度", "height_progress": "高度恢复进度", "fallen_tax": "倒地状态惩罚", "recovery_success": "成功恢复站立", "spin_rate_track": "旋转速度跟踪", "spin_rate_l1": "旋转速度偏差", "spin_stay_in_place": "保持原地旋转", "spin_wheel_differential": "旋转轮速差", "leg_antisymmetry": "双腿反向对称", "spin_grounded": "旋转时保持着地", "alive": "回合存活", "wheel_glide": "轮子滑行"};
 const rewardTitle=name=>`<strong>${esc(rewardNames[name]||"任务奖励")}</strong><small lang="en">${esc(name)}</small>`;
+const OFFICIAL_ROLLER_REFERENCES={
+  roller:[['轮滑行走 · roller.onnx','https://huggingface.co/pollen-robotics/microduck-policies/blob/main/roller.onnx','官方已训练 XL330 ONNX，运行倍率 0.8；无本任务可直接续训的官方 PPO .pt。'],['2 米轮滑冲刺 · 独立挑战','https://huggingface.co/pollen-robotics/microduck-roller-sprint-2m-reference','独立 RollerSprint2m 训练任务；其 checkpoint.pt 不能直接作为当前轮滑行走续训权重。']],
+  crouch:[['轮滑蹲下 · roller_crouch.onnx','https://huggingface.co/pollen-robotics/microduck-policies/blob/main/roller_crouch.onnx','官方已训练 XL330 ONNX，运行倍率 0.8、5 秒相位周期；无本任务可直接续训的 PPO .pt。']],
+};
+function renderOfficialPolicyReferences(){
+  const item=taskCatalog.tasks.find(t=>t.id===$('task').value), panel=$('official-policy-references'),box=$('official-reference-detail');
+  if(!panel||!box)return;
+  const data=OFFICIAL_ROLLER_REFERENCES[item?.role]||[];
+  panel.hidden=!data.length;
+  if(data.length){
+    box.innerHTML=data.map(([label,url,note])=>'<p><a href="'+esc(url)+'" target="_blank" rel="noopener noreferrer">'+esc(label)+' ↗</a><br>'+esc(note)+'</p>').join('')+'<p>训练时动作系数 1.0 与发布成品推理倍率 0.8 分开保存；参考权重不会自动载入或覆盖自训检查点。</p>';
+  }
+}
 const describeAttempts=new Set();
 const taskReferences=new Map(), referenceLoads=new Map();
 function taskSchema(task=$('task').value){return state?.environment?.configs?.[task]||taskReferences.get(task);}
@@ -22,7 +35,7 @@ async function loadTaskReference(task=$('task').value){
   const pending=(async()=>{
     try{
       const response=await fetch('/api/task-reference?task='+encodeURIComponent(task));
-      if(!response.ok)throw Error('读取随包官方配置失败。');
+      if(!response.ok)throw Error('读取随包任务配置失败。');
       taskReferences.set(task,await response.json());
       if($('task').value===task){renderTaskConfig(true);renderCurriculum();if(studioData)renderConfigTable();window.renderContactSettings?.();}
     }catch(error){tell(error.message);}finally{referenceLoads.delete(task);}
@@ -31,15 +44,12 @@ async function loadTaskReference(task=$('task').value){
 }
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const active=j=>['starting','running','stopping'].includes(j.status);
-const isViewer=j=>['preview','play','onnx'].includes(j.op);
+const isTargetLimitComparison=j=>!!j?.request?.target_limit_comparison;
+const isViewer=j=>['preview','play','onnx'].includes(j.op)&&!isTargetLimitComparison(j);
 const finite=v=>typeof v==='number'&&Number.isFinite(v);
 const fmt=v=>finite(v)?Number(v.toFixed(4)).toLocaleString('zh-CN'):'—';
 const stamp=t=>finite(t)?new Date(t*1000).toLocaleString('zh-CN',{hour12:false}):'—';
 const runName=j=>j?.request?.label|| (j?((taskCatalog.tasks.find(t=>t.id===(j.resolved_task||j.request?.task))?.name||'训练')+' · '+stamp(j.created)):'尚未选择');
-function recoverySelection(pick){
-  const job=state?.jobs.find(j=>j.id===(pick.export_job||pick.source_job));
-  return !!taskCatalog.tasks.find(t=>t.id===(job?.resolved_task||job?.request?.task)&&t.role==='stand');
-}
 const seconds=v=>finite(v)?`${Math.floor(v/3600)}h ${Math.floor(v%3600/60)}m ${Math.floor(v%60)}s`:'—';
 const metric=j=>j?.metrics?.at(-1)||j?.latest_metric;
 function tell(message){$('toast').textContent=message;$('toast').hidden=false;clearTimeout(tell.timer);tell.timer=setTimeout(()=>$('toast').hidden=true,6500);}
@@ -161,6 +171,7 @@ function renderComparison(){
 }
 function renderTaskConfig(force=false){
   const task=$('task').value,schema=taskSchema(task),key=JSON.stringify([task,schema]);
+  $('task-config-refresh').textContent='读取官方默认参数';
   if(!schema)loadTaskReference(task);
   if(!force&&key===renderedSchema)return;renderedSchema=key;
   for(const [name,id] of numericFields)$(id).placeholder=schema&&finite(schema[name])?'默认 '+schema[name]:'官方默认';
@@ -298,6 +309,7 @@ function renderCurriculum(){
   }).join(''):'<tr><td colspan="4">'+(full?'此任务没有上述起始姿态分阶段课程。':'尚未收到该任务的课程配置；无需因此执行环境检查。')+'</td></tr>';
   renderOtherCurricula(full,sample,running,!!plan,alignment);
 }
+
 function renderResources(){
   const res=state.resources,stale=!online||!res?.received||Date.now()/1000-res.received>10,gpu=res?.devices?.[0];
   $('gpu-live').textContent='GPU 占用 '+(finite(gpu?.utilization)?fmt(gpu.utilization)+'%':'—');
@@ -388,15 +400,27 @@ function renderTrainingLive(){
 }
 function simFresh(){const j=viewer();return online&&j?.status==='running'&&j.sim_state&&Date.now()/1000-j.sim_state.received<2;}
 function driveReady(){const j=viewer();return viewerStop?.id!==j?.id&&simFresh()&&j?.sim_controls?.movement&&!j.sim_state.paused&&!j.sim_state.error;}
+function isRollerViewer(){
+  const j=viewer();return !!j&&taskCatalog.tasks.find(t=>t.id===(j?.resolved_task||j?.request?.task))?.role==='roller';
+}
 function renderSimTelemetry(){
   const j=viewer(),fresh=simFresh()&&viewerStop?.id!==j?.id,data=fresh?j.sim_state:null,available=!!(fresh&&j.sim_controls),canMove=!!driveReady();
-  document.querySelectorAll('[data-direction]').forEach(b=>b.disabled=!canMove);$('sim-zero').disabled=!available;
+  const roller=isRollerViewer();
+  document.querySelectorAll('[data-direction]').forEach(b=>b.disabled=!canMove||(roller&&['left','right','turn_left','turn_right'].includes(b.dataset.direction)));$('sim-zero').disabled=!available;
   $('sim-pause').disabled=!available;$('sim-reset').disabled=!available;$('sim-pause').textContent=data?.paused?'继续仿真':'暂停仿真';
-  $('drive-status').textContent=!j?'加载行走策略后启用遥控。':!fresh?'等待仿真实时反馈…':data.error||(!j.sim_controls?.movement?'该任务可暂停与重置，未启用行走遥控。':data.paused?'仿真已暂停。':'按住方向键移动，松开后目标速度归零。');
+  $('drive-status').textContent=!j?'加载行走策略后启用遥控。':!fresh?'等待仿真实时反馈…':data.error||(data.paused?'仿真已暂停。':!j.sim_controls?.movement?'该任务可暂停与重置，未启用行走遥控。':roller?'W 推进，S 制动；松开按键滑行；左右移和转向禁用。':'按住方向键移动，松开后目标速度归零。');
   const vector=v=>Array.isArray(v)?v.map(x=>finite(x)?x.toFixed(2):'—').join(' / '):'— / — / —';
   $('sim-command').textContent=vector(data?.command);$('sim-actual').textContent=vector(data?.actual);
   $('sim-tilt').textContent=data?`${fmt(data.roll)}° / ${fmt(data.pitch)}°`:'— / —';
+  $('sim-command-label').textContent=roller?'仿真收到 · 推进 / 横移 / 转向':'仿真收到 · 前 / 左 / 转';
+  $('sim-command-unit').textContent=roller?'推进控制量 · 固定 0 · 固定 0':'m/s · m/s · rad/s';
+  $('sim-outcome-label').textContent='连续直立 / 非超时结束';
+  $('sim-outcome-note').textContent='倾角 <45° · 重置清零';
   $('sim-outcome').textContent=data?`${fmt(data.upright_seconds)} s / ${fmt(data.terminations)} 次`:'— / —';
+  const forward=document.querySelector?.('[data-direction="forward"] small'),back=document.querySelector?.('[data-direction="back"] small');
+  if(forward)forward.textContent=roller?'推进 W':'前进 W';
+  if(back)back.textContent=roller?'制动 S':'后退 S';
+  $('drive-guide').textContent=roller?'轮滑模式：W 推进，S 制动；松开滑行。左右移和转向在官方直线轮滑任务中禁用。':'按住屏幕箭头，或点击遥控区后用 ↑ ↓ ← → / WASD 移动，QE 转向；松开归零，空格停止移动。';
   $('sim-performance').hidden=!data;$('sim-performance').textContent=data?`仿真循环 ${fmt(data.loop_fps)} FPS · 物理时间 ${fmt(data.sim_seconds)} s`:'';
   if(!canMove&&held.size)clearMotion();
   renderDriveFeedback();
@@ -405,12 +429,12 @@ function keyboardReady(){return $('sim-drive').contains(document.activeElement)&
 function renderDriveFeedback(){
   const ready=!!driveReady(),focused=keyboardReady(),data=simFresh()?viewer().sim_state:null;
   const ranges=driveRanges();
-  $('drive-speed-note').textContent=`任务指令范围：前后 ${Math.max(...ranges[0].map(Math.abs)).toFixed(2)} m/s · 左右 ${Math.max(...ranges[1].map(Math.abs)).toFixed(2)} m/s · 转向 ${Math.max(...ranges[2].map(Math.abs)).toFixed(2)} rad/s`;
+  $('drive-speed-note').textContent=isRollerViewer()?`轮滑控制量：制动 ${ranges[0][0].toFixed(2)} · 滑行 0 · 推进 +${ranges[0][1].toFixed(2)}；不是 m/s。左右移/转向固定 0。`:`任务指令范围：前后 ${Math.max(...ranges[0].map(Math.abs)).toFixed(2)} m/s · 左右 ${Math.max(...ranges[1].map(Math.abs)).toFixed(2)} m/s · 转向 ${Math.max(...ranges[2].map(Math.abs)).toFixed(2)} rad/s`;
   const feedback=$('drive-feedback'),requested=movement(),moving=requested.some(x=>x!==0),command=data?.command;
   const values=requested.map(x=>x.toFixed(2)).join(' / ');
   const received=ready&&moving&&Array.isArray(command)&&command.every((v,i)=>finite(v)&&Math.abs(v-requested[i])<.001);
   const info=data?.control,ownAck=info?.client===clientId&&info.sequence>=moveSequence;
-  let message=!ready?'等待可用的仿真控制连接。':moving?received?'仿真已收到；看实际速度和动作判断策略表现。':ownAck&&info.expired?'上一条指令已过期，正在发送最新按键状态。':controlError||'等待仿真收到指令；未收到不能归因于训练轮数。':Array.isArray(command)&&command.some(x=>Math.abs(x)>.001)?'正在等待仿真目标归零…':'未按住方向 · 目标归零，策略仍在运行。';
+  let message=!ready?'等待可用的仿真控制连接。':moving?received?'仿真已收到；看实际速度和动作判断策略表现。':ownAck&&info.expired?'上一条指令已过期，正在发送最新按键状态。':controlError||'等待仿真收到指令；未收到不能归因于训练轮数。':Array.isArray(command)&&command.some(x=>Math.abs(x)>.001)?'正在等待仿真目标归零…':isRollerViewer()?'未按住方向 · 推进值为 0，轮子可继续滑行。':'未按住方向 · 目标归零，策略仍在运行。';
   if(controlError&&!moving)message=controlError;
   feedback.textContent=`按键请求 ${values} · ${message}`;
   feedback.dataset.state=received?'received':moving||controlError?'waiting':'idle';
@@ -427,9 +451,8 @@ function render(){
   renderTaskCatalog();
   renderTaskConfig();renderModels();renderComparison();renderResources();
   const picked=chosen('checkpoint');$('delete-model').disabled=!online||(!picked.checkpoint&&!picked.export_job)||jobs.some(j=>j.op==='delete_model'&&active(j));$('play-start').disabled=!online||(!picked.checkpoint&&!picked.export_job)||viewerLaunching||!!play?.wait_for_viewers&&!play?.viewer_url;$('play-start').textContent=viewerLaunching?'正在提交…':play?'切换到所选模型':picked.export_job?'验证 ONNX 模型':'查看所选策略';
-  $('recovery-eval-start').disabled=$('play-start').disabled||!recoverySelection(picked);
-  $('recovery-eval-note').hidden=!recoverySelection(picked);
   $('export-model').disabled=!online||!picked.checkpoint||jobs.some(j=>j.op==='export'&&active(j));$('play-stop').disabled=!play||!online;$('preview-start').disabled=!online||viewerLaunching||!!play?.wait_for_viewers&&!play?.viewer_url;
+  $('preview-start').textContent=taskCatalog.tasks.find(t=>t.id===$('task').value)?.role==='roller'?'查看未训练初始（可能摔倒）':'查看初始模型';
   $('play-stop').disabled=!play||!online||!!viewerStop?.sending||(play?.status==='stopping'&&!viewerStop?.error);
   $('play-stop').textContent=viewerStop?.error?'重试停止仿真':viewerStop||play?.status==='stopping'?'正在停止…':'停止仿真';
   $('training-live').disabled=!online||!liveTrain;
@@ -452,7 +475,7 @@ function render(){
   $('progress-text').textContent=run?`${words[run.status]} · ${p?Math.floor(p.percent)+'%':'等待迭代记录'}${active(run)&&p?.done===p?.total&&p?.total?' · 正在收尾':''}`:'等待训练开始';
   $('run-eta').textContent='预计剩余 '+seconds(p?.eta_seconds)+(finite(p?.eta_seconds)&&active(run)?' · 按最近迭代估算':'');
   const terms=Object.entries(m?.rewards||{});$('reward-terms').innerHTML=terms.length?terms.map(([name,v])=>`<div class="reward-term"><span>${rewardTitle(name)}</span><b>${fmt(v)}</b></div>`).join(''):'<span class="hint">当前日志尚无分项奖励。</span>';
-  renderSimulation();renderPanel('训练课程',renderCurriculum);
+  renderSimulation();renderOfficialPolicyReferences();renderPanel('训练课程',renderCurriculum);
   const history=jobs.filter(j=>j.op==='train'&&!j.history_retired).slice(0,10);
   const listKey=history.map(j=>j.id+':'+j.status).join('|')+'|'+selected;if(listKey!==renderedRuns){$('run-list').innerHTML=history.length?history.map(j=>`<button type="button" data-job="${j.id}" class="${j.id===job?.id?'selected':''}"><span>${kinds[j.op]} · ${words[j.status]||j.status}</span><span>↗</span><small>${esc(j.op==='train'?runName(j):j.request?.source_label||j.request?.task||j.profile.repo)}</small><small>${stamp(j.created)}</small></button>`).join(''):'<p class="empty">尚无运行记录。</p>';renderedRuns=listKey;}
   $('job-message').textContent=job?.message||'等待任务。';$('show-config').textContent=configView?'查看日志':'查看配置';
@@ -482,7 +505,14 @@ async function loadState(){
         if(comparisonIds().length)query.set('compare',comparisonIds().join(','));
         const r=await fetch('/api/state?'+query,{signal:AbortSignal.timeout(4000)});
         if(!r.ok)throw Error('后台无法读取');
-        state=await r.json();online=true;$('connection-error').hidden=true;
+        state=await r.json();
+        if(Array.isArray(state.jobs)){
+          const validTasks=new Set(taskCatalog.tasks.map(task=>task.id));
+          const hiddenIds=new Set(state.jobs.filter(j=>j.op==='train'&&j.request?.task&&!validTasks.has(j.resolved_task||j.request.task)).map(j=>j.id));
+          state.jobs=state.jobs.filter(j=>!hiddenIds.has(j.id)&&!hiddenIds.has(j?.request?.source_job));
+          if(hiddenIds.has(selected))selected=null;
+        }
+        online=true;$('connection-error').hidden=true;
       }catch{
         online=false;$('connection-error').hidden=false;clearMotion();
       }
@@ -517,7 +547,7 @@ async function stopViewer(){
   finally{request.sending=false;render();await loadState();}
 }
 function filterLabel(value){
-  return value?.enabled?`头颈滤波 ${value.head_alpha} / 腿部 ${value.legs_alpha}`:'头腿滤波直通 1.0';
+  return value?.enabled?`头颈滤波 ${value.head_alpha} / 腿部 ${value.legs_alpha}`:'关节目标直通';
 }
 function currentTrainingScale(){
   const source=state?.jobs.find(j=>j.id===chosen('resume').source_job);
@@ -525,7 +555,7 @@ function currentTrainingScale(){
   const info=taskCatalog.tasks.find(t=>t.id===$('task').value);
   if(info?.role==='sitstand')return 1.0; // daemon 0.15.1 pins the sit/rise scale.
   if(finite(actionScaleDrafts[$('task').value]))return actionScaleDrafts[$('task').value];
-  return info?.training_action_scale??(['walk','stand','joint'].includes(info?.role)?0.9:1.0);
+  return info?.training_action_scale??1.0;
 }
 function currentTrainingFirmwareP(){
   const source=state?.jobs.find(j=>j.id===chosen('resume').source_job);
@@ -537,16 +567,14 @@ function currentTrainingFirmwareP(){
   const override=edits.find(p=>p.path?.at(-1)==='kp_fw');
   return override?.value??5; // Preserve historical HD1910 defaults.
 }
-function readActionFilter(){return {enabled:$('action-filter-enabled').checked,head_alpha:Number($('head-filter-alpha').value),legs_alpha:Number($('legs-filter-alpha').value),version:1};}
-function applyActionFilter(value){
-  $('action-filter-enabled').checked=!!value?.enabled;
-  $('head-filter-alpha').value=value?.head_alpha??0.5;
-  $('legs-filter-alpha').value=value?.legs_alpha??0.7;
+function readActionFilter(){
+  const source=state?.jobs.find(j=>j.id===chosen('resume').source_job);
+  const saved=source?.effective_config?.action_filter??source?.request.action_filter;
+  // New jobs have no EMA. Only an actual source record may retain historical filtering.
+  return source&&saved?{enabled:!!saved.enabled,head_alpha:saved.head_alpha??1.0,legs_alpha:saved.legs_alpha??1.0,version:saved.version??1}:{enabled:false,head_alpha:1.0,legs_alpha:1.0,version:1};
 }
 function renderActionFilter(){
   const resuming=!!chosen('resume').checkpoint;
-  $('action-filter-enabled').disabled=resuming;
-  for(const id of ['head-filter-alpha','legs-filter-alpha'])$(id).disabled=resuming||!$('action-filter-enabled').checked;
   const scale=currentTrainingScale(),scaleField=$('training-action-scale');
   if(![...scaleField.options].some(o=>Number(o.value)===scale))scaleField.add(new Option(String(scale),String(scale)));
   scaleField.value=[...scaleField.options].find(o=>Number(o.value)===scale).value;
@@ -555,12 +583,12 @@ function renderActionFilter(){
   if(resuming||document.activeElement!==$('training-firmware-p'))$('training-firmware-p').value=currentTrainingFirmwareP();
   $('training-firmware-p').disabled=resuming;
   $('runtime-alignment').textContent=`舵机 P ${currentTrainingFirmwareP()} · 动作系数 ${currentTrainingScale()} · ${filterLabel(readActionFilter())} · ${resuming?'续训沿用原模型配置':'本次训练配置'}`;
-  $('action-filter-note').textContent=resuming?'续训沿用原模型动作系数与滤波；修改请选新建训练。':fixedScale?'坐站固件分支固定动作系数1.0 · 头腿滤波可调 · 仿真与导出沿用训练记录。':'动作系数作用于相对 Home 的偏移 · 滤波每 50Hz 更新 · 仿真与导出沿用训练记录。';
+  $('action-mapping-note').textContent=resuming?'续训读取原模型的 P、动作系数和历史动作处理；当前默认值不覆盖旧模型。':fixedScale?'坐站固件分支固定动作系数1.0 · 关节目标直通 · 仿真与导出沿用训练记录。':'动作系数作用于相对 Home 的偏移 · 50Hz 关节目标直通 · 仿真与导出沿用训练记录。';
 }
 function readParameters(allowQueue=false){
   const value={task:$('task').value,label:$('run-label').value.trim(),num_envs:Number($('num-envs').value),iterations:Number($('iterations').value),save_interval:1000,training_action_scale:currentTrainingScale(),action_filter:readActionFilter(),activation:$('activation').value||null,pushes:$('training-pushes').value,reward_weights:{...rewardDrafts[$('task').value]},...chosen('resume')};
   value.training_firmware_p=Number(currentTrainingFirmwareP());
-  if(!Number.isInteger(value.training_firmware_p)||value.training_firmware_p<1||value.training_firmware_p>32)throw Error('HD1910舵机P必须是1至32的整数；理论2.69可用最接近的3试训。');
+  if(!Number.isInteger(value.training_firmware_p)||value.training_firmware_p<1||value.training_firmware_p>32)throw Error('HD1910舵机P必须是1至32的整数，默认5。');
   for(const [key,id] of numericFields)value[key]=$(id).value===''?null:Number($(id).value);
   for(const [key,id] of [['actor_dims','actor-dims'],['critic_dims','critic-dims']]){const raw=$(id).value.trim();if(raw&&!/^[\d,，\s]+$/.test(raw))throw Error('隐藏层请输入逗号分隔的整数。');value[key]=raw?raw.split(/[,，\s]+/).filter(Boolean).map(Number):null;}
   if(window.jointTrainingParameters)Object.assign(value,window.jointTrainingParameters(value,allowQueue));
@@ -578,7 +606,6 @@ function applyParameters(p){
   $('task').value=p.task;previousTask=p.task;if(typeof selectTaskEngine==='function')selectTaskEngine();if(studioDraft)configOverridesText=JSON.stringify(studioDraft.task_overrides?.[p.task]||(p.task==='Mjlab-Velocity-Flat-MicroDuck'?studioDraft.overrides:[])||[],null,2);$('run-label').value=p.label||'';$('num-envs').value=p.num_envs??4096;$('iterations').value=p.iterations??50000;
   for(const [key,id] of numericFields)$(id).value=p[key]??'';
   $('actor-dims').value=p.actor_dims?.join(', ')||'';$('critic-dims').value=p.critic_dims?.join(', ')||'';$('activation').value=p.activation||'';$('training-pushes').value=p.pushes||'default';
-  applyActionFilter(p.action_filter);
   if(!chosen('resume').checkpoint&&finite(p.training_action_scale))actionScaleDrafts[p.task]=p.training_action_scale;
   if(!chosen('resume').checkpoint&&finite(p.training_firmware_p))firmwarePDraft=p.training_firmware_p;
   rewardDrafts[p.task]={...p.reward_weights};window.rememberTrainingBudget?.();renderTaskConfig(true);render();return true;
@@ -589,10 +616,15 @@ function applyParameters(p){
 const held=new Set(),clientId=globalThis.crypto?.randomUUID?.()||('browser_'+Math.random().toString(36).slice(2));
 let sequence=0,moveSequence=0,controlSending=false,pendingMove=null,controlActions=[],driveJob=null,controlError='';
 function driveRanges(){
-  // The official walking tasks use these command ranges.
-  // The running adapter publishes its actual ranges when overrides are present.
-  const defaults=[[-.4,.4],[-.3,.3],[-1,1]],live=viewer()?.sim_controls?.velocity_ranges;
-  return defaults.map((fallback,i)=>{const r=live?.[i],limit=[.4,.3,1][i];return Array.isArray(r)&&r.length===2&&r.every(finite)&&r[0]<=0&&r[1]>=0?[Math.max(-limit,r[0]),Math.min(limit,r[1])]:fallback;});
+  // Roller cmd_x: -0.5 brake / 0 coast / +0.6 push; NOT a walking speed.
+  // The roller task trains for straight-line skating, therefore Y and yaw stay 0.
+  const defaults=isRollerViewer()?[[-.5,.6],[0,0],[0,0]]:[[-.4,.4],[-.3,.3],[-1,1]];
+  const live=viewer()?.sim_controls?.velocity_ranges;
+  return defaults.map((fallback,i)=>{
+    const r=live?.[i];
+    return Array.isArray(r)&&r.length===2&&r.every(finite)&&r[0]<=0&&r[1]>=0
+      ?[Math.max(fallback[0],r[0]),Math.min(fallback[1],r[1])]:fallback;
+  });
 }
 function movement(){const ranges=driveRanges();return [['forward','back'],['left','right'],['turn_left','turn_right']].map(([positive,negative],i)=>held.has(positive)===held.has(negative)?0:held.has(positive)?ranges[i][1]:ranges[i][0]);}
 function queueControl(action){const j=viewer();if(!j||!online||!j.sim_controls||viewerStop?.id===j.id)return;const message={job_id:j.id,action,velocity:action==='move'?movement():undefined};if(action==='move'){pendingMove=message;driveJob=j.id;}else{pendingMove=null;controlActions.push(message);controlActions=controlActions.slice(-8);}pumpControl();}
@@ -652,15 +684,13 @@ $('task').onchange=async()=>{
 };
 $('task-config-refresh').onclick=()=>describeTask(true);
 $('reward-fields').oninput=e=>{const name=e.target.dataset.reward;if(!name)return;const draft=rewardDrafts[$('task').value]||=( {} );if(e.target.value==='')delete draft[name];else draft[name]=Number(e.target.value);};
-$('resume').onchange=()=>{const chosenValue=chosen('resume'),source=state?.jobs.find(j=>j.id===chosenValue.source_job);if(source){applyParameters({...source.request,...source.effective_config,label:runName(source)+' · 续训'});}else{applyActionFilter({enabled:true,head_alpha:0.5,legs_alpha:0.7});}render();};
-for(const id of ['action-filter-enabled','head-filter-alpha','legs-filter-alpha'])$(id).oninput=renderActionFilter;
+$('resume').onchange=()=>{const chosenValue=chosen('resume'),source=state?.jobs.find(j=>j.id===chosenValue.source_job);if(source){applyParameters({...source.request,...source.effective_config,label:runName(source)+' · 续训'});}render();};
 $('training-action-scale').onchange=()=>{actionScaleDrafts[$('task').value]=Number($('training-action-scale').value);renderActionFilter();};
 $('training-firmware-p').onchange=()=>{firmwarePDraft=Number($('training-firmware-p').value);renderActionFilter();};
 $('training-firmware-p').oninput=()=>{firmwarePDraft=Number($('training-firmware-p').value);renderActionFilter();};
 $('checkpoint').onchange=render;
 $('preview-start').onclick=async()=>{if(await saveStudio())return startViewer('/api/preview',{task:$('task').value,execution_profile:executionProfileForTask(),eval_pushes:$('eval-pushes').checked,training_action_scale:currentTrainingScale(),training_firmware_p:currentTrainingFirmwareP(),action_filter:readActionFilter()});};
 $('play-start').onclick=()=>{const value=chosen('checkpoint');startViewer(value.export_job?'/api/onnx':'/api/play',{...value,eval_pushes:$('eval-pushes').checked});};
-$('recovery-eval-start').onclick=()=>{const value=chosen('checkpoint');startViewer(value.export_job?'/api/onnx':'/api/play',{...value,recovery_evaluation:true,eval_pushes:false});};
 $('export-model').onclick=()=>action('/api/export',chosen('checkpoint'));
 $('play-stop').onclick=stopViewer;
 $('training-live').onclick=()=>{const j=state.jobs.find(j=>j.op==='train'&&active(j));if(!j)return;clearMotion(false);controlActions=[];$('follow-latest').checked=false;watchedTrainingId=j.id;watchTraining=true;render();};

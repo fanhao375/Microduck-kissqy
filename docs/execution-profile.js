@@ -1,7 +1,7 @@
 const finite=value=>typeof value==='number'&&Number.isFinite(value);
 const fmt=value=>finite(value)?value.toFixed(2):'—';
 
-// Catalog/loaded metadata describes the model's fixed output mapping. Current
+// Catalog/loaded metadata describes the model's saved output mapping. Current
 // scale and filter readback still come from the daemon's existing live fields.
 export function jointExecutionProfile(model){
   const profile=model?.runtime_execution_profile??model?.execution_profile;

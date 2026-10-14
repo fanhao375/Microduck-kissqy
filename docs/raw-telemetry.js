@@ -1,7 +1,7 @@
-import {supportsFeature} from './service-builds.js';
-import {deriveKinematics} from './raw-kinematics.js';
+import {supportsFeature} from './service-builds.js?demo=20261013';
+import {deriveKinematics} from './raw-kinematics.js?demo=20261013';
 
-const TTL={state:1.5,health:5,tof:2,system:7,capabilities:20,bus:1.5,calibration:Infinity};
+const TTL={state:1.5,health:5,tof:2,system:7,capabilities:20,bus:1.5,calibration:Infinity,startup:Infinity};
 const finite=v=>typeof v==='number'&&Number.isFinite(v);
 const number=v=>finite(v)?v:null;
 const counter=v=>finite(v)||(typeof v==='string'&&/^[0-9]+$/.test(v));
@@ -104,7 +104,12 @@ export class TelemetryStore{
     this.aux={...this.aux,connection_paused:true,connection:{...this.aux.connection,active:false,connected:false}};
   }
   ingest(event){
-    const channel=event?.channel,c=this.channels[channel];if(!c)return;
+    const channel=event?.channel;
+    if(channel==='robotd_stream'){
+      for(const name of Object.keys(TTL)){if(name==='tof'||name==='startup'&&event.data?.preserve_startup)continue;delete this.data[name];Object.assign(this.channels[name],{status:'waiting',at:null,error:'',seq:0});}
+      this.base={};this.model=null;this.kinematics=null;this.busSampleKey=this.busSampleAt=null;return;
+    }
+    const c=this.channels[channel];if(!c)return;
     const previous=[c.status,c.error].join('\0'),now=this.clock(),data=event.data;
     if(channel==='tof'&&!own(event,'error')&&object(data?.subscription)){
       const first=!this.data.tof?.subscription;this.data.tof={...this.data.tof,subscription:copy(data.subscription)};
@@ -170,7 +175,7 @@ export class TelemetryStore{
       }
     }
     const imu={gravity,roll_deg:roll,pitch_deg:pitch,gyro:vector(rawImu.gyro,3),quat:vector(rawImu.quat,4),source:Object.keys(rawImu).length?'robot.state.diagnostics':'robot.state.safety.gravity',health:get(health,'imu'),status:imuStatus,reason:imuReason,ready:get(rawImu,'ready'),sequence:get(rawImu,'sequence'),age_ms:get(rawImu,'age_ms')};
-    const result={schema:'microduck-console/v1',service_operation:!!this.aux.service_operation,connection_paused:!!this.aux.connection_paused,version:this.config.version,baseline:this.config.baseline,mode:this.config.mode,read_only:!this.config.control_enabled,at:this.wall(),uptime:now-this.started,channels,state,health,imu,capabilities:copy(this.data.capabilities||{}),tof:copy(this.data.tof||{}),servos,system:copy(this.data.system||{}),events:copy(this.events),extended:extension.schema==='microduck-observer/v1',pose_calibrated:true};
+    const result={schema:'microduck-console/v1',service_operation:!!this.aux.service_operation,connection_paused:!!this.aux.connection_paused,version:this.config.version,baseline:this.config.baseline,mode:this.config.mode,read_only:!this.config.control_enabled,at:this.wall(),uptime:now-this.started,channels,state,health,imu,startup:copy(this.data.startup||{}),capabilities:copy(this.data.capabilities||{}),tof:copy(this.data.tof||{}),servos,system:copy(this.data.system||{}),events:copy(this.events),extended:extension.schema==='microduck-observer/v1',pose_calibrated:true};
     if(this.config.mode==='service')adaptService(result,copy(this.data.bus||{}),copy(this.data.calibration||{}),this.busSampleAt===null?null:(now-this.busSampleAt)*1000);
     const bus=result.bus||{},loop=this.config.mode==='service'&&bus.mode==='motion'&&counter(bus.cycle)&&channels.bus.status==='live';
     if(record&&(this.aux.inspection_active||loop||this.aux.gait_capture)&&now-this.lastRecord>=.095){
