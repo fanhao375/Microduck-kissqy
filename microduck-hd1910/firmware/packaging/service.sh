@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Modified 2026-10 by fanhao375 (microduck-replica): optional servo P/D/torque-limit file and joint filters (servo-parameters, servo-parameters-clear, joint-filters); see IMU-MODULE.md at the repository root.
+# Modified 2026-10 by fanhao375 (microduck-replica): optional servo P/D/torque-limit file and joint filters (servo-parameters, servo-parameters-clear, joint-filters); UDP pad (netpad); see IMU-MODULE.md at the repository root.
 # Manages the existing official service. All motor commands go through robotd's socket.
 set -Eeuo pipefail
 # Root runs installation in a user-owned staging tree; keep it free of root
@@ -87,6 +87,55 @@ write_dropin() {
     systemctl daemon-reload
 }
 
+
+# padd, and the GameSir bridge only where it is enabled, once robotd is back. A robotd that took
+# longer than startup_gate's 60 s leaves padd exited with 78, which systemd does not restart.
+# Nothing disabled is enabled or started here.
+start_input_services() {
+    systemctl start padd.service
+    if [[ $(systemctl is-enabled gamesir-xboxd.service 2>/dev/null || true) == enabled ]]; then
+        systemctl start gamesir-xboxd.service
+    fi
+}
+
+padd_allows_inet() {
+    local families
+    families=$(systemctl show padd.service -p RestrictAddressFamilies --value)
+    if [[ -z $families ]]; then return 0; fi
+    if [[ $families == '~'* ]]; then [[ " ${families#\~} " != *" AF_INET "* ]]; return; fi
+    [[ " $families " == *" AF_INET "* ]]
+}
+
+# Restart padd alone and read what its new process says: "netpad on —" and "driving —" for on,
+# "driving —" without "netpad on —" for off. Up to 10 s; robotd keeps running throughout.
+restart_padd_checked() {
+    local want=$1 port=${2:-} pid log
+    systemctl reset-failed padd.service 2>/dev/null || true
+    systemctl restart padd.service
+    for _ in $(seq 1 40); do
+        sleep 0.25
+        pid=$(systemctl show padd.service -p MainPID --value)
+        [[ -n $pid && $pid != 0 ]] || continue
+        log=$(journalctl -u padd.service _PID="$pid" -o cat --no-pager 2>/dev/null || true)
+        [[ $log == *'driving —'* ]] || continue
+        if [[ $want == on && $log != *'netpad on —'* ]]; then
+            echo "padd 新进程 $pid 没有读 UDP（日志里没有 netpad on —）。" >&2
+            return 1
+        fi
+        if [[ $want == off && $log == *'netpad on —'* ]]; then
+            echo "padd 新进程 $pid 仍在读 UDP。" >&2
+            return 1
+        fi
+        if [[ $want == on && -n $port ]] && command -v ss >/dev/null; then
+            ss -H -ulpn "sport = :$port" | grep -q padd || { echo "UDP 端口 $port 没有被 padd 监听。" >&2; return 1; }
+        fi
+        echo "padd 新进程 $pid 已按 netpad $want 运行。"
+        return 0
+    done
+    echo 'padd 10 秒内没有进入 driving；最近日志：' >&2
+    journalctl -u padd.service -n 20 --no-pager -o cat >&2 || true
+    return 1
+}
 
 verify_servo_loaded() {
     local running
@@ -343,26 +392,30 @@ servo-parameters)
         echo "警告：P=$2 大于 10 或转矩限制=$4 小于 500，超出常用范围；下次 HOME 时扶住或吊起鸭子。" >&2
     fi
     python3 "$install_dir/runtime.py" relax-and-restore
-    systemctl stop robotd.service || { restart_service || true; fail 'robotd 停止失败；已尝试重新启动，未写入。'; }
+    systemctl stop robotd.service || { restart_service || true; start_input_services || true; fail 'robotd 停止失败；已尝试重新启动，未写入。'; }
     if ! python3 "$install_dir/runtime.py" set-servo-parameters "$2" "$3" "$4"; then
         restart_service || true
+        start_input_services || true
         fail '舵机参数写入失败；robotd 已重新启动，原设置未变。'
     fi
     restart_service
     verify_servo_loaded "$servo_json"
+    start_input_services
     echo "舵机参数已应用：P=$2 D=$3 转矩限制=$4；下次 HOME 上力时写入。卸力时 P 恢复原值，D=0、转矩 1000（同 V167）。"
     ;;
 servo-parameters-clear)
     require_installed
     [[ $# -eq 1 ]] || fail '用法：servo-parameters-clear'
     python3 "$install_dir/runtime.py" relax-and-restore
-    systemctl stop robotd.service || { restart_service || true; fail 'robotd 停止失败；已尝试重新启动，未写入。'; }
+    systemctl stop robotd.service || { restart_service || true; start_input_services || true; fail 'robotd 停止失败；已尝试重新启动，未写入。'; }
     if ! python3 "$install_dir/runtime.py" clear-servo-parameters; then
         restart_service || true
+        start_input_services || true
         fail '恢复默认失败；robotd 已重新启动。'
     fi
     restart_service
     verify_servo_loaded none
+    start_input_services
     echo '已恢复默认（未设置）：按 V167 原版，P=合同 5、D=0、转矩 1000。'
     ;;
 joint-filters)
@@ -370,18 +423,43 @@ joint-filters)
     [[ $# -eq 4 ]] || fail '用法：joint-filters 模型标识 头部滤波 腿部滤波'
     python3 "$install_dir/runtime.py" validate-filters "$3" "$4"
     python3 "$install_dir/runtime.py" relax-and-restore
-    systemctl stop robotd.service || { restart_service || true; fail 'robotd 停止失败；已尝试重新启动，未写入。'; }
+    systemctl stop robotd.service || { restart_service || true; start_input_services || true; fail 'robotd 停止失败；已尝试重新启动，未写入。'; }
     if ! python3 "$install_dir/runtime.py" set-joint-filters "$2" "$3" "$4"; then
         restart_service || true
+        start_input_services || true
         fail '滤波写入失败；robotd 已重新启动，原设置未变。'
     fi
     restart_service
     verify_motion_models
+    start_input_services
     echo "头腿滤波已应用：头 $3、腿 $4；重新 HOME 后生效。"
+    ;;
+netpad)
+    require_installed
+    [[ ${2:-} == on || ${2:-} == off ]] || fail '用法：netpad on [端口] [超时毫秒] | netpad off'
+    [[ $2 == off && $# -eq 2 || $2 == on && $# -le 4 ]] || fail '用法：netpad on [端口] [超时毫秒] | netpad off（off 不带参数）'
+    # Both robotd.toml and robotd.saved.toml are checked, each against its own [safety]
+    # deadman_ms, before anything moves.
+    python3 "$install_dir/runtime.py" validate-netpad "${@:2}" >/dev/null
+    if [[ $2 == on ]]; then
+        grep -aq 'netpad on' "$install_dir/padd" || fail '板上的 padd 不认识 [netpad]（不是 microduck-replica 版）；未改动。'
+        padd_allows_inet || fail "padd.service 不允许 AF_INET（$(systemctl show padd.service -p RestrictAddressFamilies --value)）；先用 imu-module-install.sh 安装；未改动。"
+    fi
+    python3 "$install_dir/runtime.py" relax-and-restore
+    netpad_result=$(python3 "$install_dir/runtime.py" set-netpad "${@:2}")
+    netpad_port=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("port") or "")' "$netpad_result")
+    if ! restart_padd_checked "$2" "$netpad_port"; then
+        python3 "$install_dir/runtime.py" restore-netpad || true
+        systemctl restart padd.service || true
+        start_input_services || true
+        fail 'padd 没有按新设置启动；两份 robotd.toml 已从 .previous 恢复并重启 padd。'
+    fi
+    start_input_services
+    python3 -c 'import json,sys; print(json.loads(sys.argv[1])["message"])' "$netpad_result"
     ;;
 
 *)
-    echo '用法：sudo bash service.sh {install|upgrade|status|connection|report|bus ...|enable|disable|init|enable-policy|disable-policy|relax|reconnect|models|power reboot/shutdown|servo-parameters P D 转矩限制|servo-parameters-clear|joint-filters 模型标识 头部滤波 腿部滤波}' >&2
+    echo '用法：sudo bash service.sh {install|upgrade|status|connection|report|bus ...|enable|disable|init|enable-policy|disable-policy|relax|reconnect|models|power reboot/shutdown|servo-parameters P D 转矩限制|servo-parameters-clear|joint-filters 模型标识 头部滤波 腿部滤波|netpad on [端口] [超时毫秒]|netpad off}' >&2
     exit 2
     ;;
 esac

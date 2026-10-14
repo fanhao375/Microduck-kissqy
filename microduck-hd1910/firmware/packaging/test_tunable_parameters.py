@@ -122,7 +122,8 @@ class ServiceScriptTests(unittest.TestCase):
         # Commissioning never reads the file: save only, no readback timeout.
         self.assertIn("if [[ $running == *--commissioning* ]]; then\n        echo '标定模式不读取舵机参数", text)
         self.assertIn('verify_servo_loaded none', text)
-        block = text[text.index('servo-parameters)\n'):text.index('\n*)\n')]
+        # The three tunable commands; netpad) follows them and is tested in test_netpad.py.
+        block = text[text.index('servo-parameters)\n'):text.index('\nnetpad)\n')]
         self.assertIn('verify_servo_loaded "$servo_json"', block)
         self.assertEqual(block.count("systemctl stop robotd.service || { restart_service || true;"), 3)
         # robotd is only stopped after the relax/restore check succeeds.

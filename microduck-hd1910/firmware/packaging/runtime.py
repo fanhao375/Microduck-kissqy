@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; optional servo P/D/torque-limit file and joint filters; see IMU-MODULE.md at the repository root.
+# Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; optional servo P/D/torque-limit file and joint filters; UDP pad ([netpad]); see IMU-MODULE.md at the repository root.
 """HAT deployment helpers. Motor operations use the single robotd IPC owner."""
 from __future__ import annotations
 import hashlib
@@ -422,6 +422,92 @@ def set_joint_filters(ident, head, legs):
     atomic_write(path, text)
     return {'model': ident, 'execution_profile': updated, 'message': '头腿滤波已保存；缩放保持原值。重启后读取新配置。'}
 
+# UDP pad (microduck-replica): [netpad] in robotd.toml and robotd.saved.toml. padd reads it at start;
+# robotd checks it at its own start (robotd-params). Same rules as robotd-params: the types and
+# ranges are checked whatever `enabled` says (strict parse: port u16, timeout_ms u64, enabled bool),
+# and with enabled = true port 1..65535 and 0 < timeout_ms < that file's [safety] deadman_ms (500
+# when unset). Off is never refused and keeps the numbers already there. Each file is checked
+# against its own deadman; both get a .previous copy first so a failed check can put them back.
+NETPAD_DEFAULTS = {'port': 4210, 'timeout_ms': 250}
+NETPAD_DEADMAN_MS = 500
+U64_MAX = 2**64 - 1
+
+def netpad_paths():
+    saved = CONFIG.with_name(CONFIG.stem + '.saved' + CONFIG.suffix)
+    return [CONFIG] + ([saved] if saved.exists() else [])
+
+def netpad_number(text, name, low, high):
+    text = str(text)
+    if not re.fullmatch('[0-9]{1,20}', text) or not low <= int(text) <= high:
+        raise ValueError(f'{name} 必须是 {low} 到 {high} 的整数')
+    return int(text)
+
+def netpad_plan(action, *args):
+    """The [netpad] each file gets for `netpad on [port] [timeout_ms]` / `netpad off`; nothing written."""
+    if action not in ('on', 'off'): raise ValueError('用法：netpad on [端口] [超时毫秒] 或 netpad off')
+    if action == 'off' and args: raise ValueError('netpad off 不带参数（保留文件里已有的端口和超时）')
+    if len(args) > 2: raise ValueError('用法：netpad on [端口] [超时毫秒]')
+    port = netpad_number(args[0], '端口', 1, 65535) if args else None
+    timeout = netpad_number(args[1], 'timeout_ms', 1, U64_MAX) if len(args) > 1 else None
+    plans = []
+    for path in netpad_paths():
+        data = tomllib.loads(path.read_text())
+        section = data.get('netpad', {})
+        if not isinstance(section, dict): raise ValueError(f'{path.name}: netpad 不是一节')
+        safety = data.get('safety', {})
+        deadman = safety.get('deadman_ms', NETPAD_DEADMAN_MS) if isinstance(safety, dict) else None
+        if type(deadman) is not int or not 0 <= deadman <= U64_MAX:
+            raise ValueError(f'{path.name}: safety.deadman_ms 不是整数，robotd 读不了这个文件；先修好它')
+        old_port, old_timeout = section.get('port'), section.get('timeout_ms')
+        port_ok = type(old_port) is int and 0 <= old_port <= 65535
+        timeout_ok = type(old_timeout) is int and 0 <= old_timeout <= U64_MAX
+        updated = dict(section)
+        if action == 'off' and 'netpad' not in data:
+            updated = None   # never had the section: nothing to switch off, the file stays as it is
+        elif action == 'off':
+            # Off is a way back, never refused: only a value robotd could not even parse is reset.
+            updated['enabled'] = False
+            if 'port' in section and not port_ok: updated['port'] = NETPAD_DEFAULTS['port']
+            if 'timeout_ms' in section and not timeout_ok: updated['timeout_ms'] = NETPAD_DEFAULTS['timeout_ms']
+        else:
+            new_port = port if port is not None else old_port if port_ok and old_port >= 1 else NETPAD_DEFAULTS['port']
+            new_timeout = timeout if timeout is not None else old_timeout if 'timeout_ms' in section else NETPAD_DEFAULTS['timeout_ms']
+            if type(new_timeout) is not int or not 0 < new_timeout < deadman:
+                raise ValueError(f'{path.name}: timeout_ms {new_timeout!r} 必须大于 0 且小于 safety.deadman_ms {deadman}'
+                                 '（超过 deadman 会把掉线客户端最后的摇杆再发一遍）；用 netpad on 端口 超时毫秒 指定')
+            updated.update(enabled=True, port=new_port, timeout_ms=new_timeout)
+        plans.append((path, data, updated, deadman))
+    return plans
+
+def validate_netpad(action, *args):
+    return [{'file': str(path), 'netpad': updated, 'deadman_ms': deadman} for path, _, updated, deadman in netpad_plan(action, *args)]
+
+def set_netpad(action, *args):
+    plans = netpad_plan(action, *args)
+    texts = []
+    for path, data, updated, _ in plans:
+        if updated is None or data.get('netpad') == updated: continue
+        text = dumps({**data, 'netpad': updated})
+        if tomllib.loads(text).get('netpad') != updated: raise ValueError(f'{path.name}: [netpad] 写出后读回不一致，未写入')
+        texts.append((path, text))
+    for path, _ in texts:   # both copies first, so restore-netpad can always put both back
+        atomic_write(path.with_name(path.name + '.previous'), path.read_bytes())
+    for path, text in texts:
+        atomic_write(path, text)
+    first = plans[0][2] or {'enabled': False}
+    state = f"开（UDP 端口 {first['port']}，超时 {first['timeout_ms']} ms）" if first['enabled'] else '关（读蓝牙手柄与网页手柄）'
+    return {'netpad': [{'file': str(path), 'netpad': updated} for path, _, updated, _ in plans],
+            'written': [str(path) for path, _ in texts], 'port': first.get('port'),
+            'message': f'[netpad] {state}；写入 {len(texts)} 份配置，padd 重启后生效。'}
+
+def restore_netpad():
+    restored = []
+    for path in netpad_paths():
+        previous = path.with_name(path.name + '.previous')
+        if previous.exists():
+            atomic_write(path, previous.read_bytes()); restored.append(str(path))
+    return {'restored': restored, 'message': '已从 .previous 恢复 ' + '、'.join(restored)}
+
 def model_list():
     from model_packages import catalog
     result=catalog(BASE,CONFIG);policy=tomllib.loads(CONFIG.read_text()).get('policy',{})
@@ -468,6 +554,7 @@ def main():
     if action == 'validate-servo': print(json.dumps(validate_servo(*args))); return
     if action == 'validate-filters': print(json.dumps([validate_filter(v) for v in args])); return
     if action == 'verify-servo': print(json.dumps(verify_servo_parameters(*args), ensure_ascii=False)); return
+    if action == 'validate-netpad': print(json.dumps(validate_netpad(*args), ensure_ascii=False)); return
     if action == 'port': print(detect_port()); return
     if action == 'config-path': print(effective_config_path()); return
     if action == 'connection': print(json.dumps(connection_status(), ensure_ascii=False)); return
@@ -485,6 +572,8 @@ def main():
         elif action == 'set-servo-parameters': result = set_servo_parameters(*args)
         elif action == 'clear-servo-parameters': result = clear_servo_parameters()
         elif action == 'set-joint-filters': result = set_joint_filters(*args)
+        elif action == 'set-netpad': result = set_netpad(*args)
+        elif action == 'restore-netpad': result = restore_netpad()
         elif action == 'relax-confirmed': relax_confirmed(); result = {'torque':'off'}
         elif action == 'relax-request': result = request_relax()
         else: raise ValueError('不支持的运行管理操作')

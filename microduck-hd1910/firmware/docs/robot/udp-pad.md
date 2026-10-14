@@ -18,7 +18,22 @@ trust, and only while you use it.
 
 ## Turning it on
 
-Off by default. In `/etc/robot/feetech-ft5/robotd.toml`:
+Off by default. On this fork, one command does it on the robot (hold or hang the duck: it relaxes
+the robot first):
+
+```bash
+sudo bash /opt/robot/feetech-ft5-r5/service.sh netpad on              # port 4210, timeout 250 ms
+sudo bash /opt/robot/feetech-ft5-r5/service.sh netpad on 4210 250     # or name them
+sudo bash /opt/robot/feetech-ft5-r5/service.sh netpad off             # back to the Bluetooth pad
+```
+
+It checks the numbers against both `robotd.toml` and `robotd.saved.toml` (each against its own
+`[safety] deadman_ms`), that this `padd` knows `[netpad]` and that `padd.service` allows `AF_INET`;
+writes `[netpad]` into both files (a `.previous` copy of each first); restarts `padd` alone and
+reads its new process's journal for the line below. If that line does not come, both files are put
+back and `padd` restarted. `off` keeps the port and timeout already in the files.
+
+By hand it is this section in `/etc/robot/feetech-ft5/robotd.toml` (and `robotd.saved.toml`):
 
 ```toml
 [netpad]
@@ -40,7 +55,8 @@ one source. `enabled = false` (or removing the section) and the same restart go 
 `[safety] deadman_ms`, or a `port` of 0, makes the whole file invalid — for `robotd` built from
 this tree too, which then refuses to start and names the key in its journal, exactly as upstream
 does. `padd` treats a file it cannot read as netpad off. A `robotd` from before this change ignores
-the section with a warning.
+the section with a warning. If `robotd` refuses to start over it, fix or remove `[netpad]` in both
+files and run `sudo bash /opt/robot/feetech-ft5-r5/service.sh reconnect`.
 
 `padd.service` must allow `AF_INET` (`RestrictAddressFamilies=… AF_INET`, in both
 `padd/systemd/padd.service` and `packaging/padd.service`). A unit installed before this change

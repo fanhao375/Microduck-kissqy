@@ -3789,6 +3789,31 @@ source = \"{}\"
         let path = write(dir.path(), "[netpad]\nenabled = true\nmax_hz = 30\n");
         assert!(Params::load(&path, true).unwrap().netpad.enabled);
     }
+
+    /// The board's own robotd.toml (quoted table names, inline skill array, `[trunk_imu]`) with the
+    /// `[netpad]` block `service.sh netpad on` writes through configure.dumps (packaging/test_netpad.py
+    /// checks the block is byte for byte this). It loads, and the rules still apply to it.
+    #[test]
+    fn board_robotd_toml_with_the_netpad_block_loads() {
+        let board = include_str!("../../packaging/fixtures/robotd-board-v167.toml");
+        let block = "[\"netpad\"]\n\"enabled\" = true\n\"port\" = 4210\n\"timeout_ms\" = 250\n";
+        let dir = tempfile::tempdir().unwrap();
+        let p = Params::load(&write(dir.path(), &format!("{board}\n{block}")), true).unwrap();
+        assert_eq!(
+            p.netpad,
+            NetpadParams {
+                enabled: true,
+                port: 4210,
+                timeout_ms: 250
+            }
+        );
+        assert_eq!(p.trunk_imu.source, TrunkImuSource::Bno08x);
+        let too_long = block.replace("250", "500");
+        let error = Params::load(&write(dir.path(), &format!("{board}\n{too_long}")), true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("netpad.timeout_ms"), "{error}");
+    }
 }
 
 #[cfg(test)]
