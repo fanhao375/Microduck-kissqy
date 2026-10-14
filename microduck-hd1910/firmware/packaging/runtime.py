@@ -442,7 +442,10 @@ def set_joint_filters(ident, head, legs):
 # ranges are checked whatever `enabled` says (strict parse: port u16, timeout_ms u64, enabled bool),
 # and with enabled = true port 1..65535 and 0 < timeout_ms < that file's [safety] deadman_ms (500
 # when unset). Off is never refused and keeps the numbers already there. Each file is checked
-# against its own deadman; both get a .previous copy first so a failed check can put them back.
+# against its own deadman. A file this run writes gets a <name>.netpad-previous copy first (not
+# .previous: kissqy's atomic_write rewrites that on every write); service.sh either drops the copies
+# (netpad-commit) or puts exactly those files back (restore-netpad), so nothing flips twice.
+NETPAD_BACKUP = '.netpad-previous'
 NETPAD_DEFAULTS = {'port': 4210, 'timeout_ms': 250}
 NETPAD_DEADMAN_MS = 500
 U64_MAX = 2**64 - 1
@@ -505,8 +508,9 @@ def set_netpad(action, *args):
         text = dumps({**data, 'netpad': updated})
         if tomllib.loads(text).get('netpad') != updated: raise ValueError(f'{path.name}: [netpad] 写出后读回不一致，未写入')
         texts.append((path, text))
-    for path, _ in texts:   # both copies first, so restore-netpad can always put both back
-        atomic_write(path.with_name(path.name + '.previous'), path.read_bytes())
+    netpad_commit()   # a copy left by an earlier run is not this run's to restore
+    for path, _ in texts:   # every copy first, so restore-netpad can put back what was written
+        atomic_write(path.with_name(path.name + NETPAD_BACKUP), path.read_bytes())
     for path, text in texts:
         atomic_write(path, text)
     first = plans[0][2] or {'enabled': False}
@@ -515,13 +519,24 @@ def set_netpad(action, *args):
             'written': [str(path) for path, _ in texts], 'port': first.get('port'),
             'message': f'[netpad] {state}；写入 {len(texts)} 份配置，padd 重启后生效。'}
 
+def netpad_backups():
+    return [path for path in netpad_paths() if path.with_name(path.name + NETPAD_BACKUP).exists()]
+
 def restore_netpad():
+    """Put back the files the last set-netpad wrote (only those) and drop their copies."""
     restored = []
-    for path in netpad_paths():
-        previous = path.with_name(path.name + '.previous')
-        if previous.exists():
-            atomic_write(path, previous.read_bytes()); restored.append(str(path))
-    return {'restored': restored, 'message': '已从 .previous 恢复 ' + '、'.join(restored)}
+    for path in netpad_backups():
+        backup = path.with_name(path.name + NETPAD_BACKUP)
+        atomic_write(path, backup.read_bytes()); backup.unlink(); restored.append(str(path))
+    return {'restored': restored,
+            'message': ('已恢复 ' + '、'.join(restored)) if restored else '这次没有写过配置，不用恢复'}
+
+def netpad_commit():
+    """The change stays: drop the copies set-netpad made."""
+    dropped = []
+    for path in netpad_backups():
+        path.with_name(path.name + NETPAD_BACKUP).unlink(); dropped.append(str(path))
+    return {'dropped': dropped}
 
 def model_list():
     from model_packages import catalog
@@ -589,6 +604,7 @@ def main():
         elif action == 'set-joint-filters': result = set_joint_filters(*args)
         elif action == 'set-netpad': result = set_netpad(*args)
         elif action == 'restore-netpad': result = restore_netpad()
+        elif action == 'netpad-commit': result = netpad_commit()
         elif action == 'relax-confirmed': relax_confirmed(); result = {'torque':'off'}
         elif action == 'relax-request': result = request_relax()
         else: raise ValueError('不支持的运行管理操作')

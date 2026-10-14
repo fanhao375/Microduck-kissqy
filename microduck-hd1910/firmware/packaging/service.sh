@@ -137,6 +137,28 @@ restart_padd_checked() {
     return 1
 }
 
+# robotd's four startup steps done? padd waits for them (kissqy's startup_gate), so a netpad check
+# against a robotd that is not there yet would blame padd for robotd.
+robotd_ready() { python3 "$install_dir/startup_gate.py" --timeout "${1:-1}" >/dev/null 2>&1; }
+robotd_state_hint() { if robotd_ready 1; then echo 'robotd 已就绪'; else echo 'robotd 还没完成四步启动'; fi; }
+
+# A netpad change whose padd check failed. on: put back the files this run wrote and restart padd.
+# off is never rolled back: it is the way back to the Bluetooth pad.
+netpad_failed() {
+    local want=$1 why
+    why=$(robotd_state_hint)
+    if [[ $want == on ]]; then
+        python3 "$install_dir/runtime.py" restore-netpad || true
+        systemctl restart padd.service || true
+        start_input_services || true
+        fail "padd 没有按 netpad on 启动（$why）；这次写过的配置已恢复，padd 已重启。"
+        return 1   # fail only returns: called after ||, errexit does not stop here
+    fi
+    python3 "$install_dir/runtime.py" netpad-commit >/dev/null || true
+    start_input_services || true
+    fail "netpad off 已写入，但 padd 10 秒内没有开始驾驶（$why）；off 不回滚：robotd 就绪后 padd 会按 off 启动，或 sudo bash service.sh reconnect。"
+}
+
 verify_servo_loaded() {
     local running
     running=$(systemctl show robotd.service -p ExecStart --value)
@@ -358,7 +380,9 @@ reconnect)
     [[ $# -eq 1 ]] || fail '用法：reconnect'
     request_relax_service
     restart_service
-    systemctl start padd.service gamesir-xboxd.service
+    # microduck-replica: padd, and the GameSir bridge only where it is enabled (unchanged for anyone
+    # who uses the bridge; a duck whose bridge was disabled on purpose keeps it off).
+    start_input_services
     echo 'robotd 已按现有配置重新启动；输入连接复用，不重写配置。'
     ;;
 pad-settings)
@@ -399,7 +423,7 @@ servo-parameters)
         fail '舵机参数写入失败；robotd 已重新启动，原设置未变。'
     fi
     restart_service || { start_input_services || true; echo '参数文件已写入；robotd 起来后下次 HOME 上力时生效。' >&2; exit 78; }
-    verify_servo_loaded "$servo_json"
+    verify_servo_loaded "$servo_json" || { start_input_services || true; fail '参数文件已写入，但控制器回读不一致（见上）。'; }
     start_input_services
     echo "舵机参数已应用：P=$2 D=$3 转矩限制=$4；下次 HOME 上力时写入。卸力时 P 恢复原值，D=0、转矩 1000（同 V167）。"
     ;;
@@ -414,7 +438,7 @@ servo-parameters-clear)
         fail '恢复默认失败；robotd 已重新启动。'
     fi
     restart_service || { start_input_services || true; echo '参数文件已删除；robotd 起来后下次 HOME 按 V167 原版上力。' >&2; exit 78; }
-    verify_servo_loaded none
+    verify_servo_loaded none || { start_input_services || true; fail '参数文件已删除，但控制器回读不一致（见上）。'; }
     start_input_services
     echo '已恢复默认（未设置）：按 V167 原版，P=合同 5、D=0、转矩 1000。'
     ;;
@@ -431,7 +455,7 @@ joint-filters)
         fail '滤波写入失败；robotd 已重新启动，原设置未变。'
     fi
     restart_service || { start_input_services || true; echo '滤波已写入；robotd 起来后读取新配置。' >&2; exit 78; }
-    verify_motion_models
+    verify_motion_models || { start_input_services || true; fail '滤波已写入，但模型核对没过（见上）。'; }
     start_input_services
     echo "头腿滤波已应用：头 $3、腿 $4；重新 HOME 后生效。"
     ;;
@@ -445,16 +469,21 @@ netpad)
     if [[ $2 == on ]]; then
         grep -aq 'netpad on' "$install_dir/padd" || fail '板上的 padd 不认识 [netpad]（不是 microduck-replica 版）；未改动。'
         padd_allows_inet || fail "padd.service 不允许 AF_INET（$(systemctl show padd.service -p RestrictAddressFamilies --value)）；先用 imu-module-install.sh 安装；未改动。"
+        # padd starts only after robotd's four steps; checking it before then would blame padd.
+        robotd_ready 10 || fail 'robotd 还没完成四步启动（看 sudo bash service.sh status）；netpad 没有改动。'
     fi
     python3 "$install_dir/runtime.py" relax-and-restore
     netpad_result=$(python3 "$install_dir/runtime.py" set-netpad "${@:2}")
     netpad_port=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("port") or "")' "$netpad_result")
-    if ! restart_padd_checked "$2" "$netpad_port"; then
-        python3 "$install_dir/runtime.py" restore-netpad || true
+    if [[ $2 == off ]] && ! robotd_ready 10; then
+        python3 "$install_dir/runtime.py" netpad-commit >/dev/null
         systemctl restart padd.service || true
         start_input_services || true
-        fail 'padd 没有按新设置启动；两份 robotd.toml 已从 .previous 恢复并重启 padd。'
+        echo 'netpad off 已写入；robotd 还没完成四步启动，padd 会等它就绪后按 off（蓝牙手柄、网页手柄）启动。'
+        exit 0
     fi
+    restart_padd_checked "$2" "$netpad_port" || netpad_failed "$2"
+    python3 "$install_dir/runtime.py" netpad-commit >/dev/null
     start_input_services
     python3 -c 'import json,sys; print(json.loads(sys.argv[1])["message"])' "$netpad_result"
     ;;

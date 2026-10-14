@@ -115,8 +115,10 @@ class NetpadFileTests(unittest.TestCase):
                 data = tomllib.loads(text)
                 self.assertEqual(data.pop('netpad'), {'enabled': True, 'port': 4210, 'timeout_ms': 250})
                 self.assertEqual(data, original)           # skills, pad, trunk_imu all as they were
-                previous = path.with_name(path.name + '.previous')
-                self.assertEqual(previous.read_bytes(), BOARD)
+                backup = path.with_name(path.name + '.netpad-previous')
+                self.assertEqual(backup.read_bytes(), BOARD)
+            runtime.netpad_commit()                        # the change stays: no copy left behind
+            self.assertEqual(runtime.netpad_backups(), [])
 
     def test_on_twice_and_off_never_duplicate_the_section(self):
         with Board() as board:
@@ -135,12 +137,37 @@ class NetpadFileTests(unittest.TestCase):
             self.assertEqual(board.config.read_bytes(), BOARD)
             self.assertEqual(board.saved.read_bytes(), BOARD)
 
-    def test_restore_puts_both_files_back(self):
+    def test_restore_puts_both_files_back_once(self):
         with Board() as board:
             runtime.set_netpad('on')
             runtime.restore_netpad()
             self.assertEqual(board.config.read_bytes(), BOARD)
             self.assertEqual(board.saved.read_bytes(), BOARD)
+            self.assertEqual(runtime.netpad_backups(), [])
+            runtime.restore_netpad()                       # a second restore never flips it back
+            self.assertEqual(board.config.read_bytes(), BOARD)
+
+    def test_restore_after_writing_nothing_changes_nothing(self):
+        with Board() as board:
+            # kissqy's own atomic_write leaves robotd.toml.previous on every write: not ours to use.
+            from configure import atomic_write, dumps
+            data = tomllib.loads(BOARD.decode()); data['policy']['action_scale'] = 0.55
+            atomic_write(board.config, dumps(data))
+            changed = board.config.read_bytes()
+            self.assertTrue(board.config.with_name('robotd.toml.previous').exists())
+            self.assertEqual(runtime.set_netpad('off')['written'], [])   # no section: nothing written
+            self.assertEqual(runtime.restore_netpad()['restored'], [])
+            self.assertEqual(board.config.read_bytes(), changed)
+            self.assertEqual(board.saved.read_bytes(), BOARD)
+
+    def test_restore_puts_back_only_what_this_run_wrote(self):
+        with Board() as board:
+            runtime.set_netpad('on'); runtime.netpad_commit()
+            on = board.config.read_bytes()
+            runtime.set_netpad('off')
+            board.saved.write_bytes(BOARD)                 # changed by someone else after the write
+            runtime.restore_netpad()
+            self.assertEqual(board.config.read_bytes(), on)
 
     def test_validate_reads_without_writing(self):
         with Board() as board:
@@ -149,6 +176,7 @@ class NetpadFileTests(unittest.TestCase):
             self.assertEqual([p['deadman_ms'] for p in plans], [500, 500])
             self.assertEqual(board.config.read_bytes(), BOARD)
             self.assertFalse(board.config.with_name('robotd.toml.previous').exists())
+            self.assertEqual(runtime.netpad_backups(), [])
 
 
 def function(name):
@@ -169,10 +197,16 @@ class ServiceNetpadTests(unittest.TestCase):
 
     def test_order_checks_relax_write_verify_and_restore(self):
         block = self.block()
-        order = ['validate-netpad', "grep -aq 'netpad on'", 'padd_allows_inet', 'relax-and-restore',
-                 'set-netpad', 'restart_padd_checked', 'restore-netpad', 'start_input_services']
+        order = ['validate-netpad', "grep -aq 'netpad on'", 'padd_allows_inet', 'robotd_ready 10',
+                 'relax-and-restore', 'set-netpad']
         positions = [block.index(word) for word in order]
-        self.assertEqual(positions, sorted(positions), 'checks, relax, write, verify, restore on failure')
+        self.assertEqual(positions, sorted(positions), 'checks (robotd ready for on), relax, write')
+        # then: off with robotd not ready keeps the change and leaves padd to wait for it; otherwise
+        # padd is checked, a failure goes to netpad_failed, success drops the copies.
+        verify = block.index('restart_padd_checked "$2"')
+        self.assertLess(block.index('if [[ $2 == off ]] && ! robotd_ready 10'), verify)
+        self.assertLess(verify, block.index('|| netpad_failed "$2"'))
+        self.assertLess(verify, block.rindex('netpad-commit'))
         self.assertIn('[[ $2 == off && $# -eq 2 || $2 == on && $# -le 4 ]]', block)   # off takes no numbers
         self.assertNotIn('systemctl stop robotd', block)                             # only padd restarts
         self.assertNotIn('enable', block.replace('enabled', ''))
@@ -180,8 +214,31 @@ class ServiceNetpadTests(unittest.TestCase):
     def test_every_command_that_restarts_robotd_brings_padd_back(self):
         start = SERVICE.index('\nservo-parameters)\n'); end = SERVICE.index('\nnetpad)\n')
         block = SERVICE[start:end]
-        self.assertEqual(block.count('start_input_services || true'), 9)   # stop / write / restart failed
+        self.assertEqual(block.count('start_input_services || true'), 12)  # stop / write / restart / verify failed
         self.assertEqual(block.count('    start_input_services\n'), 3)      # the three success paths
+        reconnect = SERVICE[SERVICE.index('\nreconnect)\n'):SERVICE.index('\npad-settings)\n')]
+        self.assertIn('start_input_services', reconnect)
+        self.assertNotIn('gamesir-xboxd', reconnect)       # the bridge only through start_input_services
+
+    def test_a_failed_check_rolls_back_on_but_never_off(self):
+        stub = ('python3() { echo "python3 $*" >> "$LOG"; }\n'
+                'systemctl() { echo "systemctl $*" >> "$LOG"; return 0; }\n'
+                'robotd_state_hint() { echo "robotd 已就绪"; }\n'
+                'fail() { echo "错误：$*" >&2; return 1; }\n'
+                'install_dir=/opt/robot/feetech-ft5-r5\n')
+        script = stub + function('start_input_services') + function('netpad_failed')
+        for want, rolled_back in (('on', True), ('off', False)):
+            with tempfile.TemporaryDirectory() as tmp:
+                log = Path(tmp) / 'calls'
+                result = bash(script + f'netpad_failed {want}', LOG=str(log))
+                calls = log.read_text()
+                self.assertNotEqual(result.returncode, 0, want)
+                self.assertEqual('restore-netpad' in calls, rolled_back, want)
+                self.assertEqual('netpad-commit' in calls, not rolled_back, want)
+                self.assertIn('systemctl start padd.service', calls)
+                self.assertIn('robotd 已就绪', result.stderr)
+                if want == 'off':
+                    self.assertIn('off 不回滚', result.stderr)
 
     def test_the_bridge_is_started_only_where_it_is_enabled(self):
         script = function('start_input_services') + 'start_input_services'
