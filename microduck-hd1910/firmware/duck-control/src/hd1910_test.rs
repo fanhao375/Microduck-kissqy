@@ -1,5 +1,9 @@
-//! Temporary console P/D/torque experiment. No EEPROM writes or model changes.
-//! Missing servo-test-parameters.json leaves the original arm path in charge.
+// Modified 2026-10 by fanhao375 (microduck-replica): optional servo P/D/torque-limit file (servo-test-parameters.json); see IMU-MODULE.md at the repository root.
+//! Optional servo P/D/torque limit for HD1910 (servo-test-parameters.json next to the
+//! calibration; written by packaging/service.sh servo-parameters). No EEPROM writes or
+//! model changes. Missing file leaves the V167 arm path in charge.
+//! Ranges are narrower than the registers allow: P matches the model-contract kp_fw
+//! check (1..=32), D at most 64, torque limit 200..=1000 so a typo cannot leave a leg limp.
 use crate::feetech::Bus;
 use crate::hd1910::RegisterSnapshot;
 use crate::io::{IoError, Result};
@@ -23,8 +27,16 @@ pub fn load(calibration_path: &Path) -> Result<Option<Parameters>> {
     };
     let parameters: Parameters = serde_json::from_slice(&bytes)
         .map_err(|e| IoError::Bus(format!("servo test parameters: {e}")))?;
-    if parameters.torque_limit > 1000 {
-        return Err(IoError::Bus("servo test torque limit exceeds 1000".into()));
+    if !(1..=32).contains(&parameters.kp) {
+        return Err(IoError::Bus("servo test P must be 1..=32".into()));
+    }
+    if parameters.kd > 64 {
+        return Err(IoError::Bus("servo test D must be 0..=64".into()));
+    }
+    if !(200..=1000).contains(&parameters.torque_limit) {
+        return Err(IoError::Bus(
+            "servo test torque limit must be 200..=1000".into(),
+        ));
     }
     Ok(Some(parameters))
 }
@@ -46,19 +58,12 @@ pub(crate) fn rows(snapshots: &[RegisterSnapshot], parameters: Parameters) -> Ve
         .collect()
 }
 
-pub(crate) fn original_rows(snapshots: &[RegisterSnapshot]) -> Vec<(u8, Vec<u8>)> {
+/// Relax rows: P as inspected before arm, D=0, torque limit 1000 — the RAM state V167
+/// leaves after relax, so relaxing looks the same with or without the file.
+pub(crate) fn relax_rows(snapshots: &[RegisterSnapshot]) -> Vec<(u8, Vec<u8>)> {
     snapshots
         .iter()
-        .map(|s| {
-            (
-                s.id,
-                payload(
-                    s.temporary_pdi[0],
-                    s.temporary_pdi[1],
-                    s.torque_limit_raw.unwrap(),
-                ),
-            )
-        })
+        .map(|s| (s.id, payload(s.temporary_pdi[0], 0, 1000)))
         .collect()
 }
 
@@ -107,6 +112,12 @@ mod tests {
             r#"{"kp":256,"kd":0,"torque_limit":681}"#,
             r#"{"kp":3,"kd":0,"torque_limit":1001}"#,
             r#"{"kp":3,"kd":0}"#,
+            r#"{"kp":0,"kd":0,"torque_limit":681}"#,
+            r#"{"kp":33,"kd":0,"torque_limit":681}"#,
+            r#"{"kp":3,"kd":65,"torque_limit":681}"#,
+            r#"{"kp":3,"kd":0,"torque_limit":199}"#,
+            r#"{"kp":3,"kd":0,"torque_limit":681,"extra":1}"#,
+            r#"not json"#,
         ] {
             std::fs::write(&path, invalid).unwrap();
             assert!(load(&calibration).is_err());
@@ -114,5 +125,34 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         assert_eq!(load(&calibration).unwrap(), None);
         std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn rows_are_limit_p_d_and_relax_rows_keep_p_with_d0_limit1000() {
+        let snapshot = |id, p| RegisterSnapshot {
+            id,
+            name: String::new(),
+            mode: 4,
+            eeprom_pdi: [32, 40, 0],
+            temporary_pdi: [p, 40, 9],
+            acceleration_raw: 64,
+            goal_current_raw: 0,
+            goal_speed_raw: 0,
+        };
+        let snapshots = [snapshot(20, 32), snapshot(21, 5)];
+        let parameters = Parameters {
+            kp: 3,
+            kd: 1,
+            torque_limit: 681,
+        };
+        assert_eq!(
+            rows(&snapshots, parameters),
+            vec![(20, vec![0xa9, 0x02, 3, 1]), (21, vec![0xa9, 0x02, 3, 1])]
+        );
+        // Relax: P from before arm, D=0, limit 1000 (V167's post-relax RAM), I untouched.
+        assert_eq!(
+            relax_rows(&snapshots),
+            vec![(20, vec![0xe8, 0x03, 32, 0]), (21, vec![0xe8, 0x03, 5, 0])]
+        );
     }
 }

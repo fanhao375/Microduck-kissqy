@@ -1,4 +1,8 @@
+// Modified 2026-10 by fanhao375 (microduck-replica): optional servo P/D/torque-limit file (servo-test-parameters.json); see IMU-MODULE.md at the repository root.
 //! HD1910 position payload, model-contract P, RAM D=0 and torque limit=1000.
+//! An optional servo-test-parameters.json (hd1910_test) takes a separate arm path: one 4-byte
+//! write at 48 (limit, P, D) with readback; relax leaves P restored, D=0 and limit=1000 as here.
+//! Without the file nothing below changes.
 //! Local joint calibration and FT6/SFLP body frame remain authoritative.
 use crate::feetech::{Bus, Calibration};
 use crate::io::{IoError, Result, Sensors};
@@ -42,6 +46,8 @@ pub struct Diagnostics {
     pub restore_pending: bool,
     #[serde(serialize_with = "serialize_register_snapshots")]
     pub registers_before_arm: Arc<[RegisterSnapshot]>,
+    /// The loaded servo-test-parameters.json; null without the file.
+    pub servo_parameters: Option<crate::hd1910_test::Parameters>,
 }
 
 fn serialize_register_snapshots<S: Serializer>(
@@ -57,6 +63,10 @@ pub struct State {
     // the next inspection without copying 15 joint names every control tick.
     snapshots: Arc<[RegisterSnapshot]>,
     restore: Option<Vec<(u8, Vec<u8>)>>,
+    /// servo-test-parameters.json, loaded once before the bus opens; None = V167 path.
+    pub(crate) test_parameters: Option<crate::hd1910_test::Parameters>,
+    /// File path only: rows written back at 48 on relax ([E8 03, P before arm, D=0]).
+    test_restore: Option<Vec<(u8, Vec<u8>)>>,
     applied: bool,
     velocity_delay: Option<(Instant, [f64; NUM_JOINTS])>,
 }
@@ -97,7 +107,7 @@ impl State {
         if self.applied {
             return Ok(());
         }
-        if self.restore.is_some() {
+        if self.restore.is_some() || self.test_restore.is_some() {
             return Err(error(
                 "HD1910 temporary gain restoration pending; relax first",
             ));
@@ -108,6 +118,10 @@ impl State {
             bus.verify_torque(&ids, true)?;
         }
         self.inspect(bus, calibration)?;
+        if let Some(parameters) = self.test_parameters {
+            // Returns before write_fixed_settings: the file owns 48..51 on this path.
+            return self.arm_with_file(bus, parameters, off);
+        }
         let desired: Vec<_> = self
             .snapshots
             .iter()
@@ -142,9 +156,46 @@ impl State {
         Ok(())
     }
 
+    /// servo-test-parameters.json: one 4-byte write at 48 [limit lo, limit hi, P, D] to all
+    /// joints, then a 48×4 readback. With torque already on, the file values are only
+    /// verified: nothing is written and a mismatch refuses torque-on.
+    fn arm_with_file(
+        &mut self,
+        bus: &mut Bus,
+        parameters: crate::hd1910_test::Parameters,
+        off: bool,
+    ) -> Result<()> {
+        let desired = crate::hd1910_test::rows(&self.snapshots, parameters);
+        if !off {
+            crate::hd1910_test::verify(bus, &desired)?;
+            self.applied = true;
+            tracing::warn!(
+                ?parameters,
+                "HD1910 servo parameters file verified on all joints; torque preserved"
+            );
+            return Ok(());
+        }
+        // Retain the relax rows BEFORE the first write, as on the P-only path.
+        self.test_restore = Some(crate::hd1910_test::relax_rows(&self.snapshots));
+        bus.sync_write(48, &desired)?;
+        crate::hd1910_test::verify(bus, &desired)?;
+        self.applied = true;
+        tracing::warn!(
+            ?parameters,
+            "HD1910 servo parameters file (torque limit, P, D) confirmed on all joints"
+        );
+        Ok(())
+    }
+
     pub fn disarm(&mut self, bus: &mut Bus) -> Result<()> {
         self.applied = false;
         self.velocity_delay = None;
+        if let Some(rows) = &self.test_restore {
+            // P before arm, D=0, limit=1000: the state V167 leaves after relax.
+            bus.sync_write(48, rows)?;
+            crate::hd1910_test::verify(bus, rows)?;
+            self.test_restore = None;
+        }
         if let Some(rows) = &self.restore {
             bus.sync_write(50, rows)?;
             verify_gains(bus, rows)?;
@@ -180,8 +231,9 @@ impl State {
             goal_speed_raw: 0,
             acceleration_policy: "preserve_register_41_never_written",
             temporary_gains_applied: self.applied,
-            restore_pending: self.restore.is_some(),
+            restore_pending: self.restore.is_some() || self.test_restore.is_some(),
             registers_before_arm: self.snapshots.clone(),
+            servo_parameters: self.test_parameters,
         }
     }
 }

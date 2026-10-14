@@ -1,4 +1,4 @@
-// Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; see IMU-MODULE.md at the repository root.
+// Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; optional servo P/D/torque-limit file; see IMU-MODULE.md at the repository root.
 //! R17 read-only snapshots. The control thread publishes facts; one worker encodes them.
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -537,6 +537,7 @@ pub(crate) mod tests {
             acceleration_policy: "preserve_register_41_never_written",
             temporary_gains_applied: true,
             restore_pending: false,
+            servo_parameters: None,
             registers_before_arm: Arc::from([]),
         };
         let native = feetech_snapshot::Snapshot {

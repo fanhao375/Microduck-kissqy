@@ -1,4 +1,4 @@
-// Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; see IMU-MODULE.md at the repository root.
+// Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; optional servo P/D/torque-limit file; see IMU-MODULE.md at the repository root.
 //! Native Feetech TTL packets. No Dynamixel packets or address translation.
 //!
 //! HD1910 telemetry uses only the 15-byte feedback block at 56..=70.
@@ -1465,6 +1465,19 @@ impl FeetechIo {
         }
     }
 
+    /// Optional servo P/D/torque limit (servo-test-parameters.json), loaded by robotd before
+    /// the bus is opened. None keeps the V167 arm path, its bus traffic and its gain_mode.
+    pub fn set_servo_test(&mut self, parameters: Option<crate::hd1910_test::Parameters>) {
+        self.hd1910.test_parameters = parameters;
+    }
+    fn gain_mode(&self) -> &'static str {
+        if self.hd1910.test_parameters.is_some() {
+            "hd1910_servo_parameters_file_relax_p_restored_d0_limit1000"
+        } else {
+            "hd1910_model_contract_p_restore_on_relax_native_d_torque_limit_preserved"
+        }
+    }
+
     /// Reboot recovery is always limp, including when the IMU is still booting.
     /// Only register 40 is written here; a failed attempt never opens the goal
     /// channel or writes gains/positions. This is a startup-only operation.
@@ -1928,7 +1941,7 @@ impl RobotIo for FeetechIo {
             imu_mount_verified: self.calibration.imu_mount(self.imu.kind()).verified,
             torque_enabled: self.torque_enabled,
             torque_state_confirmed: self.torque_state_confirmed,
-            gain_mode: "hd1910_model_contract_p_restore_on_relax_native_d_torque_limit_preserved",
+            gain_mode: self.gain_mode(),
             velocity_source: crate::hd1910::VELOCITY_SOURCE,
             velocity_rad_s_per_count: self.calibration.feedback_speed_scale(),
             current_available: self.calibration.units_verified,
@@ -2036,7 +2049,7 @@ impl RobotIo for FeetechIo {
             dynamic: snapshot::Dynamic {
                 torque_enabled: self.torque_enabled,
                 torque_state_confirmed: self.torque_state_confirmed,
-                gain_mode: "hd1910_model_contract_p_restore_on_relax_native_d_torque_limit_preserved",
+                gain_mode: self.gain_mode(),
                 sample_age_ms: self
                     .latest_sample_at
                     .map(|at| now.saturating_duration_since(at).as_millis() as u64),
@@ -2927,6 +2940,7 @@ mod hd1910_transport_tests {
         done: Arc<AtomicBool>,
         regs: Arc<Mutex<Vec<[u8; 96]>>>,
         writes: Arc<Mutex<Vec<(u8, u8, Vec<u8>)>>>,
+        frames: Arc<Mutex<Vec<Vec<u8>>>>,
         /// Every request that is not a write: instruction, address, the IDs it addressed.
         requests: Requests,
         reads: Arc<Mutex<Vec<(u8, usize)>>>,
@@ -2960,6 +2974,8 @@ mod hd1910_transport_tests {
         let fault_source = faults.clone();
         let done = Arc::new(AtomicBool::new(false));
         let writes = Arc::new(Mutex::new(Vec::new()));
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let frame_log = frames.clone();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let reads = Arc::new(Mutex::new(Vec::new()));
         let read_log = reads.clone();
@@ -2973,6 +2989,10 @@ mod hd1910_transport_tests {
                 }
                 let mut body = vec![0u8; header[3] as usize];
                 master.read_exact(&mut body).unwrap();
+                frame_log
+                    .lock()
+                    .unwrap()
+                    .push([&header[..], &body[..]].concat());
                 let addr = body[1];
                 let len = body[2] as usize;
                 if body[0] == SYNC_WRITE {
@@ -2985,7 +3005,11 @@ mod hd1910_transport_tests {
                         {
                             continue;
                         }
-                        if reject_gain && id == 22 && addr == 50 && row[1] == 5 {
+                        if reject_gain
+                            && id == 22
+                            && ((addr == 50 && row[1] == 5)
+                                || (addr == 48 && len == 4 && row[3] == 3))
+                        {
                             continue;
                         }
                         r.lock().unwrap()[id as usize][addr as usize..addr as usize + len]
@@ -3055,6 +3079,7 @@ mod hd1910_transport_tests {
                 done,
                 regs,
                 writes,
+                frames,
                 requests,
                 reads,
                 thread: Some(thread),
@@ -3978,6 +4003,386 @@ mod hd1910_transport_tests {
             );
         }
         io.set_torque(false).unwrap();
+    }
+
+    /// Request frames as hex; consecutive repeats are folded into "<hex> x<count>".
+    fn folded_frames(device: &Emulator) -> Vec<String> {
+        let mut folded: Vec<(String, usize)> = Vec::new();
+        for frame in device.frames.lock().unwrap().iter() {
+            let hex: String = frame.iter().map(|b| format!("{b:02x}")).collect();
+            match folded.last_mut() {
+                Some((last, count)) if *last == hex => *count += 1,
+                _ => folded.push((hex, 1)),
+            }
+        }
+        folded
+            .into_iter()
+            .map(|(hex, count)| {
+                if count == 1 {
+                    hex
+                } else {
+                    format!("{hex} x{count}")
+                }
+            })
+            .collect()
+    }
+
+    // V167 golden: every request frame robotd sends from the startup limp check through two
+    // HOME arm/relax cycles, captured by running this same test on unmodified kissqy 78bef11
+    // (only the emulator's frame log added). Without servo-test-parameters.json the bus
+    // traffic and the hd1910 diagnostics must stay byte for byte the same.
+    const V167_FRAMES: &[&str] = &[
+        "fffffe22832801140015001600170018001e001f002000210022000a000b000c000d000e00e9",
+        "fffffe1382280114151617181e1f2021220a0b0c0d0ef9",
+        "ffffc8040200052c",
+        "fffffe1482380fc814151617181e1f2021220a0b0c0d0e12 x30",
+        "fffffe1382280114151617181e1f2021220a0b0c0d0ef9",
+        "fffffe1382150314151617181e1f2021220a0b0c0d0e0a",
+        "fffffe1382210114151617181e1f2021220a0b0c0d0e00",
+        "fffffe1382320314151617181e1f2021220a0b0c0d0eed",
+        "fffffe1382290714151617181e1f2021220a0b0c0d0ef2",
+        "fffffe22833201140515051605170518051e051f052005210522050a050b050c050d050e0594",
+        "fffffe1382320114151617181e1f2021220a0b0c0d0eef",
+        "fffffe22833301140015001600170018001e001f002000210022000a000b000c000d000e00de",
+        "fffffe3183300214e80315e80316e80317e80318e8031ee8031fe80320e80321e80322e8030ae8030be8030ce8030de8030ee8030c",
+        "fffffe1482380fc814151617181e1f2021220a0b0c0d0e12",
+        "fffffe6d832a0614000800000000150008000000001600080000000017000800000000180008000000001e0008000000001f0008000000002000080000000021000800000000220008000000000a0008000000000b0008000000000c0008000000000d0008000000000e0008000000001f",
+        "fffffe13822a0214151617181e1f2021220a0b0c0d0ef6",
+        "fffffe22832801140115011601170118011e011f012001210122010a010b010c010d010e01da",
+        "fffffe1382280114151617181e1f2021220a0b0c0d0ef9",
+        "fffffe1482380fc814151617181e1f2021220a0b0c0d0e12",
+        "fffffe6d832a0614410800000000154108000000001641080000000017410800000000184108000000001e4108000000001f4108000000002041080000000021410800000000224108000000000a4108000000000b4108000000000c4108000000000d4108000000000e41080000000050",
+        "fffffe22832801140015001600170018001e001f002000210022000a000b000c000d000e00e9",
+        "fffffe1382280114151617181e1f2021220a0b0c0d0ef9",
+        "fffffe22833201142015201620172018201e201f202020212022200a200b200c200d200e20ff",
+        "fffffe1382320114151617181e1f2021220a0b0c0d0eef",
+        "fffffe1382280114151617181e1f2021220a0b0c0d0ef9",
+        "fffffe1382150314151617181e1f2021220a0b0c0d0e0a",
+        "fffffe1382210114151617181e1f2021220a0b0c0d0e00",
+        "fffffe1382320314151617181e1f2021220a0b0c0d0eed",
+        "fffffe1382290714151617181e1f2021220a0b0c0d0ef2",
+        "fffffe22833201140515051605170518051e051f052005210522050a050b050c050d050e0594",
+        "fffffe1382320114151617181e1f2021220a0b0c0d0eef",
+        "fffffe22833301140015001600170018001e001f002000210022000a000b000c000d000e00de",
+        "fffffe3183300214e80315e80316e80317e80318e8031ee8031fe80320e80321e80322e8030ae8030be8030ce8030de8030ee8030c",
+        "fffffe1482380fc814151617181e1f2021220a0b0c0d0e12",
+        "fffffe6d832a0614000800000000150008000000001600080000000017000800000000180008000000001e0008000000001f0008000000002000080000000021000800000000220008000000000a0008000000000b0008000000000c0008000000000d0008000000000e0008000000001f",
+        "fffffe13822a0214151617181e1f2021220a0b0c0d0ef6",
+        "fffffe22832801140115011601170118011e011f012001210122010a010b010c010d010e01da",
+        "fffffe1382280114151617181e1f2021220a0b0c0d0ef9",
+        "fffffe1482380fc814151617181e1f2021220a0b0c0d0e12",
+        "fffffe6d832a0614410800000000154108000000001641080000000017410800000000184108000000001e4108000000001f4108000000002041080000000021410800000000224108000000000a4108000000000b4108000000000c4108000000000d4108000000000e41080000000050",
+        "fffffe22832801140015001600170018001e001f002000210022000a000b000c000d000e00e9",
+        "fffffe1382280114151617181e1f2021220a0b0c0d0ef9",
+        "fffffe22833201142015201620172018201e201f202020212022200a200b200c200d200e20ff",
+        "fffffe1382320114151617181e1f2021220a0b0c0d0eef",
+    ];
+    const V167_HD1910_DIAGNOSTICS: &str = r#"{"acceleration_policy":"preserve_register_41_never_written","goal_address":42,"goal_length":6,"goal_speed_raw":0,"profile":"hd1910-selftrained","registers_before_arm":[{"acceleration_raw":64,"eeprom_pdi":[32,40,0],"goal_current_raw":0,"goal_speed_raw":0,"id":20,"mode":4,"name":"left_hip_yaw","temporary_pdi":[32,0,0]},{"acceleration_raw":64,"eeprom_pdi":[32,40,0],"goal_current_raw":0,"goal_speed_raw":0,"id":21,"mode":4,"name":"left_hip_roll","temporary_pdi":[32,0,0]},{"acceleration_raw":64,"eeprom_pdi":[32,40,0],"goal_current_raw":0,"goal_speed_raw":0,"id":22,"mode":4,"name":"left_hip_pitch","temporary_pdi":[32,0,0]},{"acceleration_raw":64,"eeprom_pdi":[32,40,0],"goal_current_raw":0,"goal_speed_raw":0,"id":23,"mode":4,"name":"left_knee","temporary_pdi":[32,0,0]},{"acceleration_raw":64,"eeprom_pdi":[32,40,0],"goal_current_raw":0,"goal_speed_raw":0,"id":24,"mode":4,"name":"left_ankle","temporary_pdi":[32,0,0]},{"acceleration_raw":64,"eeprom_pdi":[32,40,0],"goal_current_raw":0,"goal_speed_raw":0,"id":30,"mode":4,"name":"neck_pitch","temporary_pdi":[32,0,0]},{"acceleration_raw":64,"eeprom_pdi":[32,40,0],"goal_current_raw":0,"goal_speed_raw":0,"id":31,"mode":4,"name":"head_pitch","temporary_pdi":[32,0,0]},{"acceleration_raw":64,"eeprom_pdi":[32,40,0],"goal_current_raw":0,"goal_speed_raw":0,"id":32,"mode":4,"name":"head_yaw","temporary_pdi":[32,0,0]},{"acceleration_raw":64,"eeprom_pdi":[32,40,0],"goal_current_raw":0,"goal_speed_raw":0,"id":33,"mode":4,"name":"head_roll","temporary_pdi":[32,0,0]},{"acceleration_raw":64,"eeprom_pdi":[32,40,0],"goal_current_raw":0,"goal_speed_raw":0,"id":34,"mode":4,"name":"mouth","temporary_pdi":[32,0,0]},{"acceleration_raw":64,"eeprom_pdi":[32,40,0],"goal_current_raw":0,"goal_speed_raw":0,"id":10,"mode":4,"name":"right_hip_yaw","temporary_pdi":[32,0,0]},{"acceleration_raw":64,"eeprom_pdi":[32,40,0],"goal_current_raw":0,"goal_speed_raw":0,"id":11,"mode":4,"name":"right_hip_roll","temporary_pdi":[32,0,0]},{"acceleration_raw":64,"eeprom_pdi":[32,40,0],"goal_current_raw":0,"goal_speed_raw":0,"id":12,"mode":4,"name":"right_hip_pitch","temporary_pdi":[32,0,0]},{"acceleration_raw":64,"eeprom_pdi":[32,40,0],"goal_current_raw":0,"goal_speed_raw":0,"id":13,"mode":4,"name":"right_knee","temporary_pdi":[32,0,0]},{"acceleration_raw":64,"eeprom_pdi":[32,40,0],"goal_current_raw":0,"goal_speed_raw":0,"id":14,"mode":4,"name":"right_ankle","temporary_pdi":[32,0,0]}],"restore_pending":false,"temporary_gains_applied":false}"#;
+
+    #[test]
+    fn v167_golden_frames_and_diagnostics_without_parameter_file() {
+        let (bus, device) = emulator(false);
+        let mut io = FeetechIo::for_startup(bus, calibration()).unwrap();
+        io.confirm_startup_limp().unwrap();
+        for _ in 0..30 {
+            io.read().unwrap();
+        }
+        for _ in 0..2 {
+            io.set_torque(true).unwrap();
+            io.set_gain(200).unwrap();
+            io.write(&JointTargets::new([0.1; NUM_JOINTS])).unwrap();
+            io.set_torque(false).unwrap();
+        }
+        let frames = folded_frames(&device);
+        let mut hd1910 = serde_json::to_value(io.hd1910.diagnostics()).unwrap();
+        // The only addition allowed without the file: "servo_parameters": null.
+        let added = hd1910.as_object_mut().unwrap().remove("servo_parameters");
+        assert!(matches!(added, None | Some(serde_json::Value::Null)));
+        let gain_mode = io.feetech_diagnostics().unwrap().gain_mode;
+        if std::env::var_os("MICRODUCK_PRINT_V167_GOLDEN").is_some() {
+            println!("GOLDEN-FRAMES-BEGIN");
+            for frame in &frames {
+                println!("{frame}");
+            }
+            println!("GOLDEN-FRAMES-END");
+            println!("GOLDEN-DIAG {}", serde_json::to_string(&hd1910).unwrap());
+            println!("GOLDEN-GAIN-MODE {gain_mode}");
+        }
+        assert_eq!(frames, V167_FRAMES);
+        assert_eq!(
+            hd1910,
+            serde_json::from_str::<serde_json::Value>(V167_HD1910_DIAGNOSTICS).unwrap()
+        );
+        assert_eq!(
+            gain_mode,
+            "hd1910_model_contract_p_restore_on_relax_native_d_torque_limit_preserved"
+        );
+    }
+
+    const V167_GAIN_MODE: &str =
+        "hd1910_model_contract_p_restore_on_relax_native_d_torque_limit_preserved";
+    const FILE_GAIN_MODE: &str = "hd1910_servo_parameters_file_relax_p_restored_d0_limit1000";
+    const FILE_3_0_681: crate::hd1910_test::Parameters = crate::hd1910_test::Parameters {
+        kp: 3,
+        kd: 0,
+        torque_limit: 681,
+    };
+
+    /// Distinct per-servo acceleration, I and torque limit, so nothing is reset by accident.
+    fn distinct_registers(device: &Emulator) {
+        for id in crate::model::JOINT_IDS {
+            let mut registers = device.regs.lock().unwrap();
+            registers[id as usize][41] = id * 3;
+            registers[id as usize][52] = id;
+            registers[id as usize][48..50].copy_from_slice(&(800u16 + id as u16).to_le_bytes());
+        }
+    }
+
+    #[test]
+    fn servo_file_arm_writes_48_once_and_relax_leaves_p_restored_d0_limit1000() {
+        let (bus, device) = emulator(false);
+        distinct_registers(&device);
+        let mut io = FeetechIo::from_bus(bus, calibration()).unwrap();
+        io.set_servo_test(Some(FILE_3_0_681));
+        assert!(
+            device.writes.lock().unwrap().is_empty(),
+            "loading the file must not write motors"
+        );
+        for _ in 0..30 {
+            io.read().unwrap();
+        }
+        for _ in 0..2 {
+            device.reads.lock().unwrap().clear();
+            io.set_torque(true).unwrap();
+            assert_eq!(
+                *device.reads.lock().unwrap(),
+                vec![
+                    (40, 1),
+                    (21, 3),
+                    (33, 1),
+                    (50, 3),
+                    (41, 7),
+                    (48, 4),
+                    (56, 15),
+                    (42, 2),
+                    (40, 1),
+                    (56, 15)
+                ],
+                "the file path reads 48x4 back instead of 50x1; nothing else changes"
+            );
+            // Policy gain requests and model switches must not overwrite the file values.
+            io.set_gain(200).unwrap();
+            io.write(&JointTargets::new([0.1; NUM_JOINTS])).unwrap();
+            for id in crate::model::JOINT_IDS {
+                let reg = device.regs.lock().unwrap()[id as usize];
+                assert_eq!(&reg[48..53], &[0xa9, 0x02, 3, 0, id]);
+                assert_eq!(&reg[21..24], &[32, 40, 0]);
+                assert_eq!(reg[41], id * 3);
+            }
+            let diagnostic = io.hd1910.diagnostics();
+            assert_eq!(diagnostic.servo_parameters, Some(FILE_3_0_681));
+            assert!(diagnostic.temporary_gains_applied && diagnostic.restore_pending);
+            device.reads.lock().unwrap().clear();
+            io.set_torque(false).unwrap();
+            assert_eq!(*device.reads.lock().unwrap(), vec![(40, 1), (48, 4)]);
+            for id in crate::model::JOINT_IDS {
+                let reg = device.regs.lock().unwrap()[id as usize];
+                assert_eq!(&reg[48..53], &[0xe8, 0x03, 32, 0, id]);
+                assert_eq!(reg[41], id * 3);
+            }
+            let diagnostic = io.hd1910.diagnostics();
+            assert!(!diagnostic.restore_pending && !diagnostic.temporary_gains_applied);
+        }
+        let writes = device.writes.lock().unwrap();
+        assert!(writes.iter().all(|(_, a, _)| [40, 42, 48].contains(a)));
+        let at_48: Vec<_> = writes.iter().filter(|(_, a, _)| *a == 48).collect();
+        assert_eq!(
+            at_48.len(),
+            4 * 15,
+            "one arm write and one relax write per cycle"
+        );
+        assert!(at_48.iter().all(|(_, _, v)| v.len() == 4));
+    }
+
+    #[test]
+    fn servo_file_partial_write_never_enables_torque_and_relax_restores_every_servo() {
+        let (bus, device) = emulator(true);
+        let mut io = FeetechIo::from_bus(bus, calibration()).unwrap();
+        io.set_servo_test(Some(FILE_3_0_681));
+        for _ in 0..30 {
+            io.read().unwrap();
+        }
+        let result = io.set_torque(true).unwrap_err().to_string();
+        assert!(result.contains("ID 22"), "{result}");
+        assert!(io.hd1910.diagnostics().restore_pending);
+        io.read().unwrap();
+        let pending = io.set_torque(true).unwrap_err().to_string();
+        assert!(pending.contains("restoration pending"), "{pending}");
+        io.set_torque(false).unwrap();
+        for id in crate::model::JOINT_IDS {
+            assert_eq!(
+                &device.regs.lock().unwrap()[id as usize][48..53],
+                &[0xe8, 0x03, 32, 0, 0]
+            );
+        }
+        assert!(!io.hd1910.diagnostics().restore_pending);
+        // After relax a new torque-on is tried again (and the same servo refuses it again).
+        io.read().unwrap();
+        let retry = io.set_torque(true).unwrap_err().to_string();
+        assert!(
+            retry.contains("ID 22") && !retry.contains("pending"),
+            "{retry}"
+        );
+        io.set_torque(false).unwrap();
+        assert!(
+            !device
+                .writes
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, a, v)| *a == 40 && v[0] == 1),
+            "a failed P/D/torque-limit write must never enable torque"
+        );
+    }
+
+    /// File {contract P, 0, 1000} and no file leave every register byte the same after each
+    /// arm and each relax: the file path is a different route to the same V167 RAM state.
+    #[test]
+    fn servo_file_with_contract_p_d0_limit1000_matches_no_file_register_for_register() {
+        let run = |file: Option<crate::hd1910_test::Parameters>| {
+            let (bus, device) = emulator(false);
+            distinct_registers(&device);
+            let mut io = FeetechIo::from_bus(bus, calibration()).unwrap();
+            io.set_servo_test(file);
+            for _ in 0..30 {
+                io.read().unwrap();
+            }
+            let mut states = Vec::new();
+            for _ in 0..2 {
+                io.set_torque(true).unwrap();
+                io.write(&JointTargets::new([0.1; NUM_JOINTS])).unwrap();
+                states.push(device.regs.lock().unwrap().clone());
+                io.set_torque(false).unwrap();
+                states.push(device.regs.lock().unwrap().clone());
+            }
+            states
+        };
+        let contract = crate::hd1910_test::Parameters {
+            kp: crate::deployment::firmware_p(),
+            kd: 0,
+            torque_limit: 1000,
+        };
+        assert!(run(Some(contract)) == run(None));
+    }
+
+    #[test]
+    fn servo_file_with_torque_already_on_is_verified_never_written() {
+        for matching in [true, false] {
+            let (bus, device) = emulator(false);
+            for id in crate::model::JOINT_IDS {
+                let mut registers = device.regs.lock().unwrap();
+                registers[id as usize][40] = 1;
+                if matching {
+                    registers[id as usize][48..52].copy_from_slice(&[0xa9, 0x02, 3, 0]);
+                }
+            }
+            let before = device.regs.lock().unwrap().clone();
+            let mut io = FeetechIo::from_bus(bus, calibration()).unwrap();
+            assert_eq!(io.torque_state_confirmed, Some(true));
+            io.set_servo_test(Some(FILE_3_0_681));
+            for _ in 0..30 {
+                io.read().unwrap();
+            }
+            let result = io.set_torque(true);
+            assert!(
+                device
+                    .writes
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|(_, a, _)| ![48, 50, 51].contains(a)),
+                "with torque on, the file values are verified, never written"
+            );
+            let diagnostic = io.hd1910.diagnostics();
+            assert!(!diagnostic.restore_pending, "no relax data is invented");
+            if matching {
+                result.unwrap();
+                assert!(diagnostic.temporary_gains_applied);
+                io.set_torque(false).unwrap();
+                assert!(
+                    device
+                        .writes
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .all(|(_, a, _)| *a != 48)
+                );
+                for id in crate::model::JOINT_IDS {
+                    assert_eq!(
+                        &device.regs.lock().unwrap()[id as usize][48..52],
+                        &[0xa9, 0x02, 3, 0]
+                    );
+                }
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(
+                    error.contains("ID 20") && error.contains("mismatch"),
+                    "{error}"
+                );
+                assert!(device.writes.lock().unwrap().is_empty());
+                assert!(*device.regs.lock().unwrap() == before, "torque stays on");
+                assert!(!diagnostic.temporary_gains_applied);
+            }
+        }
+    }
+
+    #[test]
+    fn diagnostics_add_only_servo_parameters_and_keep_the_v167_gain_mode_without_the_file() {
+        let (bus, _device) = emulator(false);
+        let mut io = FeetechIo::from_bus(bus, calibration()).unwrap();
+        for _ in 0..3 {
+            io.read().unwrap();
+        }
+        let v167: BTreeSet<String> = [
+            "acceleration_policy",
+            "goal_address",
+            "goal_length",
+            "goal_speed_raw",
+            "profile",
+            "registers_before_arm",
+            "restore_pending",
+            "temporary_gains_applied",
+        ]
+        .map(String::from)
+        .into();
+        let mut expected_keys = v167.clone();
+        expected_keys.insert("servo_parameters".into());
+        for (file, gain_mode, reported) in [
+            (None, V167_GAIN_MODE, serde_json::Value::Null),
+            (
+                Some(FILE_3_0_681),
+                FILE_GAIN_MODE,
+                serde_json::json!({"kp": 3, "kd": 0, "torque_limit": 681}),
+            ),
+        ] {
+            io.set_servo_test(file);
+            let wire = serde_json::to_value(io.feetech_diagnostics().unwrap()).unwrap();
+            let keys: BTreeSet<String> = wire["hd1910"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect();
+            assert_eq!(keys, expected_keys);
+            assert_eq!(wire["hd1910"]["servo_parameters"], reported);
+            assert_eq!(wire["gain_mode"], gain_mode);
+            let snapshot = io.feetech_snapshot().unwrap();
+            assert_eq!(snapshot.dynamic.gain_mode, gain_mode);
+            assert_eq!(
+                serde_json::to_value(&snapshot.hd1910).unwrap()["servo_parameters"],
+                reported
+            );
+        }
     }
 
     fn set_positions(device: &Emulator, raw: u16) {

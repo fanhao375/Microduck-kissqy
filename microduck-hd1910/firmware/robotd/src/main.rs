@@ -1,4 +1,4 @@
-// Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; see IMU-MODULE.md at the repository root.
+// Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; optional servo P/D/torque-limit file; see IMU-MODULE.md at the repository root.
 //! `robotd` — the robot control daemon.
 //!
 //! The 50 Hz control loop, the `robot.*` socket, and the health the updater gates on
@@ -1507,6 +1507,9 @@ fn open_bus(
             let kind = host_imu.map_or(TrunkImuKind::Bus, |reader| reader.kind());
             calibration.validate_motion_for(kind)?;
             let report = feetech_commissioning::calibration_status(&calibration, path, kind);
+            // Optional servo P/D/torque limit (servo-test-parameters.json), read before the
+            // bus is opened: a bad file stops motion startup without touching the servos.
+            let servo_test = duck_control::hd1910_test::load(path)?;
             let raw = duck_control::feetech::Bus::open(port)?;
             let mut io = match host_imu {
                 Some(reader) => duck_control::feetech::FeetechIo::for_startup_with_imu(
@@ -1516,6 +1519,7 @@ fn open_bus(
                 )?,
                 None => duck_control::feetech::FeetechIo::for_startup(raw, calibration)?,
             };
+            io.set_servo_test(servo_test);
             io.confirm_startup_limp()?;
             if let Some(state) = state {
                 state.bus_calibration.store(Some(Arc::new(report)));
@@ -9103,6 +9107,59 @@ mod tests {
 
         s.shutdown.store(true, Ordering::Relaxed);
         assert!(handle.await.unwrap(), "must give up only on shutdown");
+    }
+
+    /// A bad servo-test-parameters.json stops motion startup before the UART is opened: the
+    /// bus status is waiting_for_bus and names the file. Without the file, or with a good one,
+    /// the same start goes on to the port (which does not exist here).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_bad_servo_parameters_file_waits_for_the_bus_before_the_port_is_opened() {
+        let dir = std::env::temp_dir().join(format!(
+            "robotd-servo-parameters-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let calibration = dir.join("hd1910-calibration.toml");
+        std::fs::write(
+            &calibration,
+            include_str!("../../packaging/hd1910-calibration.robot.toml"),
+        )
+        .unwrap();
+        let bus = params::Bus {
+            protocol: params::BusProtocol::Feetech,
+            feetech_calibration: Some(calibration),
+            port: "/dev/definitely-not-a-bus".into(),
+            ..Default::default()
+        };
+        let waiting_error = |file: Option<&str>| {
+            let parameters = dir.join("servo-test-parameters.json");
+            match file {
+                Some(text) => std::fs::write(&parameters, text).unwrap(),
+                None => std::fs::remove_file(&parameters).unwrap_or(()),
+            }
+            let s = RobotState::new(
+                &Params::default(),
+                std::path::Path::new("/test/robotd.toml"),
+                false,
+                false,
+            );
+            assert!(open_bus(&bus, None, 0, Some(&s)).is_none());
+            let status = s.bus_status.load_full().expect("waiting status");
+            assert_eq!(status["phase"], "waiting_for_bus");
+            status["error"].as_str().unwrap().to_owned()
+        };
+        let bad = waiting_error(Some(r#"{"kp":33,"kd":0,"torque_limit":681}"#));
+        assert!(bad.contains("servo test P must be 1..=32"), "{bad}");
+        for file in [Some(r#"{"kp":3,"kd":0,"torque_limit":681}"#), None] {
+            let error = waiting_error(file);
+            assert!(!error.contains("servo test"), "{error}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// A silent bus must be *degraded*, not unhealthy: it reports the same before and after
