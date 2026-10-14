@@ -1,6 +1,6 @@
 [简体中文](README-kissqy.md) | **English**
 
-> **This is kissqy's original homepage, kept unchanged** (only this paragraph and the language links differ). This fork's homepage is [README.en.md](README.en.md); the IMU module instructions are in [IMU-MODULE.md](IMU-MODULE.md). The downloads, one-click image and console ZIPs below are kissqy's originals **without** IMU module support.
+> **This is kissqy's original homepage, kept unchanged** (only this paragraph and the language links differ). This fork's homepage is [README.en.md](README.en.md); the IMU module, tuning and UDP pad instructions are in [IMU-MODULE.md](IMU-MODULE.md). The downloads, one-click image and console ZIPs below are kissqy's originals **without** these changes.
 
 
 <div align="center">

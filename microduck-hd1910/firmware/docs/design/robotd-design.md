@@ -1,4 +1,4 @@
-<!-- Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; UDP pad ([netpad]) and pad-loss sit; see IMU-MODULE.md at the repository root. -->
+<!-- Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; optional servo P/D/torque-limit file; UDP pad ([netpad]) and pad-loss sit; see IMU-MODULE.md at the repository root. -->
 **原文 / Original** | [English](robotd-design.en.md)
 
 ## 当前 R17 v1.0.157-Fix6 / control.36
@@ -1367,6 +1367,8 @@ Feetech motion/commissioning 每次新开 UART 只初始化一次。通信 timeo
 Feetech 上力时从已验证模型合同的 `actuators[0].kp_fw` 取得 P，使用既有整数 1—32 校验；当前随包合同为 5。全部 15 个关节，包括独立鸭嘴，使用该合同 P。HD1910 `arm` 先检查现有转矩状态和寄存器：全部卸力时，在写入前保存每个关节原 P，再以地址 50、单字节 payload 写入并回读；已经上力时只确认 P 匹配，不为重启重写或生成虚构恢复数据。`disarm` 仅恢复本次保存的原 P，保留部分写入失败时所需的恢复记录。
 
 48—49 号转矩限制、51 号 D、52 号 I、41 号加速度及 EEPROM 不显式写入。P 写入和恢复不跨到相邻寄存器；寄存器检查仍可读取 D／I 与原生状态。旧嘴巴 P=10／D=20 和测试覆盖分支已删除，官方 XL330 gain 请求不会替换 HD1910 合同 P。本页 §2.1 的 XL330 P／I／D 说明仅适用于 Dynamixel，不能套用为 Feetech 51 号的写入规则。UI、保存配置与旧模块清理由 [R17 设置设计](r17-settings-design.md) 管理。
+
+> **microduck-replica fork 注（2026-10，不是 kissqy 原文）**：V167（control.43）起上力还会写 51 号 D=0 和 48—49 号转矩限制 1000（`hd1910.rs` 的 `write_fixed_settings`），上一段「不显式写入」是 control.33 时的情形。本 fork 另有可选文件 `servo-test-parameters.json`（与标定文件同目录，`{"kp","kd","torque_limit"}`，范围 1—32、0—64、200—1000），robotd 在打开串口前读取，文件坏了停在 `waiting_for_bus` 并写明原因、不碰舵机。文件存在时：全部卸力的上力先保存卸力用的数据，再一次写 48 号起 4 字节 [转矩限制低、高、P、D] 并读回 48×4 核对（相邻寄存器一次写入，是上一段「不跨到相邻寄存器」的例外；kissqy control.29 用过同样写法）；已上力时只核对不写，不一致拒绝上力；卸力写 [1000、上力前的 P、D=0] 并读回，与无文件卸力后的 RAM 相同。文件不存在时，上力、卸力的串口报文与 V167 逐字节相同（`feetech.rs` 的金样测试，同一测试在 kissqy 78bef11 上也通过），busStatus 只多 `servo_parameters: null`。操作入口与注意事项见仓库根目录 `IMU-MODULE.md` 第 4 节。
 
 右踢的当前合同识别 `Mjlab-BallKick-Flat-MicroDuck`，验证 61 输入／14 输出、原关节顺序及 HOME、零命令、0.5 秒技能窗口、基础 1 和目标直通。它复用原 `Slot::KickRight`、`robot.do` 和技能到期回 Walk 路径；原始上一帧动作仍进入下一帧观察，电压补偿与限位照旧。没有新增 IPC 字段、姿态分支、推理次数或正常 50 Hz 循环阶段。模型及按键绑定见 [R17 设置设计](r17-settings-design.md)。
 

@@ -1,34 +1,38 @@
-# IMU 模块直接接主板 I²C（不用总线 IMU 小板）
+# IMU 模块直连主板 I²C · 舵机调参 · UDP 手柄
 
 > **这是 [microduck-replica](https://github.com/fanhao375/microduck-replica) 维护的 fork，不是 kissqy 的官方版本，没经过他审阅，也不代表他认可。**
 > 原版在 [kissqy/Microduck-kissqy](https://github.com/kissqy/Microduck-kissqy)。用这一版出了问题，请到 [microduck-replica 的 Issues](https://github.com/fanhao375/microduck-replica/issues) 反馈，别去找 kissqy：这一版的 robotd 报的版本号跟他的一模一样，他分不出来。
-> kissqy 的原版首页改名为 [README-kissqy.md](README-kissqy.md) 保留；那里的下载区、一键镜像、中控 ZIP 都是他的原版，**不带**这里的 IMU 模块支持。
+> kissqy 的原版首页改名为 [README-kissqy.md](README-kissqy.md) 保留；那里的下载区、一键镜像、中控 ZIP 都是他的原版，**不带**这里的任何改动。
 
 ## 这是什么
 
-kissqy 的 HD-1910 整套（R17 V167 / control.43）里，robotd 只认舵机总线上的 IMU 小板（ID 200，刷他的 FT6 固件）。手上是现成 IMU 模块的人用不了他的整套。
+在 kissqy 的 HD-1910 整套（R17 V167 / control.43）上加三样东西，都是可选的，不打开就跟他的 V167 一样：
 
-这条分支（`hd1910-v167-trunk-imu-i2c`）给 robotd 加了两种接法：**现成的 IMU 模块直接接主板的 I²C**。不用做总线小板，不用刷固件。`robotd.toml` 里一行选：
+1. **IMU 模块直连主板 I²C**：kissqy 的 robotd 只认舵机总线上的 IMU 小板（ID 200，刷他的 FT6 固件）。这里加了两种现成模块，`robotd.toml` 里一行选：
 
-| `[trunk_imu] source` | 硬件 | I²C 地址 |
-|---|---|---|
-| `bus`（不写就是它） | kissqy 的总线 IMU 小板，ID 200 | — |
-| `bno08x` | BNO085 / BNO086 模块 | 0x4A 或 0x4B（不写默认 0x4B） |
-| `lsm6dsv16x` | LSM6DSV16X 转接板（跟总线小板同一颗芯片） | 0x6A 或 0x6B（必须写） |
+   | `[trunk_imu] source` | 硬件 | I²C 地址 |
+   |---|---|---|
+   | `bus`（不写就是它） | kissqy 的总线 IMU 小板，ID 200 | — |
+   | `bno08x` | BNO085 / BNO086 模块 | 0x4A 或 0x4B（不写默认 0x4B） |
+   | `lsm6dsv16x` | LSM6DSV16X 转接板（跟总线小板同一颗芯片） | 0x6A 或 0x6B（必须写） |
 
-不写 `[trunk_imu]` 时，行为跟 kissqy 原版一样。其余全部是 kissqy 的 V167：包括这一版的「修复鸭身抖动」（每次上力把舵机 RAM 里的 D 写成 0、转矩限制写成 1000）。
+2. **舵机调参（可选）**：一个参数文件给全部 15 个舵机设 P、D、转矩限制，下次 HOME 上力时写入；另有命令改联合 Walk 模型的头、腿滤波。没有参数文件时，上力和卸力跟 V167 原版一个字节都不差（P = 模型合同的 5、D = 0、转矩限制 1000）。见第 4 节。
+3. **UDP 手柄与掉线坐下**：手柄（蓝牙的，或电脑上用官方 `duckctl udp-pad` 发过来的）正在开着鸭子时断了，1 秒后鸭子问一声、坐下；回来时打招呼。UDP 手柄默认关，一条命令打开。见第 5 节。
+
+V167 本身的「修复鸭身抖动」（每次上力把舵机 RAM 里的 D 写成 0、转矩限制写成 1000）原样保留。
 
 ## 现在的状态（2026-10-14）
 
 | | 状态 |
 |---|---|
-| BNO085 | **实测过**，不过用的是 V164（control.40）加这套补丁：我们的第一台鸭子，旧卡（R17）10-12 起、新卡（V164）10-13 起一直在跑；接 40 针 27 / 28 脚，`/dev/i2c-4`，0x4B |
-| 合到 V167 以后 | 单元测试跟 kissqy 原版 V167 的结果一致（失败名单相同），arm64 编译通过；**还没上过真机** |
+| BNO085 + V167 | 10-14 已在我们鸭子的新卡上实装（只换了 IMU 部分：robotd、robotctl 和 4 个安装脚本），BNO085 出数、安装方向确认过，站立、行走都跑过 |
+| 舵机调参 | 单元测试过：不设参数文件时，上力 / 卸力发到串口的每一帧和诊断输出，跟 kissqy 原版 V167 逐字节相同（同一个测试在原版代码上也通过）。**还没上真机** |
+| UDP 手柄 / 掉线坐下 | padd 单元测试 79 项、电脑上的端到端联调 14 项（假 robotd + 模拟 duckctl）都过；这一版交叉编译的 padd **还没在板上跑过** |
 | LSM6DSV16X | 只对模拟总线测过，**没上过真机** |
-| 安装脚本 `imu-module-install.sh` | 在模拟的安装目录里测过（21 项）；**还没在真板上跑过** |
-| 已知问题 | ① IMU 偶尔有过期帧，约 1.7%（当时主板过热降频，没分清原因）；② `verify-imu` 只能在调试模式下做，而调试模式一启动就卸力（见下面「确认安装方向」） |
+| 安装脚本 `imu-module-install.sh` | 在假板子上测过 56 项（模拟 systemd 和 robotd）；**这一版还没在真板上跑过**。上一版在真板上暴露的两个问题已改：robotd 卡在「等总线」时卸力确认必失败；kissqy 中控升级后清单里本来就有对不上的行，全量核对必失败 |
+| 已知问题 | ① IMU 偶尔有过期帧，约 1.7%（当时主板过热降频，没分清原因）；② `verify-imu` 只能在调试模式下做，而调试模式一启动就卸力（见第 3 节）；③ V167 默认的 P5 / D0 在我们的鸭子上策略站立时，机身前后约 2.5 Hz 晃动（俯仰角速度 RMS 约 12°/s；旧卡 P3 / D0 / 转矩 700 时约 1～2°/s），要用调参在同一张卡上对比 |
 
-实施记录、每一处跟计划的出入、还没验证的项：[`microduck-hd1910/firmware/docs/project/trunk-imu-i2c.zh-CN.md`](microduck-hd1910/firmware/docs/project/trunk-imu-i2c.zh-CN.md)。机制本身：[`robotd-design.md` §2.6](microduck-hd1910/firmware/docs/design/robotd-design.md)。
+实施记录、跟计划的出入、还没验证的项：[IMU 部分](microduck-hd1910/firmware/docs/project/trunk-imu-i2c.zh-CN.md)、[调参与 UDP 手柄部分](microduck-hd1910/firmware/docs/project/replica-v167.zh-CN.md)。机制本身：[`robotd-design.md` §2.6](microduck-hd1910/firmware/docs/design/robotd-design.md)（IMU）、同一文件「R17 HD1910 合同 P（control.33）」一节的 fork 注（调参）、[`docs/robot/udp-pad.md`](microduck-hd1910/firmware/docs/robot/udp-pad.md)（UDP 手柄）。
 
 ## 1. 硬件
 
@@ -56,33 +60,41 @@ kissqy 的 HD-1910 整套（R17 V167 / control.43）里，robotd 只认舵机总
 ```bash
 cd microduck-hd1910/firmware
 python3 prepare-V167.py                      # 恢复 kissqy 从 git 里去掉的随包资源（跑测试要用）
-cargo board --locked -p robotd -p robotctl   # 产物在 target/aarch64-unknown-linux-gnu/release/
+export DUCK_SYSROOT=~/.cache/duck-sysroot    # padd 要链接板上的 libudev：下面这步把 Debian trixie 的
+sh scripts/cross-sysroot.sh                  # arm64 包解到这个目录，最后打印几行 export，照着执行
+cargo board --locked -p robotd -p robotctl -p padd   # 产物在 target/aarch64-unknown-linux-gnu/release/
 ```
 
+- 国内下载 Debian 包慢，可以先 `export DUCK_DEBIAN_MIRROR=https://mirrors.ustc.edu.cn/debian`；
 - **别跑 `build-V167.sh`**：它会核对源码跟 kissqy 的发布逐字节一致，我们改过，一定失败；
-- **别拿错文件**：`packaging/robotd` 是 `prepare-V167.py` 恢复出来的 kissqy 原版，不认 IMU 模块。要用 `target/aarch64-unknown-linux-gnu/release/` 下面的 `robotd` 和 `robotctl`。
+- **别拿错文件**：`packaging/robotd`、`packaging/padd` 是 `prepare-V167.py` 恢复出来的 kissqy 原版。要用 `target/aarch64-unknown-linux-gnu/release/` 下面的 `robotd`、`robotctl`、`padd`。
 
-**第 2 步：拷到板上**，放进一个目录，比如 `~/imu-module/`：
-- `robotd`、`robotctl`（第 1 步编出来的）；
-- `microduck-hd1910/firmware/packaging/` 下的 `calibration-config.py`、`rebuild-config.py`、`runtime.py`、`voice-setup.py`；
+**第 2 步：拷到板上**，放进一个目录，比如 `~/replica/`：
+- `robotd`、`robotctl`、`padd`（第 1 步编出来的）；
+- `microduck-hd1910/firmware/packaging/` 下的 `calibration-config.py`、`rebuild-config.py`、`runtime.py`、`voice-setup.py`、`service.sh`；
 - `microduck-hd1910/firmware/deploy/imu-module-install.sh`。
 
-**第 3 步：扶住鸭子（会卸力），在板上运行：**
+**第 3 步：舵机电源开着，扶住鸭子（会卸力），在板上运行：**
 
 ```bash
-sudo bash ~/imu-module/imu-module-install.sh install ~/imu-module bno08x /dev/i2c-4 0x4B
+sudo bash ~/replica/imu-module-install.sh install ~/replica bno08x /dev/i2c-4 0x4B
 ```
 
 脚本按顺序做这些，每一步写进 `/var/log/imu-module-install.log`：
-1. 检查：板上是不是 control.43；拿来的 robotd 是不是 arm64、是不是 control.43、是不是带 IMU 模块支持（防止拿成 kissqy 原版）；地址对不对；`/dev/i2c-N` 在不在；
-2. 让 robotd 卸力并确认卸力了，才停 robotd；
-3. 备份：要换的 6 个文件、3 份清单、`robotd.toml`（两份）、标定文件（两份）、启动配置，放到 `/opt/robot/imu-module-backup-时间/`；
-4. 换文件，重算 `SHA256SUMS`、`ELF-CHECK.json`、`BUILD.json` 并核对；
+1. **检查**：板上是不是 control.43；拿来的三个程序是不是完整的 arm64 程序（用板上 kissqy 自己的检查）；robotd 是不是 control.43、带 IMU 模块和调参；padd 是不是认 `[netpad]`、依赖的库跟 kissqy 的 padd 相同、glibc 不超过 2.30，并在板上用 `ldd` 和 `padd --help` 确认能加载；`service.sh`、`runtime.py` 是不是这个分支的；地址对不对；`/dev/i2c-N` 在不在。板上已有旧版本留下的 `servo-test-parameters.json` 时打印出来：超出这个 robotd 收的范围（比如 kp = 0）就先拒绝，什么都不改；
+2. **卸力**：robotd 在运动模式控制中时，让它卸力并等到扭矩关闭、舵机寄存器恢复完成；robotd 在等总线、在调试模式、在反复重启或连不上时，扭矩状态确认不了，只发一次卸力请求，提醒你扶住或放倒鸭子。然后停 robotd（不管 systemd 说它在不在跑），再停 padd（它的程序要换）；
+3. **备份**到 `/opt/robot/imu-module-backup-时间/`：要换的 3 个程序和 5 个脚本、3 份清单、`robotd.toml`（两份）、标定文件（两份）、已有的参数文件、robotd 的启动配置、padd 的 AF_INET 配置（或「原来没有」的记号），以及安装前 `SHA256SUMS` 就核对不过的行；
+4. **换文件**（`service.sh` 可执行），重算 `SHA256SUMS`、`ELF-CHECK.json`、`BUILD.json`。换过的行必须全部核对通过，而且不能出现新的不一致；安装前就对不上的行（kissqy 中控升级会保留旧的模型目录、却写入新清单，`models/…/deployment-contract.json` 这类行刚升完就对不上）原样保留并在日志里列出；
 5. `robotd.toml` 和 `robotd.saved.toml` 写入 `[trunk_imu]`；
-6. 重新生成 robotd 的启动配置，让它能打开 `/dev/i2c-*`；
-7. 启动 robotd；最后提醒你这个模块的安装方向确认过没有。
+6. 重新生成 robotd 的启动配置（允许 `/dev/i2c-*`），加 padd 的 `/etc/systemd/system/padd.service.d/zzzz-replica-netpad.conf`（允许 AF_INET，UDP 手柄要用；kissqy 自己的 padd 配置不动）；
+7. **启动并核对**：重载 systemd → 起 robotd → 等它四步启动完成（最多 60 秒）→ 核对 `busStatus`（版本、IMU 来源、有没有调参字段）→ 重启 padd，看新进程开始驾驶 → GameSir 输入桥**只在它本来就是启用状态时**一并启动（不启用任何本来停用的服务，不跑 `gamepad.py prepare-all`）。最后报告输入服务的状态、IMU 安装方向确认过没有、有没有参数文件。
 
-**备份之后任何一步失败，脚本都会自己撤回，并重新启动 robotd。** 想手动撤回：`sudo bash imu-module-install.sh rollback <它打印的备份目录>`。看现在装的是什么：`sudo bash imu-module-install.sh check`。
+**备份之后任何一步失败，脚本都会自己撤回**：停 robotd 和 padd、把备份拷回去、逐个比对、重新启动。手动撤回：`sudo bash imu-module-install.sh rollback <它打印的备份目录>`，回到**那次安装之前**的样子：
+- 要用**这次安装新打的备份**。更早的备份（比如装 IMU 模块之前的）会装回 kissqy 原版 robotd，它不认标定文件里的 `[imu_mounts]`，会一直卡在等总线；真要回到 kissqy 原版，还要把两份标定文件里的 `[imu_mounts.*]` 删掉；
+- 撤回结束退出码为 2，表示文件已恢复、服务已启动，但核对有差异（日志写明是哪一行）；
+- `joint-filters` 改过的滤波不跟着撤回（见 4.2）。
+
+看现在装的是什么：`sudo bash imu-module-install.sh check`（程序种类、robotd 状态、padd 的协议族、输入服务、IMU 方向、参数文件、两份 `robotd.toml` 的 `[netpad]`、Walk 的头腿滤波、清单里对不上的行）。
 
 ## 3. 确认 IMU 的安装方向（必须做）
 
@@ -106,38 +118,123 @@ sudo bash /opt/robot/feetech-ft5-r5/service.sh enable                     # 回�
 2. 在标定文件里手动写上这一节，`verified = true`。四元数要归一化（平方和跟 1 的差不超过 1e-6），小数写够位数；
 3. 用 microduck-replica 的 [`tools/radxa/onboard-analysis/`](https://github.com/fanhao375/microduck-replica/tree/master/tools/radxa/onboard-analysis) 先查四个方向都对，再站 HOME，用仿真算出机身应有的倾斜，跟 IMU 读数比，得出偏差，补进四元数。那几个脚本按我们的板子写的：用户名是 `duck`（kissqy 镜像是 `radxa`），仿真那一步要电脑上装 mujoco 和官方 microduck_rl。
 
-## 4. 注意
+## 4. 调参（可选）
 
-- **别在 kissqy 的中控里点「安装 / 升级固件」**：它会装回他的 robotd（不认 IMU 模块），鸭子读不到 IMU、上不了力；他的安装脚本还会把总线小板那份安装方向标成已确认、关掉运动开关。点了也不要紧，重新跑一遍第 2 节的安装就行。kissqy 出新版时，等这里合进去再升；
+全部走 SSH，用板上的 `service.sh`（以下写成 `S=/opt/robot/feetech-ft5-r5/service.sh`）。kissqy 原版中控没有这些按钮。
+
+### 4.1 舵机 P / D / 转矩限制
+
+```bash
+sudo bash $S servo-parameters 3 0 700     # P D 转矩限制，全部 15 个舵机（含嘴巴）用同一组
+sudo bash $S servo-parameters-clear       # 删掉参数文件 = 回到 V167 原版
+```
+
+- **范围**：P 1～32、D 0～64、转矩限制 200～1000，都是整数。P 大于 10 或转矩限制小于 500 时打印警告（不拦，也不问）；
+- **存在哪**：`/etc/robot/feetech-ft5/servo-test-parameters.json`，内容就是 `{"kp": 3, "kd": 0, "torque_limit": 700}`；
+- **什么时候生效**：下次 HOME 上力时，一次写进全部舵机 RAM 的 48 号起 4 个字节（转矩限制低、高、P、D），再读回核对；不一致就拒绝上力。不写 EEPROM，策略的 gain 请求和换模型都不会改它；
+- **卸力后是什么状态**：P 恢复成上力前的值，D = 0，转矩限制 1000，跟 V167 原版卸力后完全一样；
+- **不设参数文件**：就是 V167 原版，上力写 P = 模型合同的 5、D = 0、转矩限制 1000，跟 kissqy 的 control.43 一个字节都不差；
+- **每条命令都会卸力并重启 robotd**：先让 robotd 卸力，确认扭矩关闭、寄存器恢复完成后才停它（确认不了就不动，robotd 保持运行），写文件，重启 robotd，回读确认它读到的就是你给的值，最后拉起 padd（GameSir 输入桥只在启用时）。**扶住或吊起鸭子**；
+- **确认生效**：命令最后会打印回读结果；`sudo bash $S report` 里 `native.hd1910.servo_parameters` 是你的值，`gain_mode` 变成 `hd1910_servo_parameters_file_relax_p_restored_d0_limit1000`；HOME 时 `journalctl -u robotd` 有 `HD1910 servo parameters file (torque limit, P, D) confirmed on all joints`；
+- **建议先跑对照**：`servo-parameters 5 0 1000` 跟不设文件时舵机寄存器的状态逐字节相同（有测试），先用它确认整条路径正常，再试目标值；新值先吊着试；
+- **文件坏了**（手改错、范围外）：robotd 停在「等总线」并写明原因，不碰舵机；`sudo bash $S servo-parameters-clear` 恢复；
+- **已经上力时 HOME**（比如 robotd 被重启过、舵机还带着扭矩）：只核对文件里的值，不写；不一致就拒绝上力，报错写「torque stays on; relax first」，先卸力再 HOME；
+- **卸力后恢复一直确认不了**（某个舵机不应答）：命令会拒绝并保持 robotd 运行；先断舵机电，再 `sudo systemctl stop robotd`，然后重试；
+- 一次写 48～51 四个相邻寄存器，是 kissqy 设计文档「P 写入和恢复不跨相邻寄存器」的例外；kissqy 自己的 control.29 用过同样的写法，P3 / D0 / 700 在我们的旧卡上跑过多次。
+
+### 4.2 头、腿滤波（联合 Walk 模型）
+
+```bash
+sudo bash $S models                             # 看当前 Walk 的模型标识
+sudo bash $S joint-filters <模型标识> 0.50 0.70   # 头部 腿部，0.10～1.00，步长 0.01
+```
+
+- 只改当前启用的联合 Walk 模型目录里 `deployment-execution.json` 的 `head_lowpass` / `legs_lowpass`，动作缩放不动；第一次改时把原文件存成 `deployment-execution.json.orig`，以后不再覆盖；
+- 模型标识、是不是当前 Walk、有没有联合执行配置，在卸力**之前**就检查，打错不会白卸一次力；
+- 恢复：`joint-filters <模型标识> 0.50 0.70`（随包默认），或者把 `.orig` 拷回去。安装脚本撤回时**不会**恢复滤波，会在日志里提醒。
+
+### 4.3 要知道的
+
+- **robotd 停止、重启、崩溃都不卸力，也不恢复寄存器。** 调参一律用上面的 `service.sh` 子命令，别直接 `systemctl restart robotd`；
+- **掉电、换电池、舵机重启之后，先卸力再 HOME**：robotd 认为自己还上着力时，HOME 直接返回，舵机会带着上电默认的 P32 / D40 上力（V167 原版也一样）；
+- **这些会删参数文件**：`service.sh install / start / upgrade / reset-models`，以及 kissqy 中控的「安装 / 升级固件」（它们走同一个安装流程）。`reset-models` 还会把随包模型的滤波文件覆盖回默认（`.orig` 留着）；
+- robotd 上力中被重启过、又删了参数文件时，卸力后 P 可能停在文件里的旧值，给舵机断一次电就回到出厂值。
+
+## 5. UDP 手柄与掉线坐下
+
+这一版换了 padd（读手柄、把按键变成指令的那个程序）。机制和完整说明：[`docs/robot/udp-pad.md`](microduck-hd1910/firmware/docs/robot/udp-pad.md)。
+
+### 5.1 掉线坐下（蓝牙手柄和 UDP 手柄都有）
+
+正在开着鸭子的手柄不见了：padd 先停止发指令，robotd 的 0.5 秒 deadman 让鸭子停步；满 1 秒还没回来，鸭子发出一声疑问，然后坐下（`sit_toggle`，跟方向键下默认的动作一样）。已经坐着、或者策略没在驱动（只 HOME 了）时不动。手柄回来时打招呼。短于 1 秒的闪断什么都不发生。坐下用的是当前上力的增益（有参数文件时就是文件里的值，转矩限制调得很低时坐下可能变成塌下）。
+
+**不开 UDP 手柄时，padd 也已经不是 kissqy 原版**：多了掉线坐下、提示音，以及上游的 Select 修复。
+
+什么时候算「不见了」：
+- **G50 Pro（Switch Pro 模式）直连**：不经过输入桥，手柄断开时设备直接消失，会触发；
+- **经 GameSir 输入桥（`gamesir-xboxd`）**：桥在手柄断开时销毁虚拟手柄，正常关手柄会触发；但信号突然丢失时，在蓝牙链路超时（缺省约 20 秒）之前，虚拟手柄会保留最后的摇杆值，padd 会照着继续发（kissqy 原有的行为），到链路判定断开才触发；
+- **UDP 手柄**：超过 `timeout_ms`（默认 250 ms）没收到数据。大约 0.25 秒判掉线、0.75 秒停步、1.25 秒坐下。
+
+### 5.2 用电脑上的手柄（UDP）
+
+默认关。在板上开（会先卸力，扶住或吊起鸭子）：
+
+```bash
+sudo bash $S netpad on             # 端口 4210，超时 250 ms；也可以写 netpad on 4210 250
+sudo bash $S netpad off            # 回到蓝牙手柄和网页手柄
+```
+
+电脑上（Windows / macOS / Linux，先装 [uv](https://docs.astral.sh/uv/)），插上手柄：
+
+```bash
+uvx duckctl@0.17.1 --help                  # 第一次先跑一下，把依赖下好
+uvx duckctl@0.17.1 udp-pad 192.168.x.x     # 一定写鸭子的 IP；推杆前进鸭子却后退，加 --invert-y
+```
+
+- `netpad on` 会检查两份 `robotd.toml` 的数值（端口 1～65535，超时大于 0 且小于 `[safety] deadman_ms`，没写就是 500）、板上的 padd 认不认 `[netpad]`、padd 允不允许 AF_INET；写进两份配置（各留一份 `.previous`），只重启 padd，看新进程的日志里有没有 `netpad on —`，没有就把两份配置恢复回去；`netpad off` 不带参数，保留原来的端口和超时；
+- **开着时蓝牙手柄和网页手柄都不读**；
+- **没有认证**：同一个局域网里谁都能开你的鸭子、让它卸力、关机。只在信得过的网络里、用的时候才开；
+- Windows 第一次运行会弹防火墙，要放行；电脑开着 Clash 之类的 TUN 模式时，局域网的包可能被截走，关掉 TUN 或者把鸭子的网段排除；
+- 逐个试按键时**跳过这三个**：Select 长按 2 秒（坐下并关机）、方向键上按住 3 秒（切到滚轮模式）、方向键右（重启舵机）；
+- 摇杆按下（L3 滚轮测试）不在 UDP 协议里，只能用蓝牙手柄；
+- kissqy 中控的「修复手柄连接」靠 padd 有没有打开虚拟 Xbox 手柄来判断，UDP 手柄开着时会误判、重启 padd；重启输入桥也会触发一次掉线坐下；
+- **`[netpad]` 写错了**（手改）：这一版的 robotd 启动第 1 步就拒绝，日志点名是哪个键（跟上游一致）；把两份 `robotd.toml` 的 `[netpad]` 改好或删掉，再 `sudo bash $S reconnect`。
+
+## 6. 注意
+
+- **别在 kissqy 的中控里点「安装 / 升级固件」**：它会装回他的 robotd（不认 IMU 模块，鸭子读不到 IMU、上不了力）和他的 padd，删掉参数文件；他的安装脚本还会把总线小板那份安装方向标成已确认、关掉运动开关，升级完多半报「启动超时」。点了也不要紧，重新跑一遍第 2 节的安装就行。kissqy 出新版时，等这里合进去再升；
 - **换了模块、拆装过，要重新确认安装方向**；
 - 别的程序在读同一个 I²C 节点时，robotd 打不开它，报错会说明（代码里说的 servo-web 是 microduck-replica 的网页调试台，它的 I²C 读 IMU 部分目前还没公开）；
-- 看板上跑的是不是这一版：`imu-module-install.sh check`，或者看 `robot.busStatus` 里有没有 `imu_source` 这个字段（只有这一版有）。
+- 看板上跑的是不是这一版：`imu-module-install.sh check`，或者看 `robot.busStatus` 里有没有 `imu_source`、`native.hd1910.servo_parameters` 这两个字段（只有这一版有）。
 
-## 5. 改了什么（修改说明）
+## 7. 改了什么（修改说明）
 
 相对 kissqy `78bef11`（R17 V167 / control.43）：
 
 | 位置 | 改动 |
 |---|---|
-| `duck-control/src/` | 新增 `bno08x.rs`（BNO08x 的 SHTP / SH-2 编解码）、`lsm6dsv16x.rs`（LSM6DSV16X 的上电配置和 FIFO 解码）、`trunk_imu.rs`（主板读的 IMU 的样本、新鲜度门限、各型号安装方向）；`feetech.rs`、`feetech_snapshot.rs`、`imu.rs`、`io.rs`、`lib.rs` 接入这三种来源；`Cargo.toml` |
-| `robotd/src/` | 新增 `trunk_imu_i2c.rs`（读 I²C 的后台线程，坏包丢弃、断线重开）；`main.rs`、`feetech_commissioning.rs`（`verify-imu` 的模块分支）、`feetech_read_only.rs`、`home_start.rs`、`raw_stream.rs` 和几处测试 |
-| `robotd-params/src/` | 新增 `[trunk_imu]` 配置节和校验 |
-| `robotctl/src/configure.rs` | 认得新配置节 |
-| `packaging/` | `calibration-config.py`、`rebuild-config.py`（每种 IMU 一份安装方向，重装时保留）、`runtime.py`（启动配置允许 `char-i2c`，回读核对模块的安装方向）、`voice-setup.py`（没有 HAT 声卡时跳过音频设置），以及相应测试 |
-| `deploy/` | `robotd.toml` 加 `[trunk_imu]` 的说明；新增 `imu-module-install.sh` |
-| `docs/` | `design/robotd-design.md` §2.6；新增 `project/trunk-imu-i2c.zh-CN.md`；`README.md` 加一行索引 |
+| `duck-control/src/` | IMU：新增 `bno08x.rs`（BNO08x 的 SHTP / SH-2 编解码）、`lsm6dsv16x.rs`（LSM6DSV16X 的上电配置和 FIFO 解码）、`trunk_imu.rs`（主板读的 IMU 的样本、新鲜度门限、各型号安装方向）；`feetech.rs`、`feetech_snapshot.rs`、`imu.rs`、`io.rs`、`lib.rs` 接入这三种来源；`Cargo.toml`。调参：`hd1910.rs`（有参数文件时的上力 / 卸力分支）、`hd1910_test.rs`（读参数文件、范围；kissqy 原有这个文件但没接入，这里接入）、`feetech.rs`（`gain_mode`、测试，包括跟原版逐字节比对的金样） |
+| `robotd/src/` | IMU：新增 `trunk_imu_i2c.rs`（读 I²C 的后台线程，坏包丢弃、断线重开）；`main.rs`、`feetech_commissioning.rs`（`verify-imu` 的模块分支）、`feetech_read_only.rs`、`home_start.rs`、`raw_stream.rs` 和几处测试。调参：`main.rs` 开串口前读参数文件 |
+| `robotd-params/src/` | 新增 `[trunk_imu]`、`[netpad]` 配置节和校验 |
+| `robotctl/src/configure.rs` | 认得 `[trunk_imu]` |
+| `padd/` | 新增 `src/loss.rs`（掉线坐下）、`src/udp.rs`、`src/udp/{health,receiver,wire}.rs`（UDP 手柄），移植自 Pollen Robotics 官方 microduck 0.17.1 的 `pad-map`、`netpadd`；`src/main.rs` 接入；`systemd/padd.service` 允许 AF_INET |
+| `packaging/` | IMU：`calibration-config.py`、`rebuild-config.py`（每种 IMU 一份安装方向，重装时保留）、`runtime.py`（启动配置允许 `char-i2c`，回读核对模块的安装方向）、`voice-setup.py`（没有 HAT 声卡时跳过音频设置）。调参与 UDP：`service.sh`（`servo-parameters`、`servo-parameters-clear`、`joint-filters`、`netpad`）、`runtime.py`（同上）、`padd.service`（AF_INET）、`fixtures/robotd-board-v167.toml`（板上真实的配置格式，测试用）。以及相应测试，新增 `test_tunable_parameters.py`、`test_netpad.py` |
+| `deploy/` | `robotd.toml` 加 `[trunk_imu]` 的说明；新增 `imu-module-install.sh`（装整套）和它的假板子测试 `test-imu-module-install.sh` |
+| `scripts/pad-link-test.sh` | 统计掉线时只数 padd 的 `pad gone —` |
+| `docs/` | `design/robotd-design.md`（§2.6；padd 一段加掉线坐下和 UDP；control.33 一节加 fork 注）；新增 `robot/udp-pad.md`、`project/trunk-imu-i2c.zh-CN.md`、`project/replica-v167.zh-CN.md`；`README.md` 加索引 |
 | `Cargo.lock` | 依赖锁定跟着变 |
-| `console/`（kissqy 的中控） | **没改**，原样保留。所以用模块时，中控调试页的 IMU 那一行还写着 FT6；「保存安装确认」只等 15 秒，模块要 20 秒，会超时，安装方向用第 3 节的 SSH 办法确认 |
+| `console/`（kissqy 的中控） | **没改**，原样保留。所以用模块时，中控调试页的 IMU 那一行还写着 FT6；「保存安装确认」只等 15 秒，模块要 20 秒，会超时，安装方向用第 3 节的 SSH 办法确认；中控里也没有调参和 UDP 手柄的按钮 |
 | 仓库根目录 | `README.md`、`README.en.md` 换成我们写的首页；kissqy 的原首页改名为 `README-kissqy.md`、`README-kissqy.en.md` 原样保留（只改了顶部一段和语言切换链接）；`DUCK-SHOPPING-LIST*.md`、`docs/README*.md`、`docs/AUTHOR-JOURNEY*.md` 里指向首页的链接改指原版首页；新增本页 |
 
-每个改过的源码和文档文件开头，都加了一行修改声明（`Cargo.lock` 没法加注释，见本表）。
+每个改过的源码和文档文件开头，都加了一行修改声明（`Cargo.lock` 没法加注释，见本表）；从 Pollen 移植的文件，声明里写了来源文件。
 
 **许可**：
-- 我们对 Rust 工作区、`packaging/`、`deploy/`、`docs/` 的改动，跟 kissqy 的固件一样按 **Apache-2.0** 提供（版权 fanhao375 / microduck-replica）；
+- 我们对 Rust 工作区、`packaging/`、`deploy/`、`scripts/`、`docs/` 的改动，跟 kissqy 的固件一样按 **Apache-2.0** 提供（版权 fanhao375 / microduck-replica）；
+- padd 的 UDP 手柄和掉线坐下移植自 Pollen Robotics 的官方 [microduck](https://github.com/pollen-robotics/microduck) 0.17.1（Apache-2.0）；
 - 原首页和那几份文档里的改动，跟随 kissqy 原文的个人非商业许可；新首页 `README.md`、`README.en.md` 是我们写的；
 - LSM6DSV16X 的寄存器配置照搬自 microduck-replica 的 `imu_to_dxl` 固件（MIT，Copyright (c) 2026 imu_to_dxl contributors），引用的是 ST 的 LSM6DSV16X 驱动（BSD-3-Clause，Copyright (c) 2019 STMicroelectronics）的寄存器定义；
 - kissqy 的 `LICENSE`、`LICENSES/`、第三方声明都原样保留；
-- `SOURCE-SHA256SUMS.txt`、`firmware/SHA256SUMS`、`PUBLICATION-MANIFEST.json`、`console/BUILD_MANIFEST.json`、`verification/v167/` 描述的是 kissqy 的原版发布，对我们改过的文件不成立，**我们没有重算**：不拿他的发布身份给我们的代码作保。
+- `SOURCE-SHA256SUMS.txt`、`firmware/SHA256SUMS`、`packaging/SHA256SUMS`、`PUBLICATION-MANIFEST.json`、`console/BUILD_MANIFEST.json`、`verification/v167/` 描述的是 kissqy 的原版发布，对我们改过的文件不成立，**我们没有重算**：不拿他的发布身份给我们的代码作保。板上的清单由安装脚本按实际换上的文件重算。
 
 **致谢**：kissqy 的 HD-1910 适配整套；Pollen Robotics 的官方 [microduck](https://github.com/pollen-robotics/microduck)（Apache-2.0）。
 
@@ -145,10 +242,14 @@ sudo bash /opt/robot/feetech-ft5-r5/service.sh enable                     # 回�
 
 ## English summary
 
-This is a fork maintained by [microduck-replica](https://github.com/fanhao375/microduck-replica); it is **not** an official kissqy release and he has not reviewed it. It adds one thing to kissqy's R17 V167 (control.43): the trunk IMU can be a ready-made module on the Zero 3W's own I²C — `[trunk_imu] source = "bno08x"` (BNO085/086, 0x4A/0x4B) or `"lsm6dsv16x"` (0x6A/0x6B, address required) — instead of his bus IMU board (ID 200). Without `[trunk_imu]` it behaves like kissqy's V167.
+This is a fork maintained by [microduck-replica](https://github.com/fanhao375/microduck-replica); it is **not** an official kissqy release and he has not reviewed it. On top of kissqy's R17 V167 (control.43) it adds three optional things; with none of them switched on it behaves like his V167:
 
-Status: BNO085 runs on our robot with the same patch on V164 since 2026-10-12; the V167 merge passes the same unit tests as stock V167 and builds for aarch64, but has not run on a robot yet; LSM6DSV16X has only been tested against a fake bus.
+1. **IMU module on the board's I²C**: `[trunk_imu] source = "bno08x"` (BNO085/086, 0x4A/0x4B) or `"lsm6dsv16x"` (0x6A/0x6B, address required) instead of his bus IMU board (ID 200).
+2. **Servo tuning**: `service.sh servo-parameters P D limit` writes `servo-test-parameters.json` (P 1–32, D 0–64, torque limit 200–1000); the next HOME writes it to all 15 servos in one 4-byte write at register 48 and reads it back; relax leaves P restored, D=0 and limit 1000, exactly as V167 does. Without the file, the bytes robotd sends are V167's, byte for byte (a golden test passes on both). `servo-parameters-clear` removes it; `joint-filters <id> head legs` edits the joint Walk's head/legs lowpass (the first original kept as `.orig`). Each command relaxes the robot and restarts robotd — hold the duck. robotd never relaxes on stop/restart/crash; after a power cycle, relax before HOME. `service.sh install/upgrade/reset-models` and kissqy's console upgrade delete the file.
+3. **UDP pad and pad-loss sit** (padd ported from Pollen microduck 0.17.1): a driving pad (Bluetooth, or `uvx duckctl@0.17.1 udp-pad <robot IP>` over the LAN) that stays gone a second makes the robot ask and sit down. The UDP pad is off by default; `service.sh netpad on [port] [timeout_ms]` / `netpad off` switch it, checking both `robotd.toml` copies against their own deadman. It is unauthenticated: LAN you trust only.
 
-Install on a duck already upgraded to V167 through kissqy's console: build with `python3 prepare-V167.py && cargo board --locked -p robotd -p robotctl` (do not run `build-V167.sh`, and do not use `packaging/robotd`, which is kissqy's), copy the two binaries, the four packaging scripts and `deploy/imu-module-install.sh` to the board, then `sudo bash imu-module-install.sh install <dir> bno08x /dev/i2c-4 0x4B`. It backs everything up, restores the backup on any failure, and never marks the IMU mount verified — confirm it with `service.sh bus verify-imu --confirmed` in commissioning mode (upright, then tip nose-down 15–30° within 20 s), not through kissqy's console (it gives up after 15 s). Do not press "install/upgrade firmware" in kissqy's console afterwards: it reinstalls his robotd, which cannot read the module.
+Status: the IMU part runs on our robot on V167 (stood and walked, 2026-10-14). Tuning and the UDP pad pass their unit tests (and a host end-to-end run for the UDP pad) but have not run on a robot; the cross-built padd has never run on a board.
 
-Our changes to the Rust workspace, `packaging/`, `deploy/` and `docs/` are Apache-2.0; the LSM6DSV16X configuration follows the MIT-licensed `imu_to_dxl` firmware and ST's BSD-3-Clause driver. Report problems to microduck-replica, not to kissqy.
+Install on a duck already upgraded to V167 through kissqy's console: `python3 prepare-V167.py`, `sh scripts/cross-sysroot.sh` (export what it prints), `cargo board --locked -p robotd -p robotctl -p padd` (do not run `build-V167.sh`, and do not use `packaging/robotd` / `packaging/padd`, which are kissqy's); copy the three binaries, `calibration-config.py`, `rebuild-config.py`, `runtime.py`, `voice-setup.py`, `service.sh` and `deploy/imu-module-install.sh` to the board; with servo power on, `sudo bash imu-module-install.sh install <dir> bno08x /dev/i2c-4 0x4B`. It relaxes the robot according to its state, backs everything up, waits for robotd's four startup steps, checks busStatus and padd, and restores the backup by itself on any failure; `rollback <backup>` returns to the state before that install. It never marks the IMU mount verified — confirm it with `service.sh bus verify-imu --confirmed` in commissioning mode (upright, then tip nose-down 15–30° within 20 s), not through kissqy's console (it gives up after 15 s).
+
+Our changes to the Rust workspace, `packaging/`, `deploy/`, `scripts/` and `docs/` are Apache-2.0; the padd UDP pad follows Pollen Robotics' microduck 0.17.1 (Apache-2.0); the LSM6DSV16X configuration follows the MIT-licensed `imu_to_dxl` firmware and ST's BSD-3-Clause driver. Report problems to microduck-replica, not to kissqy.

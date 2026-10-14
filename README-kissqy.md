@@ -1,6 +1,6 @@
 **简体中文** | [English](README-kissqy.en.md)
 
-> **这是 kissqy 的原版首页，原样保留**（只改了这一段和语言切换链接）。本 fork 的首页在 [README.md](README.md)，IMU 模块的说明在 [IMU-MODULE.md](IMU-MODULE.md)。下面的下载区、一键镜像、中控 ZIP 都是 kissqy 原版，**不带** IMU 模块支持。
+> **这是 kissqy 的原版首页，原样保留**（只改了这一段和语言切换链接）。本 fork 的首页在 [README.md](README.md)，IMU 模块、调参和 UDP 手柄的说明在 [IMU-MODULE.md](IMU-MODULE.md)。下面的下载区、一键镜像、中控 ZIP 都是 kissqy 原版，**不带**这些改动。
 
 
 <div align="center">

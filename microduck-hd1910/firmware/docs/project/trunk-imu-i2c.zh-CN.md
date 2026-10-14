@@ -87,3 +87,4 @@ R17 的 robotd 只认一种躯干 IMU：舵机总线上的 FT6 / imu_to_dxl 小�
 - **测试**（WSL，跟未改的 V167 在同一环境下对比；电脑上用的 ONNX Runtime 是 1.24.4，不是要求的 1.28.0，所以两边都有同样 17 个用例失败）：`verification/run-V167-tests.py` 跑 duck-control、duck-ipc-proto、robotd（每个用例一个进程）、padd，本分支 579 过 / 17 败，原版 498 过 / 17 败，失败名单完全相同；robotd-params、robotctl 全过；packaging 的 Python 测试两边每个文件结果相同；rustfmt、clippy 没有新增问题（原版本身有不合格项）。`cargo board -p robotd -p robotctl` 编译通过，glibc 最高 2.30，BUILD 是 `1fa8438-feetech-ft6-control.43`。
 - **安装脚本** `deploy/imu-module-install.sh`：在模拟的安装目录里测过（跳过 systemd）：各种拒绝、安装、再装、撤回、中途失败自动撤回、没有 `tomllib` 时读标定，共 21 项全过。
 - **还没上真机**：合进 V167 后的 robotd 和安装脚本都还没在板子上跑过。
+- **之后**：同一天晚上 V167 + IMU 版装上了新卡（站立、行走跑过）；调参、UDP 手柄和整套安装脚本的合并见 [`replica-v167.zh-CN.md`](replica-v167.zh-CN.md)。
