@@ -5,17 +5,19 @@
 # systemd, robotd or /etc: systemctl / journalctl are stubs on PATH, robotd is a small fake that
 # answers busStatus / relax / startupSubscribe on a UNIX socket in the temporary directory.
 #
-#   sudo bash deploy/test-imu-module-install.sh <release dir> <kissqy V167 packaging dir> [IMU-only robotd]
+#   sudo bash deploy/test-imu-module-install.sh <release dir> <kissqy V167 packaging dir> <IMU-only robotd>
 #     <release dir>                robotd, robotctl, padd (aarch64) built from this branch (cargo board)
 #     <kissqy V167 packaging dir>  packaging/ of a kissqy 78bef11 checkout after prepare-V167.py: the
 #                                  installed V167 the fake board starts from
-#     [IMU-only robotd]            optional: a robotd from the IMU-only build, which must be refused
+#     <IMU-only robotd>            a robotd from the IMU-only build (hd1910-v167-trunk-imu-i2c): most fake
+#                                  boards start with it installed, as a duck that already runs the IMU
+#                                  module does; as a source it must be refused
 #   PY=<python 3.11+> picks the interpreter the installer and the checks run with (default python3).
 # Needs Linux, root (the installer uses install -o root), sha256sum, comm, cmp.
 set -u
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 SCRIPT=$HERE/deploy/imu-module-install.sh
-RELEASE=${1:?release dir} KISSQY=${2:?kissqy packaging dir} IMU_ONLY=${3:-}
+RELEASE=${1:?release dir} KISSQY=${2:?kissqy packaging dir} IMU_ONLY=${3:?IMU-only robotd}
 PY=$(command -v "${PY:-python3}")
 BASE_PATH=$PATH
 W=$(mktemp -d /tmp/imu-install-test.XXXXXX)
@@ -41,13 +43,17 @@ case $1 in
     st=$(cat "$R/units/$unit.enabled" 2>/dev/null || echo disabled); echo "$st"; [ "$st" = enabled ] ;;
   stop)
     for u in "${@:2}"; do u=${u%.service}; echo inactive > "$R/units/$u.active"
-      if [ "$u" = robotd ] && [ -f "$R/units/robotd.pid" ]; then
-        kill "$(cat "$R/units/robotd.pid")" 2>/dev/null; rm -f "$R/units/robotd.pid" "$R/robotd.sock"; fi
+      if [ "$u" = robotd ]; then
+        for p in $(cat "$R/units/consists" 2>/dev/null); do echo inactive > "$R/units/${p%.service}.active"; done
+        if [ -f "$R/units/robotd.pid" ]; then
+          kill "$(cat "$R/units/robotd.pid")" 2>/dev/null; rm -f "$R/units/robotd.pid" "$R/robotd.sock"; fi
+      fi
     done ;;
   start|restart)
     for u in "${@:2}"; do u=${u%.service}
       case $u in
-        robotd) [ -f "$R/units/robotd.pid" ] || { python3 "$R/fake_robotd.py" "$R/robotd.sock" "$R/robotd-after.json" >>"$R/fake-robotd.log" 2>&1 & echo $! > "$R/units/robotd.pid"; } ;;
+        # 9>&-: systemd would not hand robotd the installer's lock descriptor; a child of this stub must not either.
+        robotd) [ -f "$R/units/robotd.pid" ] || { python3 "$R/fake_robotd.py" "$R/robotd.sock" "$R/robotd-after.json" >>"$R/fake-robotd.log" 2>&1 9>&- & echo $! > "$R/units/robotd.pid"; } ;;
         padd) echo $((RANDOM + 1000)) > "$R/units/padd.pid" ;;
       esac
       echo active > "$R/units/$u.active"
@@ -56,6 +62,7 @@ case $1 in
     prop=; while [ $# -gt 0 ]; do [ "$1" = -p ] && prop=$2; shift; done
     case $prop in
       MainPID) cat "$R/units/padd.pid" 2>/dev/null || echo 0 ;;
+      ConsistsOf) cat "$R/units/consists" 2>/dev/null || echo ;;
       LoadState) echo loaded ;;
       RestrictAddressFamilies)
         f='AF_UNIX AF_NETLINK'; [ -f "$R/systemd/padd.service.d/zzzz-replica-netpad.conf" ] && f="$f AF_INET"; echo "$f" ;;
@@ -71,8 +78,9 @@ exit 0
 EOF
     chmod +x "$R/bin/python3" "$R/bin/systemctl" "$R/bin/journalctl"
     cat > "$R/fake_robotd.py" <<'EOF'
-import json, os, socketserver, sys, threading
+import json, os, socketserver, sys, threading, time
 path, scenario = sys.argv[1], json.load(open(sys.argv[2]))
+slowed = []
 calls = os.path.join(os.path.dirname(path), 'robotd-calls.log')
 lock = threading.Lock()
 armed = scenario['mode'] == 'motion' and scenario['phase'] == 'control' and scenario.get('armed', False)
@@ -94,11 +102,18 @@ class Handler(socketserver.StreamRequestHandler):
         for line in self.rfile:
             request = json.loads(line); method = request.get('method')
             with open(calls, 'a') as f: f.write(method + '\n')
-            if method == 'robot.busStatus': result = report()
+            if method == 'robot.busStatus':
+                if scenario.get('hang'): time.sleep(30)                      # never answers in time
+                if scenario.get('slow_first') and not slowed:
+                    slowed.append(1); time.sleep(2.5)                         # one answer after 2.5 s
+                result = report()
             elif method == 'robot.relax':
-                with lock:
-                    state['torque'] = False
-                    if scenario.get('settles', True): state['restore'] = state['applied'] = False
+                # V167: torque goes OFF first, the HD1910 registers are restored after that.
+                with lock: state['torque'] = False
+                if scenario.get('settles', True):
+                    def settle():
+                        with lock: state['restore'] = state['applied'] = False
+                    threading.Timer(scenario.get('restore_delay', 0.6), settle).start()
                 result = {'accepted': True}
             elif method == 'robot.startupSubscribe':
                 good = scenario.get('startup_ok', True)
@@ -121,10 +136,15 @@ server.serve_forever()
 EOF
 }
 
-board() {   # a fresh fake board at $R; $1 = a (NO_SYSTEMD) | b (stubbed systemd + fake robotd)
+board() {   # a fresh fake board at $R; $1 = a (NO_SYSTEMD) | b (stubbed systemd + fake robotd);
+            # $2 = original: kissqy's robotd installed instead of the IMU-only one
     stop_fake
     R=$W/board-$((++BOARDS)); mkdir -p "$R"/{opt,etc,src,systemd,bin,units}
     cp -a "$KISSQY/." "$R/opt/"
+    if [ "${2:-}" != original ]; then
+        cp "$IMU_ONLY" "$R/opt/robotd"
+        sed -i "s/^[0-9a-f]\{64\}  robotd\$/$(sha256sum "$R/opt/robotd" | cut -c1-64)  robotd/" "$R/opt/SHA256SUMS"
+    fi
     cp "$RELEASE/robotd" "$RELEASE/robotctl" "$RELEASE/padd" "$R/src/"
     for f in calibration-config.py rebuild-config.py runtime.py voice-setup.py service.sh; do cp "$HERE/packaging/$f" "$R/src/"; done
     printf '["bus"]\n"protocol" = "feetech"\n\n["policy"]\n"action_scale" = 0.7\n' > "$R/etc/robotd.toml"; cp "$R/etc/robotd.toml" "$R/etc/robotd.saved.toml"
@@ -134,7 +154,7 @@ board() {   # a fresh fake board at $R; $1 = a (NO_SYSTEMD) | b (stubbed systemd
     echo '{"mode": "motion", "phase": "control"}' > "$R/robotd-after.json"
     touch "$R/padd-driving"
     export INSTALL_DIR=$R/opt CONFIG_DIR=$R/etc BACKUP_ROOT=$R LOG=$R/install.log SYSTEMD_DIR=$R/systemd \
-        ROBOTD_SOCKET=$R/robotd.sock READY_TIMEOUT=8 PATH=$R/bin:$BASE_PATH
+        ROBOTD_SOCKET=$R/robotd.sock READY_TIMEOUT=8 LOCK_FILE=$R/lock PATH=$R/bin:$BASE_PATH
     if [ "$1" = a ]; then export NO_SYSTEMD=1 SKIP_ELF_RUN=0; else export NO_SYSTEMD=0 SKIP_ELF_RUN=1; fi
 }
 BOARDS=0
@@ -217,13 +237,9 @@ ok "源目录放的是 kissqy 原版 padd → 拒绝，什么都没改" "[ $rc -
 cp "$R/src/padd" "$R/badsrc/padd"; cp "$KISSQY/service.sh" "$R/badsrc/service.sh"
 bash "$SCRIPT" install "$R/badsrc" bno08x /dev/i2c-4 0x4B >/dev/null 2>&1; rc=$?
 ok "源目录放的是 kissqy 原版 service.sh → 拒绝" "[ $rc -ne 0 ] && [ \"\$(state)\" = $orig ]"
-if [ -n "$IMU_ONLY" ] && [ -f "$IMU_ONLY" ]; then
-    cp "$R/src/service.sh" "$R/badsrc/service.sh"; cp "$IMU_ONLY" "$R/badsrc/robotd"
-    bash "$SCRIPT" install "$R/badsrc" bno08x /dev/i2c-4 0x4B >/dev/null 2>&1; rc=$?
-    ok "只带 IMU、不可调的 robotd → 拒绝" "[ $rc -ne 0 ] && [ \"\$(state)\" = $orig ] && grep -q '不是可调版' $R/install.log"
-else
-    skip "只带 IMU、不可调的 robotd → 拒绝（没给第 3 个参数）"
-fi
+cp "$R/src/service.sh" "$R/badsrc/service.sh"; cp "$IMU_ONLY" "$R/badsrc/robotd"
+bash "$SCRIPT" install "$R/badsrc" bno08x /dev/i2c-4 0x4B >/dev/null 2>&1; rc=$?
+ok "只带 IMU、不可调的 robotd → 拒绝" "[ $rc -ne 0 ] && [ \"\$(state)\" = $orig ] && grep -q '不是可调版' $R/install.log"
 
 board a
 contract=$(cd "$R/opt" && grep -o 'models/[0-9a-f]*/deployment-contract.json' SHA256SUMS | head -1)
@@ -263,11 +279,11 @@ board b; orig=$(state)
 fake_before '{"mode": "motion", "phase": "control", "armed": true}'
 echo enabled > "$R/units/gamesir-xboxd.enabled"; echo active > "$R/units/padd.active"
 out=$(bash "$SCRIPT" install "$R/src" bno08x /dev/null 0x4B 2>&1); rc=$?; BK=$(backup_of "$out")
-ok "B 控制中：卸力并等恢复完成，再停 robotd、停 padd，最后安装成功" "[ $rc -eq 0 ] && grep -q 'robot.relax' $R/robotd-calls.log && grep -q '运动模式控制中' $R/install.log"
-ok "B 顺序：stop robotd → stop padd → daemon-reload → start robotd → restart padd" "\"$PY\" -c \"
+ok "B 控制中：卸力后等扭矩先关、寄存器随后恢复，再停 robotd，最后安装成功" "[ $rc -eq 0 ] && grep -q 'robot.relax' $R/robotd-calls.log && grep -q '运动模式控制中' $R/install.log && grep -q 'torque OFF, restore finished' $R/install.log"
+ok "B 顺序：stop padd → stop robotd → daemon-reload → start robotd → restart padd" "\"$PY\" -c \"
 import sys
 log=open('$R/systemctl.log').read().splitlines()
-want=['stop robotd.service','stop padd.service','daemon-reload','start robotd.service','restart padd.service']
+want=['stop padd.service','stop robotd.service','daemon-reload','start robotd.service','restart padd.service']
 idx=[next(i for i,l in enumerate(log) if l==w) for w in want]
 assert idx==sorted(idx),(idx,log)\""
 ok "B 启动后核对 busStatus、padd 新进程开始 driving" "grep -q 'busStatus：' $R/install.log && grep -q '已开始 driving' $R/install.log"
@@ -279,7 +295,7 @@ ok "B 手动撤回：停 robotd 和 padd、删 drop-in、重启服务、目录�
 board b; orig=$(state)
 fake_before '{"mode": "motion", "phase": "control", "armed": true, "settles": false}'
 bash "$SCRIPT" install "$R/src" bno08x /dev/null 0x4B >/dev/null 2>&1; rc=$?
-ok "B 卸力后恢复一直没完成 → 拒绝，robotd 没停、没备份、什么都没改" "[ $rc -ne 0 ] && ! grep -q '^stop robotd' $R/systemctl.log && ! ls -d $R/imu-module-backup-* >/dev/null 2>&1 && [ \"\$(state)\" = $orig ]"
+ok "B 卸力后恢复一直没完成 → 拒绝，robotd 没停、没备份、什么都没改，停掉的 padd 重新起来" "[ $rc -ne 0 ] && ! grep -q '^stop robotd' $R/systemctl.log && ! ls -d $R/imu-module-backup-* >/dev/null 2>&1 && [ \"\$(state)\" = $orig ] && grep -qx 'restart padd.service' $R/systemctl.log && grep -q '先断舵机电' $R/install.log"
 
 for scenario in '{"mode": "motion", "phase": "waiting_for_bus"}' '{"mode": "commissioning", "phase": "waiting_for_bus"}'; do
     board b; fake_before "$scenario"
@@ -289,7 +305,7 @@ done
 
 board b; echo activating > "$R/units/robotd.active"; echo disabled > "$R/units/gamesir-xboxd.enabled"
 bash "$SCRIPT" install "$R/src" bno08x /dev/null 0x4B >/dev/null 2>&1; rc=$?
-ok "B robotd 在自动重启（activating）、socket 不通 → 警告后照样 stop robotd，装好" "[ $rc -eq 0 ] && grep -q 'unreachable' $R/install.log && grep -qx 'stop robotd.service' $R/systemctl.log"
+ok "B robotd 在自动重启（activating）、socket 不存在 → 算没在运行、不卸力，照样 stop robotd，装好" "[ $rc -eq 0 ] && grep -q 'robotd 没在运行（not-running' $R/install.log && grep -qx 'stop robotd.service' $R/systemctl.log"
 ok "B gamesir-xboxd 是 disabled → 不碰它" "! grep -q 'gamesir-xboxd.service' <(grep -v '^is-enabled\\|^is-active' $R/systemctl.log)"
 
 board b; orig=$(state); echo '{"mode": "motion", "phase": "control", "servo_parameters_key": false}' > "$R/robotd-after.json"
@@ -320,6 +336,81 @@ board a; orig=$(state)
 bash "$SCRIPT" rollback "" >/dev/null 2>&1; rc1=$?
 bash "$SCRIPT" rollback "$R/opt" >/dev/null 2>&1; rc2=$?
 ok "rollback 参数为空或不是备份目录 → 拒绝（不会把 /opt 当备份），什么都没改" "[ $rc1 -ne 0 ] && [ $rc2 -ne 0 ] && [ \"\$(state)\" = $orig ]"
+
+# --- round-2 review cases -------------------------------------------------------------------------
+board b
+fake_before '{"mode": "motion", "phase": "control", "armed": true, "slow_first": true}'
+bash "$SCRIPT" install "$R/src" bno08x /dev/null 0x4B >/dev/null 2>&1; rc=$?
+ok "B 第一次 busStatus 慢 2.5 秒 → 再问一次，按控制中卸力确认，装好" "[ $rc -eq 0 ] && grep -q '运动模式控制中' $R/install.log && grep -q 'robot.relax' $R/robotd-calls.log"
+
+board b
+fake_before '{"mode": "motion", "phase": "control", "armed": true, "hang": true}'
+bash "$SCRIPT" install "$R/src" bno08x /dev/null 0x4B >/dev/null 2>&1; rc=$?
+ok "B busStatus 8 秒都不回答 → 扭矩状态未知：卸力请求 + 警告，照样停 robotd，装好" "[ $rc -eq 0 ] && grep -q '8 秒内没回答' $R/install.log && grep -q '扭矩状态确认不了' $R/install.log && grep -q 'robot.relax' $R/robotd-calls.log"
+
+board b
+for kind in deployment-contract deployment-execution; do
+    row=$(cd "$R/opt" && grep -o "models/[0-9a-f]*/$kind.json" SHA256SUMS | head -1); printf '\n' >> "$R/opt/$row"
+done
+orig=$(state)
+out=$(bash "$SCRIPT" install "$R/src" bno08x /dev/null 0x4B 2>&1); rc=$?; BK=$(backup_of "$out")
+ok "B 板上预先 2 行不一致（contract + execution，真板就是这样）→ 安装成功并列出两行" "[ $rc -eq 0 ] && [ \$(wc -l < $BK/sha256-p0.txt) -eq 2 ] && grep -q 'deployment-contract.json models/.*deployment-execution.json\|deployment-execution.json models/.*deployment-contract.json' $R/install.log"
+bash "$SCRIPT" rollback "$BK" >/dev/null 2>&1; rc=$?
+ok "B 同一板子手动撤回成功（两行照旧不一致）" "[ $rc -eq 0 ] && [ \"\$(state)\" = $orig ]"
+
+board b; orig=$(state)
+fake_before '{"mode": "motion", "phase": "control"}'
+printf '#!/bin/bash\nfor a; do last=$a; done\ncase "$last" in */imu-module-backup-*/opt/) echo "cp: No space left on device" >&2; exit 1;; esac\nexec /bin/cp "$@"\n' > "$R/bin/cp"; chmod +x "$R/bin/cp"
+bash "$SCRIPT" install "$R/src" bno08x /dev/null 0x4B >/dev/null 2>&1; rc=$?
+rm -f "$R/bin/cp"
+ok "B 停了 padd、robotd 之后备份失败 → 原来的服务重新启动，文件没动" "[ $rc -ne 0 ] && [ \"\$(cat $R/units/robotd.active)\" = active ] && grep -qx 'restart padd.service' $R/systemctl.log && grep -q '原来的 robotd / padd 已重新启动' $R/install.log && [ \"\$(state)\" = $orig ]"
+
+board b; orig=$(state)
+fake_before '{"mode": "motion", "phase": "control"}'
+printf '#!/bin/bash\ncase "$1" in +%%Y%%m%%d-%%H%%M%%S) exit 1;; esac\nexec /bin/date "$@"\n' > "$R/bin/date"; chmod +x "$R/bin/date"
+bash "$SCRIPT" install "$R/src" bno08x /dev/null 0x4B >/dev/null 2>&1; rc=$?
+rm -f "$R/bin/date"
+ok "B 没有 die 的命令意外失败（set -e）→ ERR 陷阱：报第几行，原来的服务重新启动" "[ $rc -ne 0 ] && grep -q '意外退出' $R/install.log && [ \"\$(cat $R/units/robotd.active)\" = active ] && grep -qx 'restart padd.service' $R/systemctl.log && [ \"\$(state)\" = $orig ]"
+
+board b; orig=$(state); rm -f "$R/padd-driving"
+bash "$SCRIPT" install "$R/src" bno08x /dev/null 0x4B >/dev/null 2>&1 & INSTALLER=$!
+for _ in $(seq 1 200); do grep -q '四步启动完成' "$R/install.log" 2>/dev/null && break; sleep 0.1; done
+kill -TERM "$INSTALLER"; touch "$R/padd-driving"; wait "$INSTALLER"; rc=$?
+ok "B 安装中途收到 TERM → 自动撤回并把服务起回来" "[ $rc -ne 0 ] && grep -q '收到中断' $R/install.log && grep -q '已撤回，板子回到安装前的样子' $R/install.log && [ \"\$(state)\" = $orig ]"
+
+board b
+echo 'duck-rec.service' > "$R/units/consists"; echo active > "$R/units/duck-rec.active"
+fake_before '{"mode": "motion", "phase": "control"}'
+bash "$SCRIPT" install "$R/src" bno08x /dev/null 0x4B >/dev/null 2>&1; rc=$?
+ok "B 随 robotd 停的单元（duck-rec）：前后都报告，没跟着起来就提示，不代起" "[ $rc -eq 0 ] && grep -q 'duck-rec.service=active' $R/install.log && grep -q 'duck-rec.service 之前在运行' $R/install.log && ! grep -q 'start duck-rec' $R/systemctl.log"
+
+board a; orig=$(state)
+out=$(bash "$SCRIPT" install "$R/src" bno08x /dev/i2c-4 0x4B 2>&1); BK=$(backup_of "$out")
+sed -i 's/0.459554518/0.470000000/' "$R/etc/hd1910-calibration.toml" "$R/etc/hd1910-calibration.saved.toml"
+bash "$SCRIPT" rollback "$BK" >/dev/null 2>&1; rc=$?
+ok "撤回前重新标定过 → 标定保持现在的、提示备份里那份在哪；robotd.toml 恢复前另存" "[ $rc -eq 0 ] && grep -q '0.470000000' $R/etc/hd1910-calibration.toml && grep -q \"hd1910-calibration.toml 跟备份时不一样\" $R/install.log && grep -q trunk_imu $BK/etc-at-rollback/robotd.toml && ! grep -q trunk_imu $R/etc/robotd.toml && [ \"\$(state)\" = $orig ]"
+
+board a
+out=$(bash "$SCRIPT" install "$R/src" bno08x /dev/i2c-4 0x4B 2>&1); BK=$(backup_of "$out")
+OLD=$R/imu-module-backup-20261014-202402; mkdir -p "$OLD/opt" "$OLD/etc"
+for f in robotd robotctl calibration-config.py rebuild-config.py runtime.py voice-setup.py SHA256SUMS ELF-CHECK.json BUILD.json; do cp -a "$BK/opt/$f" "$OLD/opt/"; done
+cp -a "$BK"/etc/robotd*.toml "$BK"/etc/hd1910*.toml "$OLD/etc/"
+bash "$SCRIPT" rollback "$OLD" >/dev/null 2>&1; rc1=$?
+bash "$SCRIPT" rollback --old-backup "$OLD" >/dev/null 2>&1; rc2=$?
+ok "第一版脚本的旧备份：默认拒绝；加 --old-backup 才撤，并提示 padd、service.sh 不在备份里" "[ $rc1 -ne 0 ] && grep -q '旧备份' $R/install.log && [ $rc2 -eq 0 ] && grep -q '备份里没有 padd' $R/install.log && cmp -s $R/opt/robotd $BK/opt/robotd"
+
+board a original
+out=$(bash "$SCRIPT" install "$R/src" bno08x /dev/i2c-4 0x4B 2>&1); BK=$(backup_of "$out")
+bash "$SCRIPT" rollback "$BK" >/dev/null 2>&1; rc1=$?
+sed -i '/imu_mounts/,$d' "$R/etc/hd1910-calibration.toml" "$R/etc/hd1910-calibration.saved.toml"
+bash "$SCRIPT" rollback "$BK" >/dev/null 2>&1; rc2=$?
+ok "备份里是 kissqy 原版 robotd 而标定有 [imu_mounts] → 拒绝；删掉 imu_mounts 后才撤" "[ $rc1 -ne 0 ] && grep -q '读不了现在 hd1910-calibration.toml 里的 \[imu_mounts\]' $R/install.log && [ $rc2 -eq 0 ] && cmp -s $R/opt/robotd $KISSQY/robotd"
+
+board a; orig=$(state)
+flock "$R/lock" sleep 5 & HOLDER=$!; sleep 0.3
+bash "$SCRIPT" install "$R/src" bno08x /dev/i2c-4 0x4B >/dev/null 2>&1; rc=$?
+kill $HOLDER 2>/dev/null; wait $HOLDER 2>/dev/null
+ok "另一个服务管理操作占着锁 → 拒绝，什么都没改" "[ $rc -ne 0 ] && grep -q '已有服务管理操作在进行' $R/install.log && [ \"\$(state)\" = $orig ]"
 
 stop_fake
 echo "== $PASS passed, $FAIL failed, $SKIP skipped (work dir $W)"
