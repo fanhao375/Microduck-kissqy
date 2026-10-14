@@ -110,8 +110,14 @@ class Handler(socketserver.StreamRequestHandler):
 class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     daemon_threads = True
 
-if os.path.exists(path): os.unlink(path)
-Server(path, Handler).serve_forever()
+# Bind and listen under a temporary name, then rename into place: a client woken by the new name
+# (startup_gate watches the directory) never meets a bound socket that is not listening yet.
+temporary = path + '.tmp'
+for stale in (path, temporary):
+    if os.path.exists(stale): os.unlink(stale)
+server = Server(temporary, Handler)
+os.rename(temporary, path)
+server.serve_forever()
 EOF
 }
 
