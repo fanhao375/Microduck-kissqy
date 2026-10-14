@@ -1,3 +1,4 @@
+<!-- Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; see IMU-MODULE.md at the repository root. -->
 # Microduck R17 V164 / control.40 documentation
 
 The [R17 README](../README-R17.zh-CN.md) is the current package overview. For this robot's

@@ -1,3 +1,4 @@
+// Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; see IMU-MODULE.md at the repository root.
 //! R17 read-only snapshots. The control thread publishes facts; one worker encodes them.
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

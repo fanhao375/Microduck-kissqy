@@ -1,3 +1,4 @@
+// Added 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; see IMU-MODULE.md at the repository root.
 //! A BNO08x (BNO085/BNO086) as bytes: SHTP framing and the SH-2 reports, with no I/O.
 //!
 //! The chip is a sensor hub speaking CEVA's SH-2 inside SHTP packets. This module builds the

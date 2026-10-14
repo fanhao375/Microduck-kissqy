@@ -1,3 +1,4 @@
+// Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; see IMU-MODULE.md at the repository root.
 //! Raw telemetry mode of robotd. The control thread owns the same native Feetech
 //! Bus used by FeetechIo; IPC only reads snapshots. No fabricated calibration.
 use super::{Ordering, RobotState};

@@ -1,3 +1,4 @@
+// Added 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; see IMU-MODULE.md at the repository root.
 //! Where the trunk IMU is wired, and how a sensor off the bus reaches the control loop.
 //!
 //! Chosen by configuration and never probed for:

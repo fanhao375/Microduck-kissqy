@@ -1,3 +1,4 @@
+<!-- Added 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; see IMU-MODULE.md at the repository root. -->
 # 躯干 IMU 改接主板 I²C：实施记录
 
 2026-10-11，分支 `hd1910-trunk-imu-i2c`，基于 kissqy/Microduck-kissqy `94328f5`（R17 v1.0.146）。由 microduck-replica 项目起草计划并实施。

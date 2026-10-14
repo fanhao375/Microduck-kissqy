@@ -1,3 +1,4 @@
+// Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; see IMU-MODULE.md at the repository root.
 //! Native Feetech TTL packets. No Dynamixel packets or address translation.
 //!
 //! HD1910 telemetry uses only the 15-byte feedback block at 56..=70.

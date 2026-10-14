@@ -1,3 +1,4 @@
+// Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; see IMU-MODULE.md at the repository root.
 //! Commission the real Feetech bus through robotd's socket. The control thread is
 //! the sole UART owner; raw positions never masquerade as calibrated joint angles.
 use super::{Ordering, RobotState};

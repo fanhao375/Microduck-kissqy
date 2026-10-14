@@ -1,5 +1,8 @@
 [简体中文](README.md) | **English**
 
+> **This is a fork maintained by [fanhao375](https://github.com/fanhao375) ([microduck-replica](https://github.com/fanhao375/microduck-replica)), not an official kissqy release, and not reviewed by him.** Branch `hd1910-v167-trunk-imu-i2c` adds one thing to kissqy's R17 V167: **an IMU module (BNO085 / LSM6DSV16X) on the board's own I²C instead of the bus IMU board** — see [IMU-MODULE.md](IMU-MODULE.md). The downloads, one-click image and console ZIP below are kissqy's originals without it. Report problems to [microduck-replica](https://github.com/fanhao375/microduck-replica/issues). Upstream: [kissqy/Microduck-kissqy](https://github.com/kissqy/Microduck-kissqy).
+
+
 <div align="center">
 
 ## 🎬 See the duck in action — 5 real-robot videos

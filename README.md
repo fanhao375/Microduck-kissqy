@@ -1,5 +1,8 @@
 **简体中文** | [English](README.en.md)
 
+> **这是 [fanhao375](https://github.com/fanhao375)（[microduck-replica](https://github.com/fanhao375/microduck-replica) 项目）维护的 fork，不是 kissqy 的官方版本，没经过他审阅**。分支 `hd1910-v167-trunk-imu-i2c` 在 kissqy 的 R17 V167 上只加了一样东西：**IMU 模块（BNO085 / LSM6DSV16X）直接接主板 I²C，不用总线 IMU 小板**，说明见 [IMU-MODULE.md](IMU-MODULE.md)。下面的下载区、一键镜像、中控 ZIP 都是 kissqy 原版，不带这项支持。用这个 fork 出了问题，请到 [microduck-replica](https://github.com/fanhao375/microduck-replica/issues) 反馈。原版：[kissqy/Microduck-kissqy](https://github.com/kissqy/Microduck-kissqy)。
+
+
 <div align="center">
 
 ## 🎬 看看鸭鸭的真实表现（5 段视频）

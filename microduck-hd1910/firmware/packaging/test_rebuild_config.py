@@ -1,3 +1,4 @@
+# Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; see IMU-MODULE.md at the repository root.
 """Whole configuration recovery, with no UART or real systemd operations."""
 import importlib.util
 import json

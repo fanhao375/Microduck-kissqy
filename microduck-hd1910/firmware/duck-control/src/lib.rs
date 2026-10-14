@@ -1,3 +1,4 @@
+// Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; see IMU-MODULE.md at the repository root.
 //! The robot control core: everything between reading the bus and writing it.
 //!
 //! Deliberately not a daemon. There is no tokio here, no socket, no systemd — `robotd`

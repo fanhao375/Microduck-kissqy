@@ -1,3 +1,4 @@
+<!-- Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; see IMU-MODULE.md at the repository root. -->
 **原文 / Original** | [English](robotd-design.en.md)
 
 ## 当前 R17 v1.0.157-Fix6 / control.36

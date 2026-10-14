@@ -1,3 +1,4 @@
+// Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; see IMU-MODULE.md at the repository root.
 //! The robot's trunk orientation: what every trunk IMU shares, and the bus board's bytes.
 //!
 //! Two parts, because the sensor can be wired more than one way

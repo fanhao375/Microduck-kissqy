@@ -1,3 +1,4 @@
+// Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; see IMU-MODULE.md at the repository root.
 //! `robotd`'s startup parameters: the schema, the defaults, and the validation.
 //!
 //! A file rather than a wall of CLI flags — the prototype grew 142 of them and most were

@@ -1,3 +1,4 @@
+# Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; see IMU-MODULE.md at the repository root.
 """System ALSA migration and saved volume, with no real soundcard/systemd writes."""
 import importlib.util,json,os,subprocess,tempfile,tomllib,unittest
 from pathlib import Path

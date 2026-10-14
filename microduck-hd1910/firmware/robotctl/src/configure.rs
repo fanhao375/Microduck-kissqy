@@ -1,3 +1,4 @@
+// Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; see IMU-MODULE.md at the repository root.
 //! `robotctl configure` — edit `robotd.toml` without reading a wall of comments.
 //!
 //! The shipped `deploy/robotd.toml` is deliberately exhaustive: every key, documented at

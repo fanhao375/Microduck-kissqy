@@ -1,3 +1,4 @@
+// Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; see IMU-MODULE.md at the repository root.
 //! Editing `robotd.toml` without disturbing it.
 //!
 //! The lossless writer for this crate's own schema: parse with `toml_edit`, set or remove exactly

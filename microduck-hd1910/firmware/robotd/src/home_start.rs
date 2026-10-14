@@ -1,3 +1,4 @@
+// Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; see IMU-MODULE.md at the repository root.
 //! R17 entry guard: starting a stopped policy requires measured HOME and upright IMU.
 //! This never gates a policy that is already running (including official fall recovery).
 use std::time::{Duration, Instant};

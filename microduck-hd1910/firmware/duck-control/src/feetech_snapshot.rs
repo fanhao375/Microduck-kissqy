@@ -1,3 +1,4 @@
+// Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; see IMU-MODULE.md at the repository root.
 //! Read-only, owned facts for a reporter on another thread. No UART owner and no JSON tree.
 use std::sync::Arc;
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; see IMU-MODULE.md at the repository root.
 """Install native sound once and delegate mixer persistence to system ALSA."""
 import argparse,hashlib,json,math,os,pwd,re,shutil,subprocess,tomllib
 from pathlib import Path
