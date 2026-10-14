@@ -1,4 +1,4 @@
-// Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; see IMU-MODULE.md at the repository root.
+// Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; UDP pad ([netpad]); see IMU-MODULE.md at the repository root.
 //! `robotctl configure` — edit `robotd.toml` without reading a wall of comments.
 //!
 //! The shipped `deploy/robotd.toml` is deliberately exhaustive: every key, documented at
@@ -108,6 +108,9 @@ fn apply_for(key: &str) -> Option<Apply> {
         //
         // `pad_imu_head_control` is the *controller's* IMU steering the head. Not `head_imu` below.
         "pad" | "pad_imu_head_control" => Apply::Live("padd"),
+        // `[netpad]` picks padd's pad source, read once when padd starts (`read_netpad` in
+        // `padd/src/main.rs`); robotd only checks it at its own start.
+        "netpad" => Apply::Restart("padd"),
         // `tofd` reads `[head_imu]` out of robotd's file — see `tof/src/config.rs` for why it
         // reads that file rather than one of its own — and reads it once, at startup.
         "head_imu" => Apply::Restart("tofd"),
@@ -1165,6 +1168,16 @@ mod tests {
         let plan = plan_for(&m);
         assert_eq!(plan.restart, vec!["robotd"]);
         assert_eq!(plan.live, vec!["padd"]);
+    }
+
+    /// `[netpad]` is read by padd once at start: changing it restarts padd, and nothing else.
+    #[test]
+    fn the_netpad_section_restarts_padd_alone() {
+        for key in ["netpad.enabled", "netpad.port", "netpad.timeout_ms"] {
+            let plan = plan_for_keys([key].into_iter());
+            assert_eq!(plan.restart, vec!["padd"], "{key}");
+            assert!(plan.reload.is_empty() && plan.live.is_empty(), "{key}");
+        }
     }
 
     /// `[policy]` reloads instead of restarting — except the two keys a reload does not carry.
