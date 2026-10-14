@@ -180,7 +180,7 @@ class ServiceNetpadTests(unittest.TestCase):
     def test_every_command_that_restarts_robotd_brings_padd_back(self):
         start = SERVICE.index('\nservo-parameters)\n'); end = SERVICE.index('\nnetpad)\n')
         block = SERVICE[start:end]
-        self.assertEqual(block.count('start_input_services || true'), 6)   # stop failed / write failed
+        self.assertEqual(block.count('start_input_services || true'), 9)   # stop / write / restart failed
         self.assertEqual(block.count('    start_input_services\n'), 3)      # the three success paths
 
     def test_the_bridge_is_started_only_where_it_is_enabled(self):

@@ -167,7 +167,10 @@ impl State {
     ) -> Result<()> {
         let desired = crate::hd1910_test::rows(&self.snapshots, parameters);
         if !off {
-            crate::hd1910_test::verify(bus, &desired)?;
+            crate::hd1910_test::verify(bus, &desired).map_err(|e| match e {
+                IoError::Bus(why) => error(format!("{why}; torque stays on; relax first")),
+                other => other,
+            })?;
             self.applied = true;
             tracing::warn!(
                 ?parameters,

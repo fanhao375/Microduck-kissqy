@@ -375,11 +375,20 @@ def relax_and_restore():
     """Before stopping robotd for a servo/filter change. In motion control: relax, then wait until
     torque is OFF and the HD1910 restore has finished, otherwise refuse (robotd keeps running, so the
     in-memory restore data is not lost). Not in control (bad file, waiting for bus, commissioning,
-    unreachable): nothing is armed by this robotd, request a relax and let the caller stop it."""
-    try:
-        report = rpc('robot.busStatus', timeout=2)
-    except (OSError, ValueError, RuntimeError, KeyError) as exc:
-        return {'restored': None, 'message': 'robotd 未响应，直接停止：' + str(exc)[-200:]}
+    unreachable): nothing is armed by this robotd, request a relax and let the caller stop it.
+    Only a socket that is missing or refused means no robotd; a slow answer is asked again for 8 s,
+    and still nothing means the torque state is unknown: request a relax and say so."""
+    until = time.monotonic() + 8; last = ''; report = None
+    while report is None and time.monotonic() < until:
+        try:
+            report = rpc('robot.busStatus', timeout=2)
+        except (FileNotFoundError, ConnectionRefusedError) as exc:
+            return {'restored': None, 'message': 'robotd 不在运行（' + str(exc)[-120:] + '），直接停止'}
+        except (OSError, ValueError, RuntimeError, KeyError) as exc:
+            last = str(exc)[-200:]; time.sleep(.1)
+    if report is None:
+        request_relax()
+        return {'restored': None, 'message': '扭矩状态未确认（robotd 8 秒内没回答：' + last + '），已请求卸力；请扶住或放倒鸭子'}
     if report.get('mode') != 'motion' or report.get('phase') != 'control':
         request_relax()
         return {'restored': None, 'message': f"robotd 处于 {report.get('mode')} / {report.get('phase')}，不在控制阶段，直接停止"}
@@ -396,15 +405,17 @@ def relax_and_restore():
         last = json.dumps({'torque_off': torque_off(report), 'restore_pending': hd.get('restore_pending'),
                            'temporary_gains_applied': hd.get('temporary_gains_applied')}, ensure_ascii=False)
         time.sleep(.1)
-    raise RuntimeError('未确认卸力并恢复 P 原值，操作未继续，robotd 保持运行：' + last)
+    raise RuntimeError('未确认卸力并恢复 P 原值，操作未继续，robotd 保持运行：' + last +
+                       '。若是某个舵机不应答：先断舵机电，再 sudo systemctl stop robotd，然后重试这条命令')
 
 def validate_filter(value):
     lowpass = float(value)
     if lowpass not in tuple(round(n/100, 2) for n in range(10, 101)): raise ValueError('滤波只能选择 0.10 到 1.00，步长 0.01')
     return lowpass
 
-def set_joint_filters(ident, head, legs):
-    """Edit only head_lowpass/legs_lowpass of the active joint Walk; scale stays with set_action_scale."""
+def check_joint_filters(ident, head, legs):
+    """Every read-only check of joint-filters (values, model id, the active Walk, its joint execution
+    profile), run before robotd is relaxed and stopped. Returns what set_joint_filters writes."""
     head, legs = validate_filter(head), validate_filter(legs)
     if not re.fullmatch('[a-f0-9]{32}', ident): raise ValueError('模型标识无效')
     walk = Path(str(tomllib.loads(CONFIG.read_text()).get('policy', {}).get('walk', '')))
@@ -416,7 +427,11 @@ def set_joint_filters(ident, head, legs):
     text = json.dumps(updated, ensure_ascii=False, indent=2) + '\n'
     contract = json.loads((walk.parent/'deployment-contract.json').read_text())
     execution_profile(text.encode(), {**{k: info[k] for k in ('slot', 'label', 'task', 'sha256')}, 'contract': contract})
-    path = walk.parent/EXECUTION_FILE
+    return walk.parent/EXECUTION_FILE, updated, text
+
+def set_joint_filters(ident, head, legs):
+    """Edit only head_lowpass/legs_lowpass of the active joint Walk; scale stays with set_action_scale."""
+    path, updated, text = check_joint_filters(ident, head, legs)
     original = path.with_name(path.name + '.orig')
     if not original.exists(): atomic_write(original, path.read_bytes())   # the first original is never replaced
     atomic_write(path, text)
@@ -552,7 +567,7 @@ def main():
     if action == 'disable-automatic-recovery':disable_automatic_recovery();return
     if action == 'validate-scale': print(validate_scale(*args)); return
     if action == 'validate-servo': print(json.dumps(validate_servo(*args))); return
-    if action == 'validate-filters': print(json.dumps([validate_filter(v) for v in args])); return
+    if action == 'validate-filters': print(json.dumps(check_joint_filters(*args)[1], ensure_ascii=False)); return
     if action == 'verify-servo': print(json.dumps(verify_servo_parameters(*args), ensure_ascii=False)); return
     if action == 'validate-netpad': print(json.dumps(validate_netpad(*args), ensure_ascii=False)); return
     if action == 'port': print(detect_port()); return

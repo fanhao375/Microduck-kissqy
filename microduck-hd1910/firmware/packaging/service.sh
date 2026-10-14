@@ -398,7 +398,7 @@ servo-parameters)
         start_input_services || true
         fail '舵机参数写入失败；robotd 已重新启动，原设置未变。'
     fi
-    restart_service
+    restart_service || { start_input_services || true; echo '参数文件已写入；robotd 起来后下次 HOME 上力时生效。' >&2; exit 78; }
     verify_servo_loaded "$servo_json"
     start_input_services
     echo "舵机参数已应用：P=$2 D=$3 转矩限制=$4；下次 HOME 上力时写入。卸力时 P 恢复原值，D=0、转矩 1000（同 V167）。"
@@ -413,7 +413,7 @@ servo-parameters-clear)
         start_input_services || true
         fail '恢复默认失败；robotd 已重新启动。'
     fi
-    restart_service
+    restart_service || { start_input_services || true; echo '参数文件已删除；robotd 起来后下次 HOME 按 V167 原版上力。' >&2; exit 78; }
     verify_servo_loaded none
     start_input_services
     echo '已恢复默认（未设置）：按 V167 原版，P=合同 5、D=0、转矩 1000。'
@@ -421,7 +421,8 @@ servo-parameters-clear)
 joint-filters)
     require_installed
     [[ $# -eq 4 ]] || fail '用法：joint-filters 模型标识 头部滤波 腿部滤波'
-    python3 "$install_dir/runtime.py" validate-filters "$3" "$4"
+    # Model id, active Walk and its execution profile are checked here, before anything is relaxed.
+    python3 "$install_dir/runtime.py" validate-filters "$2" "$3" "$4" >/dev/null
     python3 "$install_dir/runtime.py" relax-and-restore
     systemctl stop robotd.service || { restart_service || true; start_input_services || true; fail 'robotd 停止失败；已尝试重新启动，未写入。'; }
     if ! python3 "$install_dir/runtime.py" set-joint-filters "$2" "$3" "$4"; then
@@ -429,7 +430,7 @@ joint-filters)
         start_input_services || true
         fail '滤波写入失败；robotd 已重新启动，原设置未变。'
     fi
-    restart_service
+    restart_service || { start_input_services || true; echo '滤波已写入；robotd 起来后读取新配置。' >&2; exit 78; }
     verify_motion_models
     start_input_services
     echo "头腿滤波已应用：头 $3、腿 $4；重新 HOME 后生效。"

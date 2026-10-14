@@ -4326,7 +4326,9 @@ mod hd1910_transport_tests {
             } else {
                 let error = result.unwrap_err().to_string();
                 assert!(
-                    error.contains("ID 20") && error.contains("mismatch"),
+                    error.contains("ID 20")
+                        && error.contains("mismatch")
+                        && error.contains("torque stays on; relax first"),
                     "{error}"
                 );
                 assert!(device.writes.lock().unwrap().is_empty());

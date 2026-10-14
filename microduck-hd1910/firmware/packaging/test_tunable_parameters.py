@@ -100,6 +100,19 @@ class JointFilterTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(), before)
             self.assertFalse(path.with_name(path.name + '.orig').exists())
 
+    def test_the_check_before_relax_reads_and_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config, path = self.environment(Path(tmp))
+            before = path.read_bytes()
+            with patch.object(runtime, 'CONFIG', config):
+                _, updated, _ = runtime.check_joint_filters(ID, '0.8', '0.9')
+                self.assertEqual((updated['head_lowpass'], updated['legs_lowpass']), (0.8, 0.9))
+                for ident in ('0' * 32, 'not-an-id'):
+                    with self.assertRaises(ValueError):
+                        runtime.check_joint_filters(ident, '.5', '.7')
+            self.assertEqual(path.read_bytes(), before)
+            self.assertFalse(path.with_name(path.name + '.orig').exists())
+
     def test_scale_slider_and_filters_do_not_overwrite_each_other(self):
         with tempfile.TemporaryDirectory() as tmp:
             config, path = self.environment(Path(tmp))
@@ -137,6 +150,13 @@ class ServiceScriptTests(unittest.TestCase):
         # The installer still retires the file on install/upgrade/reset-models (kissqy behaviour).
         self.assertIn('rm -f -- "$config_dir/servo-test-parameters.json"', text)
         self.assertEqual(text.splitlines()[1][:46], '# Modified 2026-10 by fanhao375 (microduck-rep')
+        # A failed restart after the file changed says so: the value is in effect once robotd is up.
+        self.assertEqual(block.count('exit 78; }'), 3)
+        self.assertIn('参数文件已写入；robotd 起来后下次 HOME 上力时生效', block)
+        self.assertIn('参数文件已删除；robotd 起来后下次 HOME 按 V167 原版上力', block)
+        # joint-filters checks the model id and the active Walk before it relaxes anything.
+        filters = block[block.index('joint-filters)\n'):]
+        self.assertLess(filters.index('validate-filters "$2" "$3" "$4"'), filters.index('relax-and-restore'))
 
 
 class RelaxRestoreTests(unittest.TestCase):
@@ -178,8 +198,30 @@ class RelaxRestoreTests(unittest.TestCase):
             with patch.object(runtime, 'request_relax', return_value={}):
                 result, calls = self.run_with([report])
             self.assertIsNone(result['restored']); self.assertNotIn('robot.relax', calls)
-        result, _ = self.run_with([OSError('no socket')])
+        for missing in (FileNotFoundError('no socket'), ConnectionRefusedError('refused')):
+            with patch.object(runtime, 'request_relax') as relax:
+                result, calls = self.run_with([missing])
+            self.assertIsNone(result['restored']); self.assertIn('不在运行', result['message'])
+            relax.assert_not_called(); self.assertNotIn('robot.relax', calls)
+
+    def test_a_slow_first_answer_is_asked_again(self):
+        result, calls = self.run_with([TimeoutError('timed out'), self.motion(True, False, True), self.motion(False, False, False)])
+        self.assertTrue(result['restored']); self.assertIn('robot.relax', calls)
+
+    def test_no_answer_for_eight_seconds_requests_a_relax_and_says_the_torque_is_unknown(self):
+        clock = iter(range(0, 100))
+        with patch.object(runtime.time, 'monotonic', lambda: next(clock)), \
+             patch.object(runtime, 'request_relax', return_value={}) as relax:
+            result, calls = self.run_with([TimeoutError('timed out')])
+        relax.assert_called_once()
         self.assertIsNone(result['restored'])
+        self.assertIn('扭矩状态未确认', result['message']); self.assertIn('扶住或放倒鸭子', result['message'])
+        self.assertNotIn('robot.relax', calls)
+
+    def test_a_restore_that_never_finishes_says_how_to_get_out(self):
+        with patch.object(runtime.time, 'monotonic', side_effect=[0, 0, 1, 2, 9, 10, 11]):
+            with self.assertRaisesRegex(RuntimeError, '先断舵机电，再 sudo systemctl stop robotd'):
+                self.run_with([self.motion(True, False, True), self.motion(False, True, False)])
 
 
 class VerifyServoTests(unittest.TestCase):
