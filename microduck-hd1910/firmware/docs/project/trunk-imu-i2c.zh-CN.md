@@ -78,3 +78,12 @@ R17 的 robotd 只认一种躯干 IMU：舵机总线上的 FT6 / imu_to_dxl 小�
 - **IMU 过期帧约 1.7%**（调试模式 2878 帧里 48 帧超过 50 ms；运动模式 `robotctl health` 报 1/52）。都是单帧，控制循环会 coast。当时 CPU 过热锁在 408 MHz，要等散热解决后复测，才能分清是降频还是读取线程本身的问题。
 - **`verify-imu` 没法在站着时做**：它只在调试模式下可用，而调试模式启动时会卸力。手扶软鸭子做不到 ≤5°（读到 15.2°）。这次是用 servo-web 让鸭子站到 HOME，读 BNO085 加速度，按 verify-imu 同样的标准判定（站立 4.95°；前倾变化 16.2°，方向偏正前方 3.9°），再手动写入 `[imu_mounts.bno08x]`（默认 quat，`verified = true`）。后续要让 verify-imu 能在运动模式的 HOME 保持状态下运行，或者让调试模式可以选择保持上力。
 - 原版 R17 的问题，跟本分支无关，但上机时会碰到：首次安装会把样机标定写成本机标定；舵机被别的程序上了力时，HOME 只核对 P/D、不重写，于是拒绝上力；`service.sh init` 在 robotd 运行时会抢锁失败；CPU 降频时网页手柄（webpad）超过 0.6 秒等不到 padd 确认，按键作废。
+
+## 合进 V164、V167，以及新卡（2026-10-13 ～ 10-14）
+
+- **10-13，合进 V164 / control.40**（分支 `hd1910-v164-trunk-imu-i2c`）。第一台的新卡用的就是它：kissqy 一键镜像 R1 换成瑞莎引导、开 `i2c4-m0`，换上这版 robotd、robotctl 和 4 个安装脚本，`[trunk_imu] source = "bno08x"`、`/dev/i2c-4`、0x4B。BNO085 正常出数，站 HOME，模型接管走了 13 秒后整机掉电（供电问题，不是这个补丁；见 microduck-replica 的 10-13 夜上机记录）。
+- **10-14，合进 V167 / control.43**（本分支 `hd1910-v167-trunk-imu-i2c`）。唯一的冲突在 `duck-control/src/feetech.rs` 的测试模拟器 `Emulator`：我们加的 `requests`（记录每个非写请求）和 V167 加的 `reads`（记录每次读的地址和长度）两个字段都保留，两处记录也都保留。生产代码没有冲突。V167 上力时把 RAM 里的 D 写成 0、转矩限制写成 1000（`hd1910.rs` 的 `write_fixed_settings`），总线小板和模块两种来源都一样。
+- **中控改动没带进这条分支**：上面「评审后的修正」里提到的两处中控改动（调试页按来源显示 IMU 名字、安装面板按当前来源读写）只留在 V164 那条分支里；这条分支的 `console/` 跟 kissqy 原版一字不差。所以中控里模块的 IMU 一行仍写 FT6，「保存安装确认」等 15 秒会超时，安装方向走 SSH 确认（见仓库根目录 `IMU-MODULE.md` 第 3 节）。
+- **测试**（WSL，跟未改的 V167 在同一环境下对比；电脑上用的 ONNX Runtime 是 1.24.4，不是要求的 1.28.0，所以两边都有同样 17 个用例失败）：`verification/run-V167-tests.py` 跑 duck-control、duck-ipc-proto、robotd（每个用例一个进程）、padd，本分支 579 过 / 17 败，原版 498 过 / 17 败，失败名单完全相同；robotd-params、robotctl 全过；packaging 的 Python 测试两边每个文件结果相同；rustfmt、clippy 没有新增问题（原版本身有不合格项）。`cargo board -p robotd -p robotctl` 编译通过，glibc 最高 2.30，BUILD 是 `1fa8438-feetech-ft6-control.43`。
+- **安装脚本** `deploy/imu-module-install.sh`：在模拟的安装目录里测过（跳过 systemd）：各种拒绝、安装、再装、撤回、中途失败自动撤回、没有 `tomllib` 时读标定，共 21 项全过。
+- **还没上真机**：合进 V167 后的 robotd 和安装脚本都还没在板子上跑过。

@@ -10,15 +10,6 @@ def finite(v):
     return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
 
 
-IMU_NAMES = {"bus": "FT6", "bno08x": "BNO08x", "lsm6dsv16x": "LSM6DSV16X"}
-
-
-def imu_name(source):
-    """The trunk IMU busStatus says robotd reads. An older robotd names none: it read only FT6."""
-    if not isinstance(source, str) or not source: return "FT6"
-    return IMU_NAMES.get(source, source)
-
-
 def adapt_service(result, report, calibration, sample_elapsed_ms):
     channels = result["channels"]
     active = channels["bus"]["status"] == "live"
@@ -99,7 +90,7 @@ def adapt_service(result, report, calibration, sample_elapsed_ms):
                              age_upper_bound_ms=imu.get("age_upper_bound_ms"), firmware_status=imu.get("status"),
                              mount_verified=report.get("imu_mount_verified") is True,
                              status="live" if fresh and g and imu.get("valid") is True else "stale" if g else "unavailable",
-                             source="robotd / "+imu_name(imu.get("source"))+" / 当前安装变换", reason=None if fresh else "等待新鲜的整链样本")
+                             source="robotd / "+"FT6"+" / 当前安装变换", reason=None if fresh else "等待新鲜的整链样本")
         result["imu"]["roll_deg"] = math.degrees(math.atan2(-g[1], -g[2])) if g else None
         result["imu"]["pitch_deg"] = math.degrees(math.atan2(g[0], math.hypot(g[1], g[2]))) if g else None
     else:

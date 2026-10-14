@@ -127,6 +127,7 @@ sudo bash /opt/robot/feetech-ft5-r5/service.sh enable                     # 回�
 | `deploy/` | `robotd.toml` 加 `[trunk_imu]` 的说明；新增 `imu-module-install.sh` |
 | `docs/` | `design/robotd-design.md` §2.6；新增 `project/trunk-imu-i2c.zh-CN.md`；`README.md` 加一行索引 |
 | `Cargo.lock` | 依赖锁定跟着变 |
+| `console/`（kissqy 的中控） | **没改**，原样保留。所以用模块时，中控调试页的 IMU 那一行还写着 FT6；「保存安装确认」只等 15 秒，模块要 20 秒，会超时，安装方向用第 3 节的 SSH 办法确认 |
 | 仓库根目录 | `README.md`、`README.en.md` 顶部加了 fork 说明；新增本页 |
 
 每个改过的源码和文档文件开头，都加了一行修改声明（`Cargo.lock` 没法加注释，见本表）。
