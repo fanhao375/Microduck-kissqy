@@ -1226,9 +1226,11 @@ pub async fn run(
                     imu_frame.restart_median();
                     imu_epoch = Some(sample.epoch);
                 }
+                // The chip's own orientation whatever `bno08x_fusion` publishes: a mount is
+                // measured against the sensor, never fitted to the host's fusion of it.
                 let reading = SensorReading {
                     gyro: sample.gyro,
-                    quat: Some(sample.quat),
+                    quat: Some(sample.chip_quat()),
                 };
                 host_reading = Some(reading);
                 let decoded = imu_frame.push(reading);

@@ -335,6 +335,31 @@ mod tests {
         );
     }
 
+    /// Commissioning measures against the chip: `chip_quat` is the chip's orientation when the
+    /// sample publishes the fusion's, and the sample's own when it carries no fusion.
+    #[test]
+    fn the_chip_quaternion_is_the_chips_whatever_is_published() {
+        use crate::gyro_fusion::{FusionCounts, FusionMode, FusionSample, Verdict};
+        let now = Instant::now();
+        let plain = sample(1, now);
+        assert_eq!(plain.chip_quat(), plain.quat);
+        let chip = [0.9, 0.1, 0.0, 0.0];
+        let fused = HostImuSample {
+            quat: [1.0, 0.0, 0.0, 0.0],
+            fusion: Some(FusionSample {
+                mode: FusionMode::Gyro,
+                verdict: Verdict::Rejected,
+                chip_quat: chip,
+                fused_quat: [1.0, 0.0, 0.0, 0.0],
+                theta_deg: 11.0,
+                counts: FusionCounts::default(),
+                period_us: None,
+            }),
+            ..plain
+        };
+        assert_eq!(fused.chip_quat(), chip);
+    }
+
     /// The bus board keeps its own default, unchanged by the second source.
     #[test]
     fn each_source_has_its_own_default_mount_and_label() {
