@@ -15,14 +15,15 @@ Maintained by [microduck-replica](https://github.com/fanhao375/microduck-replica
 - **Tracks the latest upstream release**: currently R17 V167 (control.43), including upstream's jitter fix (servo D=0 and torque limit 1000 on every arm);
 - **Step-by-step instructions** (Chinese, with an English summary): wiring, overlays, build, install, confirming the IMU mount.
 
-## Status (2026-10-14)
+## Status (2026-10-15)
 
 | | Status |
 |---|---|
-| BNO085 + V167 | Installed on our duck's new card on 10-14; it has stood and walked |
-| Servo tuning | Unit-tested (without the file, the frames to the servos are upstream V167 byte for byte; the diagnostics add one null field); **not yet on a robot** |
-| Pad-loss sit, UDP pad | Unit-tested and run end to end on a host; **not yet on a robot** (the pad-loss behaviour is what the code is expected to do) |
-| Installer (whole set) | Tested on fake boards; **this version has not run on a real board** |
+| BNO085 + V167 | Installed on our duck's new card on 10-14; reinstalled as this whole set on 10-15; it has stood, walked and turned |
+| BNO085 gyro-integrated attitude (`gyro`) | **Run on a robot on 10-15**: the chip's own orientation jumps when a foot lands, and the duck used to fall after two or three steps; with `gyro`, 60 s of pushing the stick gave no fall and 10+ minutes in walk mode (60 s of it pushing the stick) one. No interleaved A/B was run. The default is still `chip`; switch it yourself ([IMU-MODULE.md §4.4](IMU-MODULE.md), Chinese) |
+| Servo tuning | Unit-tested (without the file, the frames to the servos are upstream V167 byte for byte; the diagnostics add one null field); this version ran on the board on 10-15 without a parameter file; **with a file, not yet on a robot** |
+| Pad-loss sit, UDP pad | Unit-tested and run end to end on a host; this padd ran on the board on 10-15 (a Bluetooth pad drove the duck for 10+ minutes); **the UDP pad and the pad-loss sit have not been tried on a robot** |
+| Installer (whole set) | Tested on fake boards; installed this version on a real board on 10-15 at the first attempt; `rollback` not yet run on a real board |
 | LSM6DSV16X | Written and tested against a fake bus only; not yet on a robot |
 
 ## Quick start
