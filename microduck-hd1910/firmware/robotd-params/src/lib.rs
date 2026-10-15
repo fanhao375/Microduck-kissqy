@@ -2037,6 +2037,10 @@ pub struct TrunkImuParams {
     pub i2c_address: u8,
     /// Which orientation a BNO08x source publishes. Inert for every other source.
     pub bno08x_fusion: Bno08xFusion,
+    /// A file every BNO08x report is appended to as CSV, for settling the gyro fusion's numbers
+    /// on a robot: an absolute path, or `"off"` (or empty) for no log. Inert for every other
+    /// source.
+    pub bno08x_raw_log: String,
 }
 
 impl Default for TrunkImuParams {
@@ -2046,11 +2050,19 @@ impl Default for TrunkImuParams {
             i2c_device: "/dev/i2c-4".into(),
             i2c_address: 0x4B,
             bno08x_fusion: Bno08xFusion::Chip,
+            bno08x_raw_log: "off".into(),
         }
     }
 }
 
 impl TrunkImuParams {
+    /// Where a BNO08x's raw reports go: `bno08x_raw_log` when it is an absolute path.
+    pub fn bno08x_raw_log_path(&self) -> Option<&str> {
+        self.bno08x_raw_log
+            .starts_with('/')
+            .then_some(self.bno08x_raw_log.as_str())
+    }
+
     /// Why this section cannot run with this bus, if it cannot. `None` for a bus source
     /// whatever the I²C keys say: they are inert there, and an inert key does not stop a robot.
     fn problem(&self, protocol: BusProtocol) -> Option<String> {
@@ -2066,6 +2078,16 @@ impl TrunkImuParams {
         }
         if self.i2c_device.trim().is_empty() {
             return Some("i2c_device is empty".to_owned());
+        }
+        if self.source == TrunkImuSource::Bno08x
+            && self.bno08x_raw_log_path().is_none()
+            && !matches!(self.bno08x_raw_log.as_str(), "" | "off")
+        {
+            return Some(format!(
+                "bno08x_raw_log = \"{}\" is not an absolute path; robotd's working directory is \
+                 no place for a log",
+                self.bno08x_raw_log
+            ));
         }
         let addresses = self.source.i2c_addresses();
         if !addresses.contains(&self.i2c_address) {
@@ -3790,6 +3812,41 @@ source = \"{}\"
             Params::load(&path, true).unwrap().trunk_imu.source,
             TrunkImuSource::Bus
         );
+    }
+
+    /// The raw report log is off unless named, must be an absolute path for a BNO08x, and is
+    /// inert — whatever it says — for any other source.
+    #[test]
+    fn the_bno08x_raw_log_is_off_unless_an_absolute_path_is_named() {
+        assert_eq!(TrunkImuParams::default().bno08x_raw_log, "off");
+        assert_eq!(TrunkImuParams::default().bno08x_raw_log_path(), None);
+        let dir = tempfile::tempdir().unwrap();
+        let file = |source: &str, log: &str| {
+            write(
+                dir.path(),
+                &format!(
+                    "[bus]\nprotocol = \"feetech\"\n\n[trunk_imu]\nsource = \"{source}\"\n\
+                     i2c_address = {}\nbno08x_raw_log = \"{log}\"\n",
+                    if source == "lsm6dsv16x" {
+                        "0x6A"
+                    } else {
+                        "0x4B"
+                    }
+                ),
+            )
+        };
+        let p = Params::load(&file("bno08x", "/var/lib/robot/bno08x-raw.csv"), true).unwrap();
+        assert_eq!(p.trunk_imu.bno08x_raw_log, "/var/lib/robot/bno08x-raw.csv");
+        let err = Params::load(&file("bno08x", "raw.csv"), true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("absolute"), "{err}");
+        assert!(Params::load(&file("lsm6dsv16x", "raw.csv"), true).is_ok());
+        for off in ["off", ""] {
+            let p = Params::load(&file("bno08x", off), true).unwrap();
+            assert_eq!(p.trunk_imu.bno08x_raw_log_path(), None);
+        }
+        assert!(registry::entry_for("trunk_imu.bno08x_raw_log").is_some());
     }
 
     /// The I²C keys mean nothing to a bus robot, and an inert key does not stop one — the same

@@ -75,6 +75,14 @@ port = "/dev/ttyS2"
 # Ignored for any other source. Needs a robotd restart.
 # bno08x_fusion = "chip"
 
+# Append every report a BNO08x sends to this file, one CSV line each (gyro and orientation raw,
+# with their sequence numbers and delays), for settling the fusion's numbers on this robot.
+# "off" or an absolute path robotd may write: /var/lib/robot/feetech-ft5/r5/ survives a
+# reboot, /run/ does not. Each run appends under a `#` line of its own; the file stops growing
+# at 64 MB, about an hour. Writing never holds up the IMU: a writer that falls behind drops
+# lines and counts them (busStatus native.imu_reader.raw_log). Needs a robotd restart.
+# bno08x_raw_log = "off"
+
 [control]
 # Control loop rate, Hz.
 #

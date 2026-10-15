@@ -39,6 +39,7 @@ mod telemetry_geometry;
 mod telemetry_system;
 mod theremin;
 mod trunk_imu_i2c;
+mod trunk_imu_raw_log;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -1341,11 +1342,15 @@ fn spawn_control_thread(
                         // gravity the policy sees, so it is in the line that names the source.
                         let fusion = (reader.kind() == TrunkImuKind::Bno08x)
                             .then(|| params.trunk_imu.bno08x_fusion.label());
+                        let raw_log = fusion
+                            .and(params.trunk_imu.bno08x_raw_log_path())
+                            .unwrap_or("-");
                         tracing::warn!(
                             source = reader.kind().label(),
                             device = %params.trunk_imu.i2c_device,
                             address = params.trunk_imu.i2c_address,
                             bno08x_fusion = fusion.unwrap_or("-"),
+                            bno08x_raw_log = raw_log,
                             "trunk IMU is a module on I2C; ID 200 is not read"
                         );
                         Some(reader)

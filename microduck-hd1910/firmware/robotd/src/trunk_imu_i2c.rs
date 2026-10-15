@@ -37,6 +37,7 @@ use duck_control::lsm6dsv16x::{self, FifoStatus, Lsm6dsv16xAssembler, Op};
 use duck_control::trunk_imu::{FusionHealth, HostImu, HostImuHealth, HostImuSample, TrunkImuKind};
 
 use crate::params::{Bno08xFusion, TrunkImuParams, TrunkImuSource};
+use crate::trunk_imu_raw_log::RawLog;
 
 /// The source `[trunk_imu]` names, as the control core knows it.
 pub fn kind_of(source: TrunkImuSource) -> TrunkImuKind {
@@ -56,16 +57,21 @@ pub fn fusion_of(choice: Bno08xFusion) -> FusionMode {
 }
 
 /// What a reader is started with beyond its device: for a BNO08x, which orientation it
-/// publishes.
+/// publishes and where its reports are logged, if anywhere.
 #[derive(Clone, Default)]
 pub(crate) struct ReaderOptions {
     pub(crate) fusion: FusionMode,
+    pub(crate) raw_log: Option<RawLog>,
 }
 
 impl ReaderOptions {
     fn for_params(params: &TrunkImuParams) -> Self {
+        let path = params
+            .bno08x_raw_log_path()
+            .filter(|_| params.source == TrunkImuSource::Bno08x);
         Self {
             fusion: fusion_of(params.bno08x_fusion),
+            raw_log: path.map(RawLog::open),
         }
     }
 }
@@ -274,6 +280,7 @@ pub(crate) struct Bno08x {
     assembler: Bno08xAssembler,
     enabled_once: bool,
     io_run: u32,
+    raw_log: Option<RawLog>,
 }
 
 impl Bno08x {
@@ -300,6 +307,7 @@ impl Bno08x {
             assembler: Bno08xAssembler::with_fusion(epoch, now, options.fusion, counts),
             enabled_once: false,
             io_run: 0,
+            raw_log: options.raw_log.clone(),
         }
     }
 
@@ -363,6 +371,9 @@ impl Bno08x {
         let mut newest = None;
         let mut drained = false;
         let mut garbled = None;
+        // Every packet this step reads, offered to the log's writer when the step ends.
+        let raw_log = self.raw_log.clone();
+        let mut logged = raw_log.as_ref().map(|log| log.step(now));
         for _ in 0..BNO08X_PACKETS_PER_STEP {
             let Some((header, body)) = Self::next_packet_classified(io)? else {
                 drained = true;
@@ -370,6 +381,9 @@ impl Bno08x {
             };
             let packet =
                 Packet::check(&header, &body).map_err(|e| Fault::Garbled(e.to_string()))?;
+            if let Some(lines) = logged.as_mut() {
+                lines.packet(packet.channel, packet.sequence, packet.payload);
+            }
             if packet.channel == bno08x::channel::CONTROL {
                 Self::note_control(packet.payload);
             }
@@ -843,6 +857,7 @@ fn machine(
 struct Shared {
     kind: TrunkImuKind,
     location: String,
+    raw_log: Option<RawLog>,
     sample: ArcSwapOption<HostImuSample>,
     state: AtomicU8,
     epoch: AtomicU32,
@@ -853,10 +868,11 @@ struct Shared {
 }
 
 impl Shared {
-    fn new(kind: TrunkImuKind, location: String) -> Self {
+    fn new(kind: TrunkImuKind, location: String, raw_log: Option<RawLog>) -> Self {
         Self {
             kind,
             location,
+            raw_log,
             sample: ArcSwapOption::empty(),
             state: AtomicU8::new(State::Opening as u8),
             epoch: AtomicU32::new(0),
@@ -922,7 +938,7 @@ impl Shared {
                 .load()
                 .as_deref()
                 .and_then(|s| s.fusion.as_ref().map(FusionHealth::from)),
-            raw_log: None,
+            raw_log: self.raw_log.as_ref().map(RawLog::health),
         }
     }
 }
@@ -1067,7 +1083,7 @@ impl TrunkImuReader {
         location: String,
         options: ReaderOptions,
     ) -> io::Result<Self> {
-        let shared = Arc::new(Shared::new(kind, location));
+        let shared = Arc::new(Shared::new(kind, location, options.raw_log.clone()));
         let stop = Arc::new(AtomicBool::new(false));
         let (thread_shared, thread_stop) = (Arc::clone(&shared), Arc::clone(&stop));
         let thread = std::thread::Builder::new()
@@ -2105,7 +2121,10 @@ mod tests {
                 answers_feature: true,
                 ..FakeBno::default()
             };
-            let options = ReaderOptions { fusion };
+            let options = ReaderOptions {
+                fusion,
+                raw_log: None,
+            };
             let mut chip = Bno08x::with_options(1, t, &options, FusionCounts::default());
             let now = until_streaming(&mut chip, &mut io, t).unwrap();
             let mut published = Vec::new();
@@ -2157,6 +2176,7 @@ mod tests {
             later,
             &ReaderOptions {
                 fusion: FusionMode::Gyro,
+                raw_log: None,
             },
             counts,
         );
@@ -2194,6 +2214,7 @@ mod tests {
             "test".into(),
             ReaderOptions {
                 fusion: FusionMode::Gyro,
+                raw_log: None,
             },
         )
         .unwrap();
@@ -2214,6 +2235,69 @@ mod tests {
         assert!(taken >= 150, "{first:?} then {after:?}");
         let sample = reader.latest().unwrap();
         assert_eq!(sample.quat, sample.fusion.unwrap().fused_quat);
+    }
+
+    /// With a raw log named, every packet the reader reads is a line in it — the reports
+    /// published and the ones a backlog step was not, the chip's confirmations too — and the
+    /// reader's health says how many.
+    #[test]
+    fn a_named_raw_log_gets_every_report_the_reader_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bno08x-raw.csv");
+        let t = Instant::now();
+        let mut io = FakeBno {
+            answers_id: true,
+            answers_feature: true,
+            ..FakeBno::default()
+        };
+        let log = RawLog::open(path.to_str().unwrap());
+        let options = ReaderOptions {
+            fusion: FusionMode::Chip,
+            raw_log: Some(log.clone()),
+        };
+        let mut chip = Bno08x::with_options(1, t, &options, FusionCounts::default());
+        let now = until_streaming(&mut chip, &mut io, t).unwrap();
+        for n in 0..12 {
+            io.queue.push_back(reports(n));
+        }
+        chip.step(&mut io, now, &mut |_| {});
+        chip.step(&mut io, now, &mut |_| {});
+        // Two feature responses, then twelve packets of base timestamp, gyro, orientation.
+        let want = 2 + 12 * 3;
+        for _ in 0..200 {
+            if log.health().lines >= want {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let health = log.health();
+        assert_eq!(
+            (health.lines, health.dropped, health.error),
+            (want, 0, None)
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        let gyros = text
+            .lines()
+            .filter(|l| l.split(',').nth(4) == Some("2"))
+            .count();
+        assert_eq!(gyros, 12);
+        assert_eq!(
+            text.lines()
+                .filter(|l| l.contains(",252,,,,8,10000"))
+                .count(),
+            1
+        );
+        let shared = Shared::new(TrunkImuKind::Bno08x, "test".into(), Some(log));
+        assert_eq!(shared.health().raw_log.unwrap().lines, want);
+        let params = TrunkImuParams {
+            source: TrunkImuSource::Lsm6dsv16x,
+            bno08x_raw_log: path.to_str().unwrap().into(),
+            ..TrunkImuParams::default()
+        };
+        assert!(
+            ReaderOptions::for_params(&params).raw_log.is_none(),
+            "only a BNO08x has reports to log"
+        );
     }
 
     #[test]

@@ -144,6 +144,11 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Choice(&["chip", "gyro"]),
         "BNO08x: publish the chip's orientation, or the host's gyro-integrated one",
     ),
+    entry(
+        "trunk_imu.bno08x_raw_log",
+        Kind::Text,
+        "BNO08x: append every report to this CSV file (absolute path), or off",
+    ),
     // ── [control] ────────────────────────────────────────────────────────────
     entry("control.hz", Kind::Integer, "Control loop rate"),
     entry(
