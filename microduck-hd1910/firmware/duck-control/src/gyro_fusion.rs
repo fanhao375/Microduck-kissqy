@@ -993,3 +993,370 @@ pub(crate) mod tests {
         }
     }
 }
+
+/// The fusion on robot recordings, the whole way to what the policy sees: fused attitude →
+/// [`crate::imu::TrunkFrame`] → three-point median → the glitch count the recordings were
+/// judged by. `test-data/bno08x-fusion-replay/` holds the recordings and says where each is
+/// from; the phase-0 Python reference (same algorithm, same inputs) got the figures each test
+/// compares against, to the tolerances below.
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+    use crate::imu::{SensorReading, TrunkFrame};
+
+    struct Row {
+        t: f64,
+        policy: String,
+        limp: bool,
+        fallen: bool,
+        quat: Quat,
+        gyro: [f64; 3],
+    }
+
+    fn parse(csv: &str) -> Vec<Row> {
+        csv.lines()
+            .filter(|line| !line.starts_with('#') && !line.starts_with("t,"))
+            .map(|line| {
+                let c: Vec<&str> = line.split(',').collect();
+                let f = |i: usize| c[i].parse::<f64>().unwrap();
+                Row {
+                    t: f(0),
+                    policy: c[1].to_owned(),
+                    limp: c[2] == "1",
+                    fallen: c[3] == "1",
+                    quat: [f(5), f(6), f(7), f(8)],
+                    gyro: [f(9), f(10), f(11)],
+                }
+            })
+            .collect()
+    }
+
+    /// The recording is 50 Hz and its gyro is already a tick late (it is the median's output):
+    /// each tick integrates the *next* tick's rate over this tick's interval, as the reference
+    /// does.
+    fn run(rows: &[Row]) -> (Vec<Quat>, Vec<Verdict>) {
+        let mut fusion = GyroFusion::new();
+        let (mut out, mut verdicts) = (Vec::new(), Vec::new());
+        for (k, row) in rows.iter().enumerate() {
+            let verdict = if k == 0 {
+                fusion.chip(row.quat, 0.02)
+            } else {
+                let dt = row.t - rows[k - 1].t;
+                let next = &rows[(k + 1).min(rows.len() - 1)];
+                let span = next.t - rows[k - 1].t;
+                let rate = if span > 0.0 && span <= 0.2 {
+                    next.gyro
+                } else {
+                    row.gyro
+                };
+                fusion.gyro(rate, dt);
+                fusion.chip(row.quat, dt)
+            };
+            out.push(fusion.fused().unwrap());
+            verdicts.push(verdict);
+        }
+        (out, verdicts)
+    }
+
+    /// What the policy would see: each orientation through a trunk frame (identity mount — the
+    /// recording is in trunk axes already) and its median.
+    fn through_the_frame(rows: &[Row], quats: &[Quat]) -> Vec<[f64; 3]> {
+        let mut frame = TrunkFrame::new(IDENTITY);
+        frame.restart_median();
+        rows.iter()
+            .zip(quats)
+            .map(|(row, q)| {
+                frame
+                    .push(SensorReading {
+                        gyro: row.gyro,
+                        quat: Some(*q),
+                    })
+                    .gravity
+            })
+            .collect()
+    }
+
+    /// The recordings' glitch count: the last gravity carried 20 ms by the recorded gyro, more
+    /// than 5° from this one.
+    fn jump_errors(g: &[[f64; 3]], rows: &[Row]) -> Vec<Option<f64>> {
+        let mut errors = vec![None; g.len()];
+        for k in 1..g.len() {
+            let (p, c) = (&rows[k - 1], &rows[k]);
+            let dt = c.t - p.t;
+            if !(0.015 < dt && dt < 0.03) || c.limp || p.limp {
+                continue;
+            }
+            let (g0, w) = (g[k - 1], c.gyro);
+            let pred = [
+                g0[0] - (w[1] * g0[2] - w[2] * g0[1]) * dt,
+                g0[1] - (w[2] * g0[0] - w[0] * g0[2]) * dt,
+                g0[2] - (w[0] * g0[1] - w[1] * g0[0]) * dt,
+            ];
+            let dot = pred[0] * g[k][0] + pred[1] * g[k][1] + pred[2] * g[k][2];
+            let n = |v: [f64; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+            let cos = (dot / (n(pred) * n(g[k]))).clamp(-1.0, 1.0);
+            errors[k] = Some(cos.acos().to_degrees());
+        }
+        errors
+    }
+
+    fn percentile(mut xs: Vec<f64>, p: f64) -> f64 {
+        xs.sort_by(f64::total_cmp);
+        if xs.is_empty() {
+            return 0.0;
+        }
+        xs[((xs.len() as f64 * p) as usize).min(xs.len() - 1)]
+    }
+
+    #[derive(Debug)]
+    struct Metrics {
+        counts: FusionCounts,
+        chip_steps: usize,
+        fused_steps: usize,
+        fused_step_max: f64,
+        longest_open_loop_s: f64,
+        /// Whole realignments: (t, walking upright, fallen within the second before).
+        realigns: Vec<(f64, bool, bool)>,
+        clean_med: f64,
+        clean_p99: f64,
+        held_med: f64,
+        held_p99: f64,
+        held_max: f64,
+        last_second_max: f64,
+    }
+
+    fn metrics(csv: &str) -> Metrics {
+        let rows = parse(csv);
+        let (fused, verdicts) = run(&rows);
+        let walking: Vec<bool> = rows.iter().map(|r| r.policy == "walk" && !r.limp).collect();
+        let chip: Vec<Quat> = rows.iter().map(|r| positive(normalise(r.quat))).collect();
+        let chip_errors = jump_errors(&through_the_frame(&rows, &chip), &rows);
+        let fused_errors = jump_errors(&through_the_frame(&rows, &fused), &rows);
+        // A chip glitch, ±25 ticks: the part of a recording the fusion is meant to differ in.
+        let raw: Vec<[f64; 3]> = chip.iter().map(|q| gravity(*q)).collect();
+        let mut episode = vec![false; rows.len()];
+        for (k, e) in jump_errors(&raw, &rows).iter().enumerate() {
+            if e.is_some_and(|e| e > 5.0) {
+                for flag in &mut episode[k.saturating_sub(25)..(k + 26).min(rows.len())] {
+                    *flag = true;
+                }
+            }
+        }
+        let dev: Vec<f64> = (0..rows.len())
+            .map(|k| angle_deg(gravity(fused[k]), raw[k]))
+            .collect();
+        let pick = |keep: &dyn Fn(usize) -> bool| -> Vec<f64> {
+            (0..rows.len())
+                .filter(|&k| keep(k))
+                .map(|k| dev[k])
+                .collect()
+        };
+        let clean = pick(&|k| !episode[k] && !rows[k].limp && verdicts[k] != Verdict::Follow);
+        let held =
+            pick(&|k| rows[k].policy == "held" && !rows[k].limp && verdicts[k] != Verdict::Follow);
+        let steps: Vec<f64> = (0..rows.len())
+            .filter_map(|k| fused_errors[k].filter(|e| walking[k] && *e > 5.0))
+            .collect();
+        let (mut run_s, mut longest) = (0.0, 0.0f64);
+        for k in 1..rows.len() {
+            if matches!(verdicts[k], Verdict::Rejected | Verdict::Slew)
+                && walking[k]
+                && !rows[k].fallen
+            {
+                run_s += rows[k].t - rows[k - 1].t;
+                longest = longest.max(run_s);
+            } else {
+                run_s = 0.0;
+            }
+        }
+        let mut counts = FusionCounts::default();
+        verdicts.iter().for_each(|v| counts.note(*v));
+        let end = rows.last().unwrap().t;
+        Metrics {
+            counts,
+            chip_steps: (0..rows.len())
+                .filter(|&k| walking[k] && chip_errors[k].is_some_and(|e| e > 5.0))
+                .count(),
+            fused_steps: steps.len(),
+            fused_step_max: steps.iter().copied().fold(0.0, f64::max),
+            longest_open_loop_s: longest,
+            realigns: (0..rows.len())
+                .filter(|&k| verdicts[k] == Verdict::RealignLong)
+                .map(|k| {
+                    let fallen = rows[k.saturating_sub(50)..=k].iter().any(|r| r.fallen);
+                    (rows[k].t, walking[k] && !rows[k].fallen, fallen)
+                })
+                .collect(),
+            clean_med: percentile(clean.clone(), 0.5),
+            clean_p99: percentile(clean, 0.99),
+            held_med: percentile(held.clone(), 0.5),
+            held_p99: percentile(held.clone(), 0.99),
+            held_max: held.iter().copied().fold(0.0, f64::max),
+            last_second_max: (0..rows.len())
+                .filter(|&k| rows[k].t >= end - 1.0)
+                .map(|k| dev[k])
+                .fold(0.0, f64::max),
+        }
+    }
+
+    /// The reference's figure, to 0.01°.
+    fn near(name: &str, rust: f64, python: f64) {
+        assert!(
+            (rust - python).abs() <= 0.01,
+            "{name}: Rust {rust} against the Python reference's {python}"
+        );
+    }
+
+    fn verdicts(m: &Metrics) -> [u64; 7] {
+        let c = m.counts;
+        [
+            c.follow,
+            c.accepted,
+            c.rejected,
+            c.slew,
+            c.realign_long,
+            c.realign_gap,
+            c.fallback,
+        ]
+    }
+
+    /// Verdict by verdict within 1 % (or one) of the reference's.
+    fn like_python(m: &Metrics, python: [u64; 7]) {
+        for (rust, python) in verdicts(m).into_iter().zip(python) {
+            let slack = (python as f64 * 0.01).max(1.0);
+            assert!(
+                (rust as f64 - python as f64).abs() <= slack,
+                "{:?} against the Python reference's {python:?}",
+                verdicts(m)
+            );
+        }
+    }
+
+    /// Walking through two glitch runs: the chip's 72 one-tick steps (the 50 Hz glitch count)
+    /// are none in what the policy would see; the longest the gyro carries the attitude alone
+    /// is a third of a second; outside the glitches it stays within 1.5° of the chip.
+    #[test]
+    fn walking_through_glitches_takes_none_of_them() {
+        let m = metrics(include_str!(
+            "../../test-data/bno08x-fusion-replay/walk-glitch.csv"
+        ));
+        assert_eq!(verdicts(&m), [50, 567, 132, 0, 0, 0, 0], "{m:?}");
+        like_python(&m, [50, 567, 132, 0, 0, 0, 0]);
+        assert_eq!(m.chip_steps, 72);
+        assert_eq!(m.fused_steps, 0);
+        assert!(m.realigns.is_empty());
+        near(
+            "longest open loop",
+            m.longest_open_loop_s,
+            0.3402308600000019,
+        );
+        near("clean median", m.clean_med, 0.24022472540063058);
+        near("clean P99", m.clean_p99, 1.4976655595583248);
+        assert!(m.clean_p99 < 2.0, "{m:?}");
+    }
+
+    /// Standing still: nothing refused, and the fusion is the chip to a twentieth of a degree.
+    #[test]
+    fn standing_still_is_the_chip() {
+        let m = metrics(include_str!(
+            "../../test-data/bno08x-fusion-replay/home-still.csv"
+        ));
+        assert_eq!(verdicts(&m), [50, 250, 0, 0, 0, 0, 0], "{m:?}");
+        like_python(&m, [50, 250, 0, 0, 0, 0, 0]);
+        near("held median", m.held_med, 0.01835686127561385);
+        near("held P99", m.held_p99, 0.04822575047501972);
+        near("held max", m.held_max, 0.05048697450199928);
+        assert!(m.held_med < 0.5 && m.held_p99 < 1.0, "{m:?}");
+    }
+
+    /// Glitches and two falls: no step, no whole realignment, and lying on the floor at the end
+    /// the fusion is back within a degree of the chip.
+    #[test]
+    fn glitches_and_falls_leave_no_step() {
+        let m = metrics(include_str!(
+            "../../test-data/bno08x-fusion-replay/fall-walk.csv"
+        ));
+        assert_eq!(verdicts(&m), [51, 632, 88, 29, 0, 0, 0], "{m:?}");
+        like_python(&m, [51, 632, 88, 29, 0, 0, 0]);
+        assert_eq!(m.chip_steps, 43);
+        assert_eq!(m.fused_steps, 0);
+        near(
+            "longest open loop",
+            m.longest_open_loop_s,
+            0.46032800000011775,
+        );
+        near("clean median", m.clean_med, 0.3739451721765738);
+        near("clean P99", m.clean_p99, 7.556046261165057);
+        near("last second", m.last_second_max, 0.6577658035897217);
+        assert!(m.last_second_max < 1.0);
+    }
+
+    /// The one whole realignment in these recordings: after the robot fell, with chip and trunk
+    /// still — its 7° is the only step, and it lands on a robot already on the floor.
+    #[test]
+    fn the_one_whole_realignment_comes_after_the_fall() {
+        let m = metrics(include_str!(
+            "../../test-data/bno08x-fusion-replay/fall-realign.csv"
+        ));
+        assert_eq!(verdicts(&m), [51, 536, 112, 0, 1, 0, 0], "{m:?}");
+        like_python(&m, [51, 536, 112, 0, 1, 0, 0]);
+        assert_eq!(m.realigns.len(), 1);
+        let (t, walking_upright, fallen) = m.realigns[0];
+        assert!((t - 102.9348469).abs() < 1e-6, "{t}");
+        assert!(!walking_upright && fallen, "{m:?}");
+        assert_eq!(m.fused_steps, 1);
+        near("the step", m.fused_step_max, 6.9553327162602345);
+        near("last second", m.last_second_max, 0.10386545743043264);
+        near("clean median", m.clean_med, 0.34989472653901743);
+    }
+
+    /// The fusion runs in the sensor's axes and the policy reads the trunk's. With a real
+    /// mount `m` — `q_s = q_t ⊗ m`, `ω_s = m⁻¹ ω_t m` — the sensor-frame fusion through
+    /// `TrunkFrame(m)` is the trunk-frame fusion through an identity frame, value for value.
+    #[test]
+    fn fusing_in_sensor_axes_is_fusing_in_trunk_axes() {
+        let rows = parse(include_str!(
+            "../../test-data/bno08x-fusion-replay/fall-walk.csv"
+        ));
+        let (trunk, trunk_verdicts) = run(&rows);
+        for mount in [
+            crate::trunk_imu::BNO08X_DEFAULT_MOUNT,
+            [0.459554518, 0.539556409, 0.532044137, 0.463268349],
+        ] {
+            let mount = normalise(mount);
+            let sensor_rows: Vec<Row> = rows
+                .iter()
+                .map(|r| {
+                    let v = [0.0, r.gyro[0], r.gyro[1], r.gyro[2]];
+                    let w = mul(mul(conj(mount), v), mount);
+                    Row {
+                        t: r.t,
+                        policy: r.policy.clone(),
+                        limp: r.limp,
+                        fallen: r.fallen,
+                        quat: mul(r.quat, mount),
+                        gyro: [w[1], w[2], w[3]],
+                    }
+                })
+                .collect();
+            let (sensor, sensor_verdicts) = run(&sensor_rows);
+            assert_eq!(sensor_verdicts, trunk_verdicts);
+            let mut in_mount = TrunkFrame::new(mount);
+            let mut identity = TrunkFrame::new(IDENTITY);
+            for k in 0..rows.len() {
+                let a = in_mount.push(SensorReading {
+                    gyro: sensor_rows[k].gyro,
+                    quat: Some(sensor[k]),
+                });
+                let b = identity.push(SensorReading {
+                    gyro: rows[k].gyro,
+                    quat: Some(trunk[k]),
+                });
+                for i in 0..3 {
+                    assert!((a.gravity[i] - b.gravity[i]).abs() < 1e-9, "{k}");
+                    assert!((a.gyro[i] - b.gyro[i]).abs() < 1e-9, "{k}");
+                }
+            }
+        }
+    }
+}
