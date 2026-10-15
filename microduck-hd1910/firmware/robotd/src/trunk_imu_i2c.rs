@@ -20,6 +20,10 @@
 //! The device itself is Linux only (i2c-dev, `flock`, `I2C_SLAVE`, `I2C_RDWR`). Everything else
 //! is plain code, tested anywhere against a fake bus; elsewhere the reader runs and reports that
 //! it has no device to open.
+//!
+//! A BNO08x's samples also carry the host's gyro fusion (`duck_control::gyro_fusion`), and
+//! `[trunk_imu] bno08x_fusion` picks which orientation they publish. Its totals carry over a
+//! reopen, so the health counts for the reader's whole life like everything else in it.
 
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
@@ -28,10 +32,11 @@ use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwapOption;
 use duck_control::bno08x::{self, Bno08xAssembler, ControlReply, Header, Packet, Writer};
+use duck_control::gyro_fusion::{FusionCounts, FusionMode};
 use duck_control::lsm6dsv16x::{self, FifoStatus, Lsm6dsv16xAssembler, Op};
 use duck_control::trunk_imu::{FusionHealth, HostImu, HostImuHealth, HostImuSample, TrunkImuKind};
 
-use crate::params::{TrunkImuParams, TrunkImuSource};
+use crate::params::{Bno08xFusion, TrunkImuParams, TrunkImuSource};
 
 /// The source `[trunk_imu]` names, as the control core knows it.
 pub fn kind_of(source: TrunkImuSource) -> TrunkImuKind {
@@ -42,11 +47,40 @@ pub fn kind_of(source: TrunkImuSource) -> TrunkImuKind {
     }
 }
 
+/// `bno08x_fusion`, as the control core knows it.
+pub fn fusion_of(choice: Bno08xFusion) -> FusionMode {
+    match choice {
+        Bno08xFusion::Chip => FusionMode::Chip,
+        Bno08xFusion::Gyro => FusionMode::Gyro,
+    }
+}
+
+/// What a reader is started with beyond its device: for a BNO08x, which orientation it
+/// publishes.
+#[derive(Clone, Default)]
+pub(crate) struct ReaderOptions {
+    pub(crate) fusion: FusionMode,
+}
+
+impl ReaderOptions {
+    fn for_params(params: &TrunkImuParams) -> Self {
+        Self {
+            fusion: fusion_of(params.bno08x_fusion),
+        }
+    }
+}
+
 /// Start the reader `[trunk_imu]` asks for; `None` when the trunk IMU is the bus board.
 pub fn spawn_for(params: &TrunkImuParams) -> Option<io::Result<TrunkImuReader>> {
     let kind = kind_of(params.source);
-    (kind != TrunkImuKind::Bus)
-        .then(|| TrunkImuReader::spawn(kind, &params.i2c_device, params.i2c_address))
+    (kind != TrunkImuKind::Bus).then(|| {
+        TrunkImuReader::spawn(
+            kind,
+            &params.i2c_device,
+            params.i2c_address,
+            ReaderOptions::for_params(params),
+        )
+    })
 }
 
 /// One device at one address, as the state machines see it.
@@ -195,6 +229,11 @@ pub(crate) trait Machine: Send {
     fn epoch(&self) -> u32;
     /// Best effort on the way out: undo what this reader turned on. RAM only.
     fn stop(&mut self, io: &mut dyn I2c);
+    /// The gyro fusion's running totals, for a chip that has one — carried into the next
+    /// machine when the device is reopened.
+    fn fusion_counts(&self) -> Option<FusionCounts> {
+        None
+    }
 }
 
 /// A stream with nothing new for this long is a fault, closed and reopened. A BNO08x's 2 s is
@@ -238,13 +277,61 @@ pub(crate) struct Bno08x {
 }
 
 impl Bno08x {
+    #[cfg(test)]
     pub(crate) fn new(epoch: u32, now: Instant) -> Self {
+        Self::with_options(
+            epoch,
+            now,
+            &ReaderOptions::default(),
+            FusionCounts::default(),
+        )
+    }
+
+    /// Publishing `options.fusion`'s orientation, its fusion totals carried on from `counts`.
+    pub(crate) fn with_options(
+        epoch: u32,
+        now: Instant,
+        options: &ReaderOptions,
+        counts: FusionCounts,
+    ) -> Self {
         Self {
             phase: BnoPhase::Drain,
             writer: Writer::default(),
-            assembler: Bno08xAssembler::new(epoch, now),
+            assembler: Bno08xAssembler::with_fusion(epoch, now, options.fusion, counts),
             enabled_once: false,
             io_run: 0,
+        }
+    }
+
+    /// A control-channel packet read while streaming — the chip confirming a report's period
+    /// after it was enabled. Logged: the fusion integrates at the period asked for, and a chip
+    /// that settled on another one is worth knowing about. Nothing here acts on it.
+    fn note_control(payload: &[u8]) {
+        let Ok(replies) = bno08x::control_replies(payload) else {
+            return;
+        };
+        for reply in replies {
+            if let ControlReply::Feature {
+                report_id,
+                interval_us,
+            } = reply
+            {
+                tracing::info!(
+                    report = format!("{report_id:#04x}"),
+                    interval_us,
+                    "trunk IMU: BNO08x confirmed a report period"
+                );
+                let ours = matches!(report_id, bno08x::GAME_ROTATION_VECTOR | bno08x::GYROSCOPE);
+                if ours && interval_us != bno08x::REPORT_INTERVAL_US {
+                    tracing::warn!(
+                        report = format!("{report_id:#04x}"),
+                        interval_us,
+                        asked_us = bno08x::REPORT_INTERVAL_US,
+                        "trunk IMU: BNO08x runs a report at another period than asked; the gyro \
+                         fusion integrates at the asked period"
+                    );
+                }
+            }
         }
     }
 
@@ -283,6 +370,9 @@ impl Bno08x {
             };
             let packet =
                 Packet::check(&header, &body).map_err(|e| Fault::Garbled(e.to_string()))?;
+            if packet.channel == bno08x::channel::CONTROL {
+                Self::note_control(packet.payload);
+            }
             if packet.is_reset_complete() {
                 self.phase = BnoPhase::Enable;
                 return Ok(Step::Restart(
@@ -400,7 +490,12 @@ impl Bno08x {
                 if self.enabled_once {
                     self.assembler.restart(now);
                 } else {
-                    self.assembler = Bno08xAssembler::new(self.assembler.epoch(), now);
+                    self.assembler = Bno08xAssembler::with_fusion(
+                        self.assembler.epoch(),
+                        now,
+                        self.assembler.fusion_mode(),
+                        self.assembler.fusion_counts(),
+                    );
                     self.enabled_once = true;
                 }
                 self.phase = BnoPhase::Stream { last_sample: now };
@@ -459,6 +554,10 @@ impl Machine for Bno08x {
                 break;
             }
         }
+    }
+
+    fn fusion_counts(&self) -> Option<FusionCounts> {
+        Some(self.assembler.fusion_counts())
     }
 }
 
@@ -724,9 +823,15 @@ impl Machine for Lsm6dsv16x {
     }
 }
 
-fn machine(kind: TrunkImuKind, epoch: u32, now: Instant) -> Box<dyn Machine> {
+fn machine(
+    kind: TrunkImuKind,
+    epoch: u32,
+    now: Instant,
+    options: &ReaderOptions,
+    carried: FusionCounts,
+) -> Box<dyn Machine> {
     match kind {
-        TrunkImuKind::Bno08x => Box::new(Bno08x::new(epoch, now)),
+        TrunkImuKind::Bno08x => Box::new(Bno08x::with_options(epoch, now, options, carried)),
         // `spawn_for` never starts a reader for the bus board; treated as the LSM's sibling
         // rather than a panic, and the bring-up's identity check fails it with a reason.
         TrunkImuKind::Lsm6dsv16x | TrunkImuKind::Bus => Box::new(Lsm6dsv16x::new(epoch, now)),
@@ -849,8 +954,16 @@ fn pause(stop: &AtomicBool, duration: Duration) {
 type Opener = Box<dyn FnMut() -> Result<Box<dyn I2c + Send>, String> + Send>;
 
 /// The reader thread: open, step the chip's machine until it fails or `stop`, back off, reopen.
-fn run(kind: TrunkImuKind, mut open: Opener, shared: &Shared, stop: &AtomicBool, timing: &Timing) {
+fn run(
+    kind: TrunkImuKind,
+    mut open: Opener,
+    shared: &Shared,
+    stop: &AtomicBool,
+    timing: &Timing,
+    options: &ReaderOptions,
+) {
     let mut epoch = 0u32;
+    let mut carried = FusionCounts::default();
     let mut backoff = timing.retry_min;
     while !stop.load(Ordering::Relaxed) {
         shared.set_state(State::Opening);
@@ -865,7 +978,7 @@ fn run(kind: TrunkImuKind, mut open: Opener, shared: &Shared, stop: &AtomicBool,
             }
         };
         epoch = epoch.wrapping_add(1);
-        let mut chip = machine(kind, epoch, Instant::now());
+        let mut chip = machine(kind, epoch, Instant::now(), options, carried);
         loop {
             shared.set_state(chip.state());
             shared.epoch.store(chip.epoch(), Ordering::Relaxed);
@@ -898,6 +1011,7 @@ fn run(kind: TrunkImuKind, mut open: Opener, shared: &Shared, stop: &AtomicBool,
             }
         }
         epoch = chip.epoch();
+        carried = chip.fusion_counts().unwrap_or_default();
         drop(io);
         shared.set_state(State::Backoff);
         pause(stop, backoff);
@@ -930,9 +1044,20 @@ pub struct TrunkImuReader {
 
 impl TrunkImuReader {
     /// Start reading `kind` at `address` on `device` (an i2c-dev node).
-    pub fn spawn(kind: TrunkImuKind, device: &str, address: u8) -> io::Result<Self> {
+    pub(crate) fn spawn(
+        kind: TrunkImuKind,
+        device: &str,
+        address: u8,
+        options: ReaderOptions,
+    ) -> io::Result<Self> {
         let location = format!("{device} @ {address:#04x}");
-        Self::spawn_with(kind, opener(device.to_owned(), address), TIMING, location)
+        Self::spawn_with(
+            kind,
+            opener(device.to_owned(), address),
+            TIMING,
+            location,
+            options,
+        )
     }
 
     fn spawn_with(
@@ -940,13 +1065,14 @@ impl TrunkImuReader {
         open: Opener,
         timing: Timing,
         location: String,
+        options: ReaderOptions,
     ) -> io::Result<Self> {
         let shared = Arc::new(Shared::new(kind, location));
         let stop = Arc::new(AtomicBool::new(false));
         let (thread_shared, thread_stop) = (Arc::clone(&shared), Arc::clone(&stop));
         let thread = std::thread::Builder::new()
             .name(format!("imu-{}", kind.label()))
-            .spawn(move || run(kind, open, &thread_shared, &thread_stop, &timing))?;
+            .spawn(move || run(kind, open, &thread_shared, &thread_stop, &timing, &options))?;
         Ok(Self {
             inner: Arc::new(Inner {
                 shared,
@@ -1148,10 +1274,33 @@ mod tests {
         /// Alternate a NACK with a garbage header, read after read.
         flapping: bool,
         reads: u32,
+        /// Answer each set-feature with the chip's get-feature response, as a real one does.
+        answers_feature: bool,
+        /// Once its reports are enabled, a report pair on every other read that finds the
+        /// queue empty: a chip streaming at whatever pace it is read.
+        streams: Option<u8>,
+        /// Reads still to answer before every read fails, as a module unplugged.
+        fail_after: Option<u32>,
     }
 
     impl I2c for FakeBno {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if let Some(left) = self.fail_after.as_mut() {
+                if *left == 0 {
+                    return Err(io::Error::other("Remote I/O error"));
+                }
+                *left -= 1;
+            }
+            if !self.body_next
+                && self.queue.is_empty()
+                && let Some(n) = self.streams.as_mut()
+            {
+                self.reads += 1;
+                if self.reads.is_multiple_of(2) {
+                    self.queue.push_back(reports(*n));
+                    *n = n.wrapping_add(1);
+                }
+            }
             if self.fail_reads > 0 {
                 self.fail_reads -= 1;
                 return Err(io::Error::other("Remote I/O error"));
@@ -1202,6 +1351,19 @@ mod tests {
                     if self.answers_id =>
                 {
                     self.queue.push_back(product_id());
+                }
+                (bno08x::channel::CONTROL, Some(&bno08x::SET_FEATURE_COMMAND)) => {
+                    if self.answers_feature {
+                        let mut reply = [0u8; 17];
+                        reply[0] = bno08x::GET_FEATURE_RESPONSE;
+                        reply[1] = bytes[5];
+                        reply[5..9].copy_from_slice(&bytes[9..13]);
+                        self.queue.push_back(shtp(bno08x::channel::CONTROL, &reply));
+                    }
+                    if bytes[9..13] != [0; 4] && self.streams.is_none() && self.fail_after.is_some()
+                    {
+                        self.streams = Some(0);
+                    }
                 }
                 _ => {}
             }
@@ -1824,9 +1986,14 @@ mod tests {
             chip.streaming = true;
             Ok(Box::new(chip))
         });
-        let reader =
-            TrunkImuReader::spawn_with(TrunkImuKind::Lsm6dsv16x, open, FAST, "test".into())
-                .unwrap();
+        let reader = TrunkImuReader::spawn_with(
+            TrunkImuKind::Lsm6dsv16x,
+            open,
+            FAST,
+            "test".into(),
+            ReaderOptions::default(),
+        )
+        .unwrap();
         assert_eq!(reader.kind(), TrunkImuKind::Lsm6dsv16x);
         wait_for(&reader, "samples", |r| r.latest().is_some());
         let health = reader.health();
@@ -1856,9 +2023,14 @@ mod tests {
             chip.streaming = counted.fetch_add(1, Ordering::Relaxed) > 0;
             Ok(Box::new(chip))
         });
-        let reader =
-            TrunkImuReader::spawn_with(TrunkImuKind::Lsm6dsv16x, open, FAST, "test".into())
-                .unwrap();
+        let reader = TrunkImuReader::spawn_with(
+            TrunkImuKind::Lsm6dsv16x,
+            open,
+            FAST,
+            "test".into(),
+            ReaderOptions::default(),
+        )
+        .unwrap();
         wait_for(&reader, "second epoch", |r| {
             r.latest().is_some_and(|s| s.epoch == 2)
         });
@@ -1904,9 +2076,14 @@ mod tests {
                 streamed: 0,
             }))
         });
-        let reader =
-            TrunkImuReader::spawn_with(TrunkImuKind::Lsm6dsv16x, open, FAST, "test".into())
-                .unwrap();
+        let reader = TrunkImuReader::spawn_with(
+            TrunkImuKind::Lsm6dsv16x,
+            open,
+            FAST,
+            "test".into(),
+            ReaderOptions::default(),
+        )
+        .unwrap();
         wait_for(&reader, "samples", |r| r.latest().is_some());
         flaky.store(true, Ordering::Relaxed);
         wait_for(&reader, "drops", |r| r.health().dropped >= 3);
@@ -1914,6 +2091,129 @@ mod tests {
         assert_eq!(health.errors, 0, "{health:?}");
         assert_eq!(health.epoch, 1);
         assert_eq!(health.state, "streaming");
+    }
+
+    /// In `gyro` mode the machine publishes the fusion's orientation; in the default `chip`
+    /// mode the chip's — and both carry the other, and the chip's confirmation of each report's
+    /// period is read past without a drop.
+    #[test]
+    fn a_bno08x_publishes_the_orientation_its_mode_names() {
+        let t = Instant::now();
+        for fusion in FusionMode::ALL {
+            let mut io = FakeBno {
+                answers_id: true,
+                answers_feature: true,
+                ..FakeBno::default()
+            };
+            let options = ReaderOptions { fusion };
+            let mut chip = Bno08x::with_options(1, t, &options, FusionCounts::default());
+            let now = until_streaming(&mut chip, &mut io, t).unwrap();
+            let mut published = Vec::new();
+            for n in 0..3 {
+                io.queue.push_back(reports(n));
+                let step = chip.step(&mut io, now, &mut |s| published.push(s));
+                assert!(matches!(step, Step::Again(_)), "{step:?}");
+            }
+            let sample = published.last().unwrap();
+            let view = sample.fusion.unwrap();
+            assert_eq!(view.mode, fusion);
+            match fusion {
+                FusionMode::Chip => assert_eq!(sample.quat, view.chip_quat),
+                FusionMode::Gyro => assert_eq!(sample.quat, view.fused_quat),
+            }
+            assert_eq!(chip.fusion_counts().unwrap().follow, 3);
+        }
+    }
+
+    /// The fusion's totals are the reader's: a chip that resets in place keeps them, and a
+    /// machine made for a reopened device starts from the old one's.
+    #[test]
+    fn the_fusion_totals_outlive_a_reset_and_a_reopen() {
+        let t = Instant::now();
+        let mut io = FakeBno {
+            answers_id: true,
+            ..FakeBno::default()
+        };
+        let mut chip = Bno08x::new(1, t);
+        let now = until_streaming(&mut chip, &mut io, t).unwrap();
+        for n in 0..4 {
+            io.queue.push_back(reports(n));
+            chip.step(&mut io, now, &mut |_| {});
+        }
+        io.queue.push_back(shtp(
+            bno08x::channel::EXECUTABLE,
+            &[bno08x::EXECUTABLE_RESET],
+        ));
+        chip.step(&mut io, now, &mut |_| {});
+        let later = now + Duration::from_millis(50);
+        chip.step(&mut io, later, &mut |_| {});
+        io.queue.push_back(reports(0));
+        chip.step(&mut io, later, &mut |_| {});
+        let counts = chip.fusion_counts().unwrap();
+        assert_eq!(counts.follow, 5, "four before the reset, one after");
+        let reopened = machine(
+            TrunkImuKind::Bno08x,
+            3,
+            later,
+            &ReaderOptions {
+                fusion: FusionMode::Gyro,
+            },
+            counts,
+        );
+        assert_eq!(reopened.fusion_counts(), Some(counts));
+        let lsm = machine(
+            TrunkImuKind::Lsm6dsv16x,
+            1,
+            t,
+            &ReaderOptions::default(),
+            counts,
+        );
+        assert_eq!(lsm.fusion_counts(), None);
+    }
+
+    /// A streaming BNO08x behind the real reader thread: its health reports the fusion — the
+    /// mode it was started in and its totals — and keeps them across the reopen that follows
+    /// when the module stops answering.
+    #[test]
+    fn the_reader_health_reports_the_fusion_across_a_reopen() {
+        let opens = Arc::new(AtomicU32::new(0));
+        let counted = Arc::clone(&opens);
+        let open: Opener = Box::new(move || {
+            let first = counted.fetch_add(1, Ordering::Relaxed) == 0;
+            Ok(Box::new(FakeBno {
+                answers_id: true,
+                // The first module streams a few hundred reads and then stops answering.
+                fail_after: Some(if first { 600 } else { u32::MAX }),
+                ..FakeBno::default()
+            }))
+        });
+        let reader = TrunkImuReader::spawn_with(
+            TrunkImuKind::Bno08x,
+            open,
+            FAST,
+            "test".into(),
+            ReaderOptions {
+                fusion: FusionMode::Gyro,
+            },
+        )
+        .unwrap();
+        wait_for(&reader, "first epoch streaming", |r| {
+            r.health().fusion.is_some_and(|f| f.counts.follow > 10)
+        });
+        let first = reader.health().fusion.unwrap();
+        assert_eq!(first.mode, FusionMode::Gyro);
+        assert!(!first.disabled);
+        wait_for(&reader, "second epoch", |r| {
+            r.latest().is_some_and(|s| s.epoch == 2)
+        });
+        // The first module took about two hundred orientations before it stopped answering; a
+        // second epoch that had started its count again would show a handful.
+        let after = reader.health().fusion.unwrap();
+        let c = after.counts;
+        let taken = c.follow + c.accepted + c.rejected + c.slew + c.realign_long + c.realign_gap;
+        assert!(taken >= 150, "{first:?} then {after:?}");
+        let sample = reader.latest().unwrap();
+        assert_eq!(sample.quat, sample.fusion.unwrap().fused_quat);
     }
 
     #[test]
@@ -1928,5 +2228,12 @@ mod tests {
             spawn_for(&TrunkImuParams::default()).is_none(),
             "the bus needs no reader"
         );
+        assert_eq!(fusion_of(Bno08xFusion::Chip), FusionMode::Chip);
+        assert_eq!(fusion_of(Bno08xFusion::Gyro), FusionMode::Gyro);
+        let params = TrunkImuParams {
+            bno08x_fusion: Bno08xFusion::Gyro,
+            ..TrunkImuParams::default()
+        };
+        assert_eq!(ReaderOptions::for_params(&params).fusion, FusionMode::Gyro);
     }
 }

@@ -1337,10 +1337,15 @@ fn spawn_control_thread(
                 match trunk_imu_i2c::spawn_for(&params.trunk_imu) {
                     None => None,
                     Some(Ok(reader)) => {
+                        // What a BNO08x publishes is the one thing here that changes the
+                        // gravity the policy sees, so it is in the line that names the source.
+                        let fusion = (reader.kind() == TrunkImuKind::Bno08x)
+                            .then(|| params.trunk_imu.bno08x_fusion.label());
                         tracing::warn!(
                             source = reader.kind().label(),
                             device = %params.trunk_imu.i2c_device,
                             address = params.trunk_imu.i2c_address,
+                            bno08x_fusion = fusion.unwrap_or("-"),
                             "trunk IMU is a module on I2C; ID 200 is not read"
                         );
                         Some(reader)

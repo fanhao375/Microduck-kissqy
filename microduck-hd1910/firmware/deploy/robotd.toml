@@ -1,4 +1,4 @@
-# Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; see IMU-MODULE.md at the repository root.
+# Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; BNO08x gyro-integrated attitude; see IMU-MODULE.md at the repository root.
 # robotd — per-robot parameters.
 #
 # Installed to /etc/robot/robotd.toml. Mostly read once at startup and not watched, so
@@ -64,6 +64,16 @@ port = "/dev/ttyS2"
 # default for it rather than open whatever answers at 0x4B. Ignored when source = "bus".
 # i2c_device = "/dev/i2c-4"
 # i2c_address = 0x4B
+
+# Which orientation a BNO08x publishes. Walking, a BNO085's own fusion sometimes jumps 20-60
+# degrees inside one tick while its gyro says the trunk barely turned. robotd integrates that
+# gyro into an attitude of its own and checks every chip orientation against it, in either
+# mode. "chip" publishes the chip's orientation exactly as before, and the gyro-fused one only
+# rides along in the diagnostics (busStatus native.imu_reader.fusion, the state stream's
+# imu.fusion). "gyro" publishes the fused one: the chip's tilt taken slowly while it agrees
+# with the gyro, refused while it jumps. docs/design/robotd-design.md §2.6 has the rules.
+# Ignored for any other source. Needs a robotd restart.
+# bno08x_fusion = "chip"
 
 [control]
 # Control loop rate, Hz.

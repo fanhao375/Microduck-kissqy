@@ -1,4 +1,4 @@
-// Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; UDP pad ([netpad]); see IMU-MODULE.md at the repository root.
+// Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; UDP pad ([netpad]); BNO08x gyro-integrated attitude; see IMU-MODULE.md at the repository root.
 //! The machine-readable index of every key in `robotd.toml` — what an editor needs to know.
 //!
 //! [`Params`] and its `Default` impls are the truth about *values*; what they cannot carry at
@@ -138,6 +138,11 @@ pub const REGISTRY: &[Entry] = &[
         "trunk_imu.i2c_address",
         Kind::Integer,
         "Module address, decimal: BNO08x 75 = 0x4B / 74 = 0x4A; LSM6DSV16X 107 = 0x6B / 106 = 0x6A",
+    ),
+    entry(
+        "trunk_imu.bno08x_fusion",
+        Kind::Choice(&["chip", "gyro"]),
+        "BNO08x: publish the chip's orientation, or the host's gyro-integrated one",
     ),
     // ── [control] ────────────────────────────────────────────────────────────
     entry("control.hz", Kind::Integer, "Control loop rate"),

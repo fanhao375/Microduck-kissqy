@@ -1,4 +1,4 @@
-// Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; UDP pad ([netpad]); see IMU-MODULE.md at the repository root.
+// Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; UDP pad ([netpad]); BNO08x gyro-integrated attitude; see IMU-MODULE.md at the repository root.
 //! `robotd`'s startup parameters: the schema, the defaults, and the validation.
 //!
 //! A file rather than a wall of CLI flags — the prototype grew 142 of them and most were
@@ -1992,6 +1992,32 @@ impl TrunkImuSource {
     }
 }
 
+/// What a BNO08x trunk IMU's samples carry. The host's gyro fusion
+/// (`duck_control::gyro_fusion`) runs in both; this picks which orientation is published.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Bno08xFusion {
+    /// The chip's own game rotation vector, as every BNO08x robot published before the fusion
+    /// existed. The fused attitude is reported beside it, not used.
+    #[default]
+    Chip,
+    /// The host's gyro-integrated attitude: the chip's tilt taken slowly while it agrees with
+    /// the gyro, refused while it jumps.
+    Gyro,
+}
+
+impl Bno08xFusion {
+    pub const ALL: [Self; 2] = [Self::Chip, Self::Gyro];
+
+    /// What the file says for it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Chip => "chip",
+            Self::Gyro => "gyro",
+        }
+    }
+}
+
 /// `[trunk_imu]`: which sensor the policy's gyro and gravity come from.
 ///
 /// A section of its own rather than more `[bus]` keys, because the other sources are precisely
@@ -2009,6 +2035,8 @@ pub struct TrunkImuParams {
     /// for every chip, so the default (a BNO08x's 0x4B) is not an LSM6DSV16X's: that source
     /// has to set its own, which validation insists on.
     pub i2c_address: u8,
+    /// Which orientation a BNO08x source publishes. Inert for every other source.
+    pub bno08x_fusion: Bno08xFusion,
 }
 
 impl Default for TrunkImuParams {
@@ -2017,6 +2045,7 @@ impl Default for TrunkImuParams {
             source: TrunkImuSource::Bus,
             i2c_device: "/dev/i2c-4".into(),
             i2c_address: 0x4B,
+            bno08x_fusion: Bno08xFusion::Chip,
         }
     }
 }
@@ -3728,6 +3757,39 @@ source = \"{}\"
             .unwrap();
             assert_eq!(parsed.trunk_imu.source, source);
         }
+    }
+
+    /// A BNO08x publishes its own orientation unless told otherwise; `gyro` is the only other
+    /// word, the editor offers both under those names, and the key is inert on any other
+    /// source.
+    #[test]
+    fn a_bno08x_publishes_the_chip_unless_told_otherwise() {
+        let p: Params = toml::from_str("[trunk_imu]\nsource = \"bno08x\"\n").unwrap();
+        assert_eq!(p.trunk_imu.bno08x_fusion, Bno08xFusion::Chip);
+        let p: Params =
+            toml::from_str("[trunk_imu]\nsource = \"bno08x\"\nbno08x_fusion = \"gyro\"\n").unwrap();
+        assert_eq!(p.trunk_imu.bno08x_fusion, Bno08xFusion::Gyro);
+        assert!(toml::from_str::<Params>("[trunk_imu]\nbno08x_fusion = \"both\"\n").is_err());
+        let Some(registry::Entry {
+            kind: registry::Kind::Choice(offered),
+            ..
+        }) = registry::entry_for("trunk_imu.bno08x_fusion")
+        else {
+            panic!("trunk_imu.bno08x_fusion is a choice");
+        };
+        assert_eq!(
+            offered.to_vec(),
+            Bno08xFusion::ALL.map(Bno08xFusion::label).to_vec()
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            "[trunk_imu]\nsource = \"bus\"\nbno08x_fusion = \"gyro\"\n",
+        );
+        assert_eq!(
+            Params::load(&path, true).unwrap().trunk_imu.source,
+            TrunkImuSource::Bus
+        );
     }
 
     /// The I²C keys mean nothing to a bus robot, and an inert key does not stop one — the same
