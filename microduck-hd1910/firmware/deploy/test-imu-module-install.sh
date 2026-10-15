@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Added 2026-10 by fanhao375 (microduck-replica): fake-board tests for imu-module-install.sh; Apache-2.0 like the rest of this workspace.
+# Added 2026-10 by fanhao375 (microduck-replica): fake-board tests for imu-module-install.sh; BNO08x gyro-integrated attitude; Apache-2.0 like the rest of this workspace.
 #
 # Runs the installer against fake boards in a temporary directory. It never touches the real
 # systemd, robotd or /etc: systemctl / journalctl are stubs on PATH, robotd is a small fake that
@@ -219,8 +219,16 @@ ok "robotd.saved.toml 也有" "grep -q trunk_imu $R/etc/robotd.saved.toml"
 ok "原有配置保留" "toml x \"assert d['policy']['action_scale']==0.7\" $R/etc/robotd.toml"
 ok "BUILD.json 带补丁说明" "grep -q microduck_replica_patch $R/opt/BUILD.json"
 ok "日志里有安装方向已确认" "grep -q '安装方向已确认' $R/install.log"
+# The operator picks the fusion and a raw log (one key quoted, one bare: both spellings must be
+# recognised); a later install rewrites the wiring and must keep both, in both files.
+for f in robotd.toml robotd.saved.toml; do
+    sed -i 's/^"i2c_address" = 75$/&\n"bno08x_fusion" = "gyro"\nbno08x_raw_log = "\/run\/bno08x-raw.csv"/' "$R/etc/$f"
+done
 sleep 1; bash "$SCRIPT" install "$R/src" lsm6dsv16x /dev/i2c-3 0x6B >/dev/null 2>&1
 ok "再装一次：trunk_imu 被替换成 lsm6dsv16x 0x6B 且只有一段" "\"$PY\" -c \"import tomllib;t=open('$R/etc/robotd.toml').read();d=tomllib.loads(t);assert d['trunk_imu']['source']=='lsm6dsv16x' and d['trunk_imu']['i2c_address']==107 and t.count('trunk_imu')==1\""
+for f in robotd.toml robotd.saved.toml; do
+    ok "再装一次：$f 的 bno08x_fusion / bno08x_raw_log 保留" "toml x \"t=d['trunk_imu'];assert (t['bno08x_fusion'],t['bno08x_raw_log'],t['i2c_device'])==('gyro','/run/bno08x-raw.csv','/dev/i2c-3'),t\" $R/etc/$f"
+done
 ok "lsm6dsv16x 安装方向没确认 → 警告" "grep -q 'lsm6dsv16x 的安装方向还没确认' $R/install.log"
 bash "$SCRIPT" check | sed 's/^/  check> /'
 bash "$SCRIPT" rollback "$BK" >/dev/null 2>&1; ok "撤回成功" "[ \$? -eq 0 ]"

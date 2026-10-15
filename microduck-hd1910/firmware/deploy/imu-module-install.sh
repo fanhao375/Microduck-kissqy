@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Microduck HD1910 · microduck-replica board-side installer: the whole replica set on kissqy V167 —
 # trunk IMU module over I2C + optional servo P/D/torque-limit file (tuning) + UDP pad / pad-loss sit.
-# Added 2026-10 by fanhao375 (microduck-replica); Apache-2.0 like the rest of this workspace.
+# Added 2026-10 by fanhao375 (microduck-replica); BNO08x gyro-integrated attitude; Apache-2.0 like the rest of this workspace.
 #
 # On a duck already upgraded to kissqy's R17 V167 (control.43) through his console, swap in the
 # robotd / robotctl / padd built from this branch and the five packaging scripts it changes, add
-# [trunk_imu] to robotd.toml, let robotd open /dev/i2c-* and padd bind UDP (AF_INET drop-in; the
+# [trunk_imu] to robotd.toml (its wiring rewritten; bno08x_fusion / bno08x_raw_log, if the operator
+# set them, kept), let robotd open /dev/i2c-* and padd bind UDP (AF_INET drop-in; the
 # UDP pad itself stays off until `service.sh netpad on`). Everything replaced is backed up first; a
 # failure after that restores the backup by itself, and `rollback` does it on request.
 # Run on the board as root, with servo power on (robotd must finish its four startup steps).
@@ -476,14 +477,22 @@ path, source, device, address = Path(sys.argv[1]), sys.argv[2], sys.argv[3], int
 text = path.read_text()
 block = f'["trunk_imu"]\n"source" = "{source}"\n"i2c_device" = "{device}"\n"i2c_address" = {address}\n'
 header = re.compile(r'^\[\s*"?trunk_imu"?\s*\]\s*$', re.M)
+# What the module publishes and whether its reports are logged are the operator's choices, not
+# its wiring: an old section's lines for them are carried into the new one as they were.
+kept_key = re.compile(r'^\s*"?(bno08x_fusion|bno08x_raw_log)"?\s*=')
+kept = []
 m = header.search(text)
 if m:
     nxt = re.compile(r'^\[', re.M).search(text, m.end())
+    old = text[m.end():nxt.start() if nxt else len(text)]
+    kept = [line for line in old.splitlines() if kept_key.match(line)]
+    block += ''.join(line + '\n' for line in kept)
     text = text[:m.start()] + block + ('\n' + text[nxt.start():] if nxt else '')
 else:
     text = text.rstrip('\n') + '\n\n' + block
 path.write_text(text)
-print(f'{path.name}: [trunk_imu] source={source} {device} {address:#04x}')
+print(f'{path.name}: [trunk_imu] source={source} {device} {address:#04x}'
+      + (f'; kept {" ".join(line.split("=")[0].strip() for line in kept)}' if kept else ''))
 PY
 }
 
@@ -611,7 +620,7 @@ cmd_check() {
     fi
     echo "padd AF_INET drop-in：$( [ -f "$PADD_DROPIN" ] && echo "$PADD_DROPIN" || echo 无)"
     echo "I2C 设备：$(ls /dev/i2c-* 2>/dev/null | tr '\n' ' ')"
-    grep -A3 -E '^\[\s*"?trunk_imu"?\s*\]' "$CONFIG_DIR/robotd.toml" 2>/dev/null || echo 'robotd.toml 里没有 [trunk_imu]（默认读总线 IMU 小板）'
+    grep -A5 -E '^\[\s*"?trunk_imu"?\s*\]' "$CONFIG_DIR/robotd.toml" 2>/dev/null || echo 'robotd.toml 里没有 [trunk_imu]（默认读总线 IMU 小板）'
     for kind in bno08x lsm6dsv16x; do echo "安装方向 $kind：$(mount_state "$kind" 2>/dev/null || echo '读不了标定文件')"; done
     if grep -q 'DeviceAllow=char-i2c rw' "$DROPIN" 2>/dev/null; then echo '启动配置：允许 /dev/i2c-*'; else echo '启动配置：不允许 /dev/i2c-*'; fi
     python3 - "$CONFIG_DIR" <<'PY' || echo '（参数文件 / 滤波 / netpad 需要 Python 3.11 的 tomllib 才能读）'

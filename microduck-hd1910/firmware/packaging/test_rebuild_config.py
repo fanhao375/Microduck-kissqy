@@ -1,4 +1,4 @@
-# Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; see IMU-MODULE.md at the repository root.
+# Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; BNO08x gyro-integrated attitude; see IMU-MODULE.md at the repository root.
 """Whole configuration recovery, with no UART or real systemd operations."""
 import importlib.util
 import json
@@ -36,7 +36,7 @@ class RecoveryTests(unittest.TestCase):
     def test_an_upgrade_keeps_the_trunk_imu_source(self):
         # [trunk_imu] is the operator's wiring; the shipped profile has no such table to impose.
         data=tomllib.loads((ROOT/'packaging/robotd-profile.toml').read_text())
-        data['trunk_imu']={'source':'bno08x','i2c_device':'/dev/i2c-4','i2c_address':0x4B}
+        data['trunk_imu']={'source':'bno08x','i2c_device':'/dev/i2c-4','i2c_address':0x4B,'bno08x_fusion':'gyro','bno08x_raw_log':'/var/lib/robot/feetech-ft5/r5/bno08x-raw.csv'}
         source=self.base/'old.toml';source.write_text(dumps(data));output=self.base/'new.toml'
         subprocess.run([sys.executable,str(ROOT/'packaging/configure.py'),'--source',str(source),'--previous-overrides',str(ROOT/'packaging/robotd-profile.toml'),'--overrides',str(ROOT/'packaging/robotd-profile.toml'),'--output',str(output)],check=True,capture_output=True,text=True)
         self.assertEqual(tomllib.loads(output.read_text())['trunk_imu'],data['trunk_imu'])
