@@ -4094,6 +4094,11 @@ async fn control_loop<T: RobotIo>(
                 imu: Some(proto::ImuState {
                     gyro: sensors.imu.gyro,
                     quat: sensors.imu.quat,
+                    // The same read as `quat`: the snapshot keeps the view of the sample it used.
+                    fusion: raw_bus
+                        .as_ref()
+                        .and_then(|bus| bus.native.imu_fusion)
+                        .map(imu_fusion_state),
                 }),
                 frames: official_subscribed
                     .then(|| mapping::frames_at(mapping::head_joints_of(&sensors.positions))),
@@ -4256,6 +4261,27 @@ fn has_any_wav(bank: &std::path::Path) -> bool {
             wavs.any(|w| w.is_ok_and(|w| w.path().extension().is_some_and(|ext| ext == "wav")))
         })
     })
+}
+
+/// The snapshot's fusion view as the state stream says it: the other orientation under the
+/// name of what it is.
+fn imu_fusion_state(tick: duck_control::feetech_snapshot::ImuFusionTick) -> proto::ImuFusionState {
+    use duck_control::gyro_fusion::{FusionMode, Verdict};
+    proto::ImuFusionState {
+        verdict: match tick.verdict {
+            Verdict::Follow => proto::ImuFusionVerdict::Follow,
+            Verdict::Accepted => proto::ImuFusionVerdict::Accepted,
+            Verdict::Rejected => proto::ImuFusionVerdict::Rejected,
+            Verdict::Slew => proto::ImuFusionVerdict::Slew,
+            Verdict::RealignLong => proto::ImuFusionVerdict::RealignLong,
+            Verdict::RealignGap => proto::ImuFusionVerdict::RealignGap,
+            Verdict::Fallback => proto::ImuFusionVerdict::Fallback,
+            Verdict::Disabled => proto::ImuFusionVerdict::Disabled,
+        },
+        theta_deg: tick.theta_deg,
+        fused: (tick.mode == FusionMode::Chip).then_some(tick.other_quat),
+        chip: (tick.mode == FusionMode::Gyro).then_some(tick.other_quat),
+    }
 }
 
 fn limit_name(limit: duck_control::safety::Limit) -> &'static str {
@@ -6122,6 +6148,27 @@ mod mapping {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fusion view's other orientation is named by what it is: the fused attitude when the
+    /// robot publishes the chip's, the chip's when it publishes the fused one.
+    #[test]
+    fn the_imu_fusion_view_names_the_other_orientation() {
+        use duck_control::feetech_snapshot::ImuFusionTick;
+        use duck_control::gyro_fusion::{FusionMode, Verdict};
+        let tick = |mode| ImuFusionTick {
+            mode,
+            verdict: Verdict::Slew,
+            theta_deg: 6.5,
+            other_quat: [0.5; 4],
+        };
+        let chip = imu_fusion_state(tick(FusionMode::Chip));
+        assert_eq!(
+            (chip.fused, chip.chip, chip.verdict, chip.theta_deg),
+            (Some([0.5; 4]), None, proto::ImuFusionVerdict::Slew, 6.5)
+        );
+        let gyro = imu_fusion_state(tick(FusionMode::Gyro));
+        assert_eq!((gyro.fused, gyro.chip), (None, Some([0.5; 4])));
+    }
 
     // Drive the real quaternion decoder through startup, rather than making the
     // readiness flag become true after an arbitrary number of fake reads.

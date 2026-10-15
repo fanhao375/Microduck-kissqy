@@ -1,3 +1,4 @@
+// Modified 2026-10 by fanhao375 (microduck-replica): BNO08x gyro-integrated attitude; see IMU-MODULE.md at the repository root.
 //! IPC contracts between the robot's services and their clients.
 //!
 //! Two namespaces over one wire format:
@@ -3825,6 +3826,55 @@ pub struct ImuState {
     /// Orientation trunk → world, scalar-first `[w, x, y, z]`. The world is the IMU's own
     /// gravity-aligned frame with an arbitrary yaw at boot — the same frame `odom` lives in.
     pub quat: [f64; 4],
+    /// What a BNO08x module's gyro check made of this tick's orientation. Absent for any other
+    /// trunk IMU, and from a daemon predating it. Additive and optional, so no `API_VERSION`
+    /// step: a client that does not know it reads the frame exactly as before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fusion: Option<ImuFusionState>,
+}
+
+/// [`ImuState::fusion`]: the robot runs a gyro-integrated attitude beside the chip's own and
+/// publishes one of them as `quat` (`[trunk_imu] bno08x_fusion`); this is the other, and the
+/// verdict on this tick's chip report. Exactly one of `fused` and `chip` is present.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ImuFusionState {
+    pub verdict: ImuFusionVerdict,
+    /// Tilt between the chip's orientation and the fused one before this report's
+    /// correction, degrees.
+    pub theta_deg: f64,
+    /// The fused attitude, trunk → world, when `quat` is the chip's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fused: Option<[f64; 4]>,
+    /// The chip's own orientation, trunk → world, when `quat` is the fused one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chip: Option<[f64; 4]>,
+}
+
+/// What the gyro check made of one chip orientation.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImuFusionVerdict {
+    /// The first second after the chip's reports (re)started: the chip as it is.
+    #[default]
+    Follow,
+    /// Within the gate, taken slowly.
+    Accepted,
+    /// Outside it; the gyro carried the attitude.
+    Rejected,
+    /// Refused for long; the tilt pulled towards the chip at a capped rate.
+    Slew,
+    /// Refused for long with chip and trunk still: the chip's tilt taken whole.
+    RealignLong,
+    /// After a hole in the gyro stream: the chip taken whole.
+    RealignGap,
+    /// The fused result was not a rotation; the chip taken instead.
+    Fallback,
+    /// The check is off after an internal fault; `quat` is the chip's.
+    Disabled,
+    /// A verdict from a later release.
+    #[serde(other)]
+    Unrecognised,
 }
 
 /// A pose in the trunk frame: position in metres, orientation scalar-first `[w, x, y, z]`.
@@ -5702,6 +5752,46 @@ mod tests {
             params: Some(serde_json::json!({ "wrong": "shape" })),
         };
         assert_eq!(malformed.as_call().unwrap_err().code, code::INVALID_PARAMS);
+    }
+
+    /// The IMU's fusion view is optional both ways: absent, the frame's bytes are what they
+    /// were; present, it round-trips; a verdict from a later release is read, not refused.
+    #[test]
+    fn the_imu_fusion_view_is_optional_and_tolerant() {
+        let plain = ImuState {
+            gyro: [0.1, 0.0, -0.2],
+            quat: [1.0, 0.0, 0.0, 0.0],
+            fusion: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            r#"{"gyro":[0.1,0.0,-0.2],"quat":[1.0,0.0,0.0,0.0]}"#
+        );
+        let fused = ImuState {
+            fusion: Some(ImuFusionState {
+                verdict: ImuFusionVerdict::RealignLong,
+                theta_deg: 7.25,
+                fused: Some([0.5, 0.5, 0.5, 0.5]),
+                chip: None,
+            }),
+            ..plain
+        };
+        let text = serde_json::to_string(&fused).unwrap();
+        assert!(
+            text.ends_with(
+                r#""fusion":{"verdict":"realign_long","theta_deg":7.25,"fused":[0.5,0.5,0.5,0.5]}}"#
+            ),
+            "{text}"
+        );
+        assert_eq!(serde_json::from_str::<ImuState>(&text).unwrap(), fused);
+        let later: ImuState = serde_json::from_str(
+            r#"{"gyro":[0,0,0],"quat":[1,0,0,0],"fusion":{"verdict":"from_a_later_release"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            later.fusion.unwrap().verdict,
+            ImuFusionVerdict::Unrecognised
+        );
     }
 
     /// A `params` member this release does not know is refused, and named, for every method that

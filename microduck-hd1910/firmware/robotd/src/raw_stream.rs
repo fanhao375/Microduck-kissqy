@@ -605,6 +605,7 @@ pub(crate) mod tests {
                 imu: Some(proto::ImuState {
                     gyro: [0.1, -0.0, 0.3],
                     quat: [1.0, 0.0, 0.0, 0.0],
+                    fusion: None,
                 }),
                 frames: None,
                 skeleton: Vec::new(),
