@@ -1,4 +1,4 @@
-<!-- Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; optional servo P/D/torque-limit file; UDP pad ([netpad]) and pad-loss sit; see IMU-MODULE.md at the repository root. -->
+<!-- Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; optional servo P/D/torque-limit file; UDP pad ([netpad]) and pad-loss sit; BNO08x gyro-integrated attitude; see IMU-MODULE.md at the repository root. -->
 **原文 / Original** | [English](robotd-design.en.md)
 
 ## 当前 R17 v1.0.157-Fix6 / control.36
@@ -693,6 +693,45 @@ holding the last quaternion, the 25-sample ready gate, the three-point median �
 means the same thing whichever chip produced it. The LSM6DSV16X's FIFO words go through the
 board's own gyro and half-precision conversions, so the same bytes are the same reading.
 
+**A BNO08x's orientation is checked against its own gyro.** Walking, a BNO085's game rotation
+vector now and then jumps 20–60° within one tick while its calibrated gyro says the trunk barely
+turned — on 1.9–23 % of walking ticks in recordings, depending on the feet, and 0.05 % standing;
+the legs' kinematics side with the gyro. So `Bno08xAssembler` also hands every report, in the
+order the chip sent them and only once the whole payload has parsed, to `gyro_fusion`, a pure
+core in `duck-control`. Each gyro report is integrated into an attitude of the host's own; the
+step is the report sequence's step × the 10 ms asked for, never host time (a backlog read in one
+go is still 10 ms apart). A step of up to 3 is bridged at the arriving rate; a larger one, or
+100 ms of host time between two rates, is a hole; a step backwards (over 128) is a re-read and
+skipped. Each game rotation vector is compared with the attitude as a tilt θ between the two
+gravity directions:
+
+- θ < 6°: the chip's tilt, and its heading at the same rate, are taken with τ = 0.66 s
+  (`1 − e^(−Δt/τ)` of the way per report);
+- θ ≥ 6°: refused, and the gyro carries the attitude;
+- refused for 0.5 s of report clock: if the chip has been calm that long (each report within
+  100°/s of where the gyro carried its previous one) *and* the trunk still (gyro RMS under
+  30°/s over 0.5 s), the chip's tilt is taken whole — only the tilt; otherwise the tilt is
+  pulled towards the chip at 5°/s, so a long refusal is never left open-loop and, moving, never
+  steps.
+
+Heading is never gated or slewed on: it reaches only the roller's course and odometry. A new
+epoch follows the chip outright for its first second — the gate's settling second; after a hole
+the chip is taken whole, heading included, once it has been calm for 0.5 s. The fusion runs in
+the sensor's axes, before the median and before the mount, which it commutes with. Every result is
+checked finite and unit length, else the chip is taken (`fallback`); a panic inside it is caught
+and turns it off for the reader's life (`disabled`), publishing the chip — the reader thread is
+never restarted, and a robot losing its IMU mid-walk is worse than one losing a diagnostic.
+`[trunk_imu] bno08x_fusion` picks what a sample publishes: `chip`, the default, the chip's own
+orientation, the samples field for field what they were before the fusion existed (pinned
+against a frozen copy of the old assembler over random packet streams); `gyro`, the fused
+attitude. Everything else about a sample — when there is one, its rate, its age, its sequence —
+is the same in both. Commissioning and `verify-imu` always measure the chip's own orientation
+(`HostImuSample::chip_quat`). The numbers are an initial setting from a 50 Hz replay of recorded
+walks; `[trunk_imu] bno08x_raw_log` names a CSV file every report is appended to (a bounded
+queue and a writer thread of its own, so the reader never waits on a disk: a full queue drops
+and counts; 64 MB cap), for settling them on 100 Hz data
+([`trunk-imu-i2c.zh-CN.md`](../project/trunk-imu-i2c.zh-CN.md)).
+
 **Each source has its own mount**, because the sensors sit in different places: the calibration
 gains `[imu_mounts.bno08x]` and `[imu_mounts.lsm6dsv16x]` (`quat`, `verified`), with the bus
 board's left where every existing file has it. An uncommissioned BNO08x starts from
@@ -727,7 +766,11 @@ reader takes the same `flock` servo-web's `imu_i2c.py` takes on the node, so the
 configure one chip; a held lock is reported naming servo-web and retried. Nothing written to a
 chip persists: a BNO08x's report settings live in its RAM and are turned off on the way out, and
 an LSM6DSV16X has nothing to persist. Diagnostics carry `imu_source`, and for a module
-`imu_reader` — its state, epoch, samples, faults and last fault.
+`imu_reader` — its state, epoch, samples, faults and last fault; for a BNO08x also `fusion` (the
+mode, `disabled`, totals per verdict, gyro holes, re-read reports, panics, the report period the
+host clock measures) and, with a log, `raw_log` (path, lines, dropped, bytes, error). The state
+stream's `imu.fusion` is the per-tick view: the verdict, θ, and whichever orientation `quat` is
+not, in trunk axes.
 
 ## 3. The API
 

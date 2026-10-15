@@ -16,12 +16,14 @@
    | `bno08x` | BNO085 / BNO086 模块 | 0x4A 或 0x4B（不写默认 0x4B） |
    | `lsm6dsv16x` | LSM6DSV16X 转接板（跟总线小板同一颗芯片） | 0x6A 或 0x6B（必须写） |
 
+   BNO085 另有一个可选的「陀螺积分姿态」：芯片自己的姿态在走路时会突然跳几十度，robotd 用芯片的陀螺把它接住。默认不用（`chip`），只在诊断里多一路，见 4.4 节。
+
 2. **舵机调参（可选）**：一个参数文件给全部 15 个舵机设 P、D、转矩限制，下次 HOME 上力时写入；另有命令改联合 Walk 模型的头、腿滤波。没有参数文件时，上力和卸力发到舵机的报文跟 V167 原版一个字节都不差（P = 模型合同的 5、D = 0、转矩限制 1000），诊断里只多一个值为 null 的 `servo_parameters`。见第 4 节。
 3. **UDP 手柄与掉线坐下**：手柄（蓝牙的，或电脑上用官方 `duckctl udp-pad` 发过来的）正在开着鸭子时断了，1 秒后鸭子问一声、坐下；回来时打招呼。UDP 手柄默认关，一条命令打开。见第 5 节。
 
 V167 本身的「修复鸭身抖动」（每次上力把舵机 RAM 里的 D 写成 0、转矩限制写成 1000）原样保留。
 
-## 现在的状态（2026-10-14）
+## 现在的状态（2026-10-15）
 
 | | 状态 |
 |---|---|
@@ -29,7 +31,8 @@ V167 本身的「修复鸭身抖动」（每次上力把舵机 RAM 里的 D 写�
 | 舵机调参 | 单元测试过：不设参数文件时，上力 / 卸力发到串口的每一帧跟 kissqy 原版 V167 逐字节相同（同一个测试在原版代码上也通过）；诊断输出只多一个 `native.hd1910.servo_parameters: null`。**还没上真机** |
 | UDP 手柄 / 掉线坐下 | padd 单元测试 79 项、电脑上的端到端联调 14 项（假 robotd + 模拟 duckctl）都过；这一版交叉编译的 padd **还没在板上跑过** |
 | LSM6DSV16X | 只对模拟总线测过，**没上过真机** |
-| 安装脚本 `imu-module-install.sh` | 在假板子上测过 68 项（模拟 systemd 和 robotd）；**这一版还没在真板上跑过**。上一版在真板上暴露的两个问题已改：robotd 卡在「等总线」时卸力确认必失败；kissqy 中控升级后清单里本来就有对不上的行，全量核对必失败 |
+| BNO085 陀螺积分姿态 | 单元测试和 50 Hz 录像回放通过，**还没上真机**。默认 `chip`：发给策略的姿态跟以前逐字段相同，只多诊断（`busStatus` 和状态流里的 `fusion`）；切 `gyro` 才用积分姿态。原始报告落盘（`bno08x_raw_log`）同样没上过机 |
+| 安装脚本 `imu-module-install.sh` | 在假板子上测过 73 项（模拟 systemd 和 robotd）；**这一版还没在真板上跑过**。上一版在真板上暴露的两个问题已改：robotd 卡在「等总线」时卸力确认必失败；kissqy 中控升级后清单里本来就有对不上的行，全量核对必失败 |
 | 已知问题 | ① IMU 偶尔有过期帧，约 1.7%（当时主板过热降频，没分清原因）；② `verify-imu` 只能在调试模式下做，而调试模式一启动就卸力（见第 3 节）；③ V167 默认的 P5 / D0 在我们的鸭子上策略站立时，机身前后约 2.5 Hz 晃动（俯仰角速度 RMS 约 12°/s；旧卡 P3 / D0 / 转矩 700 时约 1～2°/s），要用调参在同一张卡上对比 |
 
 实施记录、跟计划的出入、还没验证的项：[IMU 部分](microduck-hd1910/firmware/docs/project/trunk-imu-i2c.zh-CN.md)、[调参与 UDP 手柄部分](microduck-hd1910/firmware/docs/project/replica-v167.zh-CN.md)。机制本身：[`robotd-design.md` §2.6](microduck-hd1910/firmware/docs/design/robotd-design.md)（IMU）、同一文件「R17 HD1910 合同 P（control.33）」一节的 fork 注（调参）、[`docs/robot/udp-pad.md`](microduck-hd1910/firmware/docs/robot/udp-pad.md)（UDP 手柄）。
@@ -170,6 +173,42 @@ sudo bash $S joint-filters <模型标识> 0.50 0.70   # 头部 腿部，0.10～1
 - **这些会删参数文件**：`service.sh install / start / upgrade / reset-models`，以及 kissqy 中控的「安装 / 升级固件」（它们走同一个安装流程）。`reset-models` 还会把随包模型的滤波文件覆盖回默认（`.orig` 留着）；
 - robotd 上力中被重启过、又删了参数文件时，卸力后 P 可能停在文件里的旧值，给舵机断一次电就回到出厂值。
 
+### 4.4 BNO085：用芯片的姿态，还是陀螺积分的（试验中）
+
+**为什么**：我们的录像里，走路时 BNO085 自己融合出来的姿态隔一阵就在 20 ms 里跳 20–60°，同一时刻芯片的陀螺说机身几乎没动（推摇杆走路的帧里 2 %～23 %，看脚底材料；静站 0.05 %）。策略看到的重力跟着跳，等于突然被告知「你在倒」。这一版的 robotd 把芯片的陀螺积分成一份自己的姿态，每来一个芯片姿态就比一下倾斜：差得少（< 6°）就慢慢跟芯片，差得多就不信芯片、靠陀螺撑着，撑久了再按规则慢慢或整步对回芯片。机制见 [`robotd-design.md` §2.6](microduck-hd1910/firmware/docs/design/robotd-design.md)，依据和测试见 [`trunk-imu-i2c.zh-CN.md`](microduck-hd1910/firmware/docs/project/trunk-imu-i2c.zh-CN.md) 最后一节。
+
+两个键，都在 `[trunk_imu]` 里，只对 `bno08x` 起作用：
+
+| 键 | 取值 | 作用 |
+|---|---|---|
+| `bno08x_fusion` | `"chip"`（不写就是它）/ `"gyro"` | 发给策略和倒地判断的是芯片的姿态还是积分姿态。两种模式下融合都在跑 |
+| `bno08x_raw_log` | `"off"`（不写就是它）/ 绝对路径 | 把芯片发来的每一条报告追加写进这个 CSV 文件（陀螺、姿态的原始值、序号、延迟），用来在真机 100 Hz 数据上重新定门限。约 1 MB/分钟，64 MB 封顶；写盘跟不上就丢行并计数，不会拖慢 IMU |
+
+改的办法：两份 `robotd.toml` 都要改（`robotd.saved.toml` 是升级、重建配置时的来源），改完用 `reconnect` 重启：它先让鸭子卸力，再重启 robotd、拉起 padd，**扶住鸭子**。别直接 `systemctl restart robotd`（不卸力，见 4.3）：
+
+```bash
+C=/etc/robot/feetech-ft5; S=/opt/robot/feetech-ft5-r5/service.sh
+sudo grep -A6 'trunk_imu' $C/robotd.toml          # 看现在的 [trunk_imu]
+sudo nano $C/robotd.toml $C/robotd.saved.toml      # 在 [trunk_imu] 那一节里加或改：bno08x_fusion = "gyro"
+sudo bash $S reconnect                             # 先卸力，再重启 robotd、拉起 padd
+```
+
+**上机顺序**（每一步出问题就停，退回上一步）：
+
+1. **影子模式（默认，零风险）**：装上这一版什么都不用改，发给策略的跟以前一样。顺手把原始日志打开（两份文件加 `bno08x_raw_log = "/var/lib/robot/feetech-ft5/r5/bno08x-raw.csv"`，`reconnect`）。`sudo bash $S report` 里 `native.imu_reader.fusion` 的计数在涨、`mode` 是 `chip`、`disabled` 是 `false`；`raw_log` 的 `lines` 在涨、`error` 为空。录几段：静站 60 秒、各方向倾斜、推几次摇杆走路（录像里每帧多一个 `imu.fusion`，`fused` 就是积分那一路），连同原始日志拿回来分析。用完把 `bno08x_raw_log` 改回 `"off"`。
+2. **gyro 静态**：改成 `bno08x_fusion = "gyro"`、`reconnect`。静站 5 分钟，积分姿态跟芯片的倾斜差中位应 < 0.5°，`realign_long` 不涨；再做一遍倾斜。
+3. **gyro 走路 A/B**：同参数、同地面，先跑一段 `chip` 当基线，再 `gyro`、`chip`、`gyro` 轮着来，记下起止时间。主指标是推摇杆走路每分钟摔几次（或走多久才摔）；另看晃动不要比 `chip` 大一成以上。
+4. **故意摔、抱起来放平**：静止后 2 秒内，积分姿态应回到跟芯片差 1° 以内，HOME 起始检查正常。
+
+**立刻退回 `chip` 的情况**：静站时倾斜差 > 1°；走路中出现一拍 > 5° 的台阶；`realign_long` 在没倒的时候涨；IMU 过期次数比 `chip` 时多；`disabled` 变成 `true`（融合内部出错已自己关掉，发的是芯片姿态，把日志发给我们）。退回就是把两份文件里的 `bno08x_fusion` 改回 `"chip"`（或删掉这行），`reconnect`。
+
+**要知道的**：
+- 安装脚本重写 `[trunk_imu]` 时会保留这两个键；撤回时两份 `robotd.toml` 回到安装前的样子；
+- 装回不认识这两个键的 robotd（这条分支之前的 fork 版本）时，它们**不会**让 robotd 起不来：robotd 读到不认识的键会在日志里警告一句「this build has no such keys; they are ignored」，照常启动，行为就是 `chip`。kissqy 原版连 `[trunk_imu]` 都不认，见第 6 节；
+- 这次没升 `API_VERSION`：只在已有的消息里加了可选字段（`busStatus` 的 `imu_reader.fusion` / `raw_log`、状态流的 `imu.fusion`），只有 BNO08x 才出现，旧客户端读不到也不出错；没有新方法、没有改旧字段，所以不需要中控、btd、configd 跟着升级；
+- `verify-imu` 和标定永远拿芯片自己的姿态去比，不会把安装方向拟合到积分姿态上；
+- 门限 6°、5°/s、0.5 s 这些数是从 50 Hz 录像定的初值，等影子模式的原始日志回来再定。
+
 ## 5. UDP 手柄与掉线坐下
 
 这一版换了 padd（读手柄、把按键变成指令的那个程序）。机制和完整说明：[`docs/robot/udp-pad.md`](microduck-hd1910/firmware/docs/robot/udp-pad.md)。
@@ -224,15 +263,17 @@ uvx duckctl@0.17.1 udp-pad 192.168.x.x     # 一定写鸭子的 IP；推杆前�
 
 | 位置 | 改动 |
 |---|---|
-| `duck-control/src/` | IMU：新增 `bno08x.rs`（BNO08x 的 SHTP / SH-2 编解码）、`lsm6dsv16x.rs`（LSM6DSV16X 的上电配置和 FIFO 解码）、`trunk_imu.rs`（主板读的 IMU 的样本、新鲜度门限、各型号安装方向）；`feetech.rs`、`feetech_snapshot.rs`、`imu.rs`、`io.rs`、`lib.rs` 接入这三种来源；`Cargo.toml`。调参：`hd1910.rs`（有参数文件时的上力 / 卸力分支）、`hd1910_test.rs`（读参数文件、范围；kissqy 原有这个文件但没接入，这里接入）、`feetech.rs`（`gain_mode`、测试，包括跟原版逐字节比对的金样） |
-| `robotd/src/` | IMU：新增 `trunk_imu_i2c.rs`（读 I²C 的后台线程，坏包丢弃、断线重开）；`main.rs`、`feetech_commissioning.rs`（`verify-imu` 的模块分支）、`feetech_read_only.rs`、`home_start.rs`、`raw_stream.rs` 和几处测试。调参：`main.rs` 开串口前读参数文件 |
-| `robotd-params/src/` | 新增 `[trunk_imu]`、`[netpad]` 配置节和校验 |
+| `duck-control/src/` | 陀螺积分姿态：新增 `gyro_fusion.rs`；`bno08x.rs`（每条报告按包内顺序交给融合，发布逻辑不变）、`trunk_imu.rs`、`imu.rs`、`feetech.rs`、`feetech_snapshot.rs`、`lsm6dsv16x.rs`、`lib.rs`。IMU：新增 `bno08x.rs`（BNO08x 的 SHTP / SH-2 编解码）、`lsm6dsv16x.rs`（LSM6DSV16X 的上电配置和 FIFO 解码）、`trunk_imu.rs`（主板读的 IMU 的样本、新鲜度门限、各型号安装方向）；`feetech.rs`、`feetech_snapshot.rs`、`imu.rs`、`io.rs`、`lib.rs` 接入这三种来源；`Cargo.toml`。调参：`hd1910.rs`（有参数文件时的上力 / 卸力分支）、`hd1910_test.rs`（读参数文件、范围；kissqy 原有这个文件但没接入，这里接入）、`feetech.rs`（`gain_mode`、测试，包括跟原版逐字节比对的金样） |
+| `robotd/src/` | 陀螺积分姿态：新增 `trunk_imu_raw_log.rs`（原始报告落盘）；`trunk_imu_i2c.rs`、`main.rs`、`feetech_commissioning.rs`（标定用芯片姿态）、`raw_stream.rs` 和几处测试。IMU：新增 `trunk_imu_i2c.rs`（读 I²C 的后台线程，坏包丢弃、断线重开）；`main.rs`、`feetech_commissioning.rs`（`verify-imu` 的模块分支）、`feetech_read_only.rs`、`home_start.rs`、`raw_stream.rs` 和几处测试。调参：`main.rs` 开串口前读参数文件 |
+| `robotd-params/src/` | 新增 `[trunk_imu]`（含 `bno08x_fusion`、`bno08x_raw_log`）、`[netpad]` 配置节和校验 |
+| `duck-ipc-proto/src/lib.rs`（kissqy 原文件） | 状态流的 `ImuState` 加可选的 `fusion`（只有 BNO08x 才有，不升 `API_VERSION`） |
 | `robotctl/src/configure.rs` | 认得 `[trunk_imu]`；`[netpad]` 改了之后提示重启 padd |
 | `padd/` | 新增 `src/loss.rs`（掉线坐下）、`src/udp.rs`、`src/udp/{health,receiver,wire}.rs`（UDP 手柄），移植自 Pollen Robotics 官方 microduck 0.17.1 的 `pad-map`、`netpadd`；`src/main.rs` 接入；`systemd/padd.service` 允许 AF_INET |
 | `packaging/` | IMU：`calibration-config.py`、`rebuild-config.py`（每种 IMU 一份安装方向，重装时保留）、`runtime.py`（启动配置允许 `char-i2c`，回读核对模块的安装方向）、`voice-setup.py`（没有 HAT 声卡时跳过音频设置）。调参与 UDP：`service.sh`（`servo-parameters`、`servo-parameters-clear`、`joint-filters`、`netpad`）、`runtime.py`（同上）、`padd.service`（AF_INET）、`fixtures/robotd-board-v167.toml`（板上真实的配置格式，测试用）。以及相应测试，新增 `test_tunable_parameters.py`、`test_netpad.py` |
-| `deploy/` | `robotd.toml` 加 `[trunk_imu]` 的说明；新增 `imu-module-install.sh`（装整套）和它的假板子测试 `test-imu-module-install.sh` |
+| `deploy/` | `robotd.toml` 加 `[trunk_imu]` 的说明（含两个融合键）；新增 `imu-module-install.sh`（装整套，重写 `[trunk_imu]` 时保留两个融合键）和它的假板子测试 `test-imu-module-install.sh` |
+| `test-data/bno08x-fusion-replay/` | 新增：4 段 BNO085 录像（CSV，约 300 KB），融合的回放测试用 |
 | `scripts/pad-link-test.sh` | 统计掉线时只数 padd 的 `pad gone —` |
-| `docs/` | `design/robotd-design.md`（§2.6；padd 一段加掉线坐下和 UDP；control.33 一节加 fork 注）；新增 `robot/udp-pad.md`、`project/trunk-imu-i2c.zh-CN.md`、`project/replica-v167.zh-CN.md`；`README.md` 加索引 |
+| `docs/` | `design/robotd-design.md`（§2.6，含陀螺积分姿态一段；padd 一段加掉线坐下和 UDP；control.33 一节加 fork 注）；新增 `robot/udp-pad.md`、`project/trunk-imu-i2c.zh-CN.md`、`project/replica-v167.zh-CN.md`；`README.md` 加索引 |
 | `Cargo.lock` | 依赖锁定跟着变 |
 | `console/`（kissqy 的中控） | **没改**，原样保留。所以用模块时，中控调试页的 IMU 那一行还写着 FT6；「保存安装确认」只等 15 秒，模块要 20 秒，会超时，安装方向用第 3 节的 SSH 办法确认；中控里也没有调参和 UDP 手柄的按钮 |
 | 仓库根目录 | `README.md`、`README.en.md` 换成我们写的首页；kissqy 的原首页改名为 `README-kissqy.md`、`README-kissqy.en.md` 原样保留（只改了顶部一段和语言切换链接）；`DUCK-SHOPPING-LIST*.md`、`docs/README*.md`、`docs/AUTHOR-JOURNEY*.md` 里指向首页的链接改指原版首页；新增本页 |
@@ -253,13 +294,15 @@ uvx duckctl@0.17.1 udp-pad 192.168.x.x     # 一定写鸭子的 IP；推杆前�
 
 ## English summary
 
-This is a fork maintained by [microduck-replica](https://github.com/fanhao375/microduck-replica); it is **not** an official kissqy release and he has not reviewed it. On top of kissqy's R17 V167 (control.43) it adds three optional things; with none of them switched on it behaves like his V167:
+This is a fork maintained by [microduck-replica](https://github.com/fanhao375/microduck-replica); it is **not** an official kissqy release and he has not reviewed it. On top of kissqy's R17 V167 (control.43) it adds four optional things; with none of them switched on it behaves like his V167:
 
 1. **IMU module on the board's I²C**: `[trunk_imu] source = "bno08x"` (BNO085/086, 0x4A/0x4B) or `"lsm6dsv16x"` (0x6A/0x6B, address required) instead of his bus IMU board (ID 200).
 2. **Servo tuning**: `service.sh servo-parameters P D limit` writes `servo-test-parameters.json` (P 1–32, D 0–64, torque limit 200–1000); the next HOME writes it to all 15 servos in one 4-byte write at register 48 and reads it back; relax leaves P restored, D=0 and limit 1000, exactly as V167 does. Without the file, the frames robotd sends the servos are V167's, byte for byte (a golden test passes on both); the diagnostics only add `native.hd1910.servo_parameters: null`. `servo-parameters-clear` removes it; `joint-filters <id> head legs` edits the joint Walk's head/legs lowpass (the first original kept as `.orig`). Each command relaxes the robot and restarts robotd — hold the duck. robotd never relaxes on stop/restart/crash; after a power cycle, relax before HOME. `service.sh install/start/upgrade/reset-models` and kissqy's console upgrade delete the file.
 3. **UDP pad and pad-loss sit** (padd ported from Pollen microduck 0.17.1): a driving pad (Bluetooth, or `uvx duckctl@0.17.1 udp-pad <robot IP>` over the LAN) that stays gone a second is expected to make the robot ask and sit down (from the code and a host run; not yet seen on a robot). The UDP pad is off by default; `service.sh netpad on [port] [timeout_ms]` / `netpad off` switch it, checking both `robotd.toml` copies against their own deadman. It is unauthenticated: LAN you trust only.
 
-Status: the IMU part (BNO085) runs on our robot on V167 (stood and walked, 2026-10-14). LSM6DSV16X has only been tested against a fake bus. Tuning and the UDP pad pass their unit tests (and a host end-to-end run for the UDP pad) but have not run on a robot; the cross-built padd has never run on a board. The installer has only been tested on fake boards.
+4. **BNO085 gyro-integrated attitude** (optional, experimental): walking, the BNO085's own orientation sometimes jumps 20–60° within one tick while its gyro says the trunk barely turned. robotd integrates that gyro into an attitude of its own and checks every chip orientation against it (tilt under 6° taken slowly, over it refused; long refusals realigned only on a calm, still trunk, otherwise slewed at 5°/s). `[trunk_imu] bno08x_fusion = "chip"` (default) publishes the chip's orientation exactly as before, the fused one only in diagnostics (`busStatus` `native.imu_reader.fusion`, the state stream's `imu.fusion`); `"gyro"` publishes the fused one. `bno08x_raw_log = "<absolute path>"` appends every report to a CSV file, for settling the numbers on 100 Hz data. The installer keeps both keys. An older robotd ignores them with a warning and behaves as `chip`; no `API_VERSION` step, since only optional fields were added. Unit-tested and replayed on 50 Hz recordings only — not yet run on a robot. Order on a robot: shadow (chip) with the raw log, gyro standing, gyro walking A/B against chip, deliberate falls; back to chip at once on a standing tilt difference over 1°, a step over 5° while walking, `realign_long` rising while upright, more stale IMU samples, or `disabled`.
+
+Status: the IMU part (BNO085) runs on our robot on V167 (stood and walked, 2026-10-14). The gyro-integrated attitude has not run on a robot. LSM6DSV16X has only been tested against a fake bus. Tuning and the UDP pad pass their unit tests (and a host end-to-end run for the UDP pad) but have not run on a robot; the cross-built padd has never run on a board. The installer has only been tested on fake boards.
 
 Install on a duck already upgraded to V167 through kissqy's console: `python3 prepare-V167.py`, `sh scripts/cross-sysroot.sh` (export what it prints), `cargo board --locked -p robotd -p robotctl -p padd` (do not run `build-V167.sh`, and do not use `packaging/robotd` / `packaging/padd`, which are kissqy's); copy the three binaries, `calibration-config.py`, `rebuild-config.py`, `runtime.py`, `voice-setup.py`, `service.sh` and `deploy/imu-module-install.sh` to the board; with servo power on, `sudo bash imu-module-install.sh install <dir> bno08x /dev/i2c-4 0x4B`. It relaxes the robot according to its state, backs everything up, waits for robotd's four startup steps, checks busStatus and padd, and restores the backup by itself on any failure; `rollback <backup>` returns to the state before that install — use the backup this install printed: an older one may bring back kissqy's robotd, which cannot read the calibration's `[imu_mounts]` and waits for the bus forever (the script refuses that while the calibration has them). The calibration files themselves are never rolled back. It never marks the IMU mount verified — confirm it with `service.sh bus verify-imu --confirmed` in commissioning mode (upright, then tip nose-down 15–30° within 20 s), not through kissqy's console (it gives up after 15 s).
 
