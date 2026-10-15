@@ -152,7 +152,7 @@ netpad_failed() {
         systemctl restart padd.service || true
         start_input_services || true
         fail "padd 没有按 netpad on 启动（$why）；这次写过的配置已恢复，padd 已重启。"
-        return 1   # fail only returns: called after ||, errexit does not stop here
+        return 1   # not reached: netpad_failed runs after the final ||, so errexit applies and fail ends the script via on_error
     fi
     python3 "$install_dir/runtime.py" netpad-commit >/dev/null || true
     start_input_services || true

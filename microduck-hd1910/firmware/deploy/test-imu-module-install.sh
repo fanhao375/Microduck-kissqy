@@ -169,6 +169,31 @@ stop_fake() { [ -n "${R:-}" ] && [ -f "$R/units/robotd.pid" ] && kill "$(cat "$R
 trap stop_fake EXIT
 
 state() { (cd "$R/opt" && sha256sum robotd robotctl padd runtime.py service.sh SHA256SUMS | sha256sum | cut -c1-12); }
+
+# The installer on a pty of its own as session leader, like an ssh login; "<text>@<file>" closes the
+# master once <file> contains <text>, as sshd does when the connection drops.
+cat > "$W/ptyrun.py" <<'EOF'
+import os, pty, select, sys, time
+text, path = sys.argv[1].split('@', 1)
+pid, fd = pty.fork()
+if pid == 0:
+    os.execvp(sys.argv[2], sys.argv[2:])
+closed = False; deadline = time.time() + 240
+while time.time() < deadline:
+    done, status = os.waitpid(pid, os.WNOHANG)
+    if done: sys.exit(os.waitstatus_to_exitcode(status))
+    if not closed:
+        if select.select([fd], [], [], 0.05)[0]:
+            try: os.read(fd, 65536)
+            except OSError: pass
+        try:
+            if text in open(path, encoding='utf-8', errors='replace').read(): os.close(fd); closed = True
+        except OSError: pass
+    else:
+        time.sleep(0.05)
+os.kill(pid, 9); sys.exit(124)
+EOF
+hangup_after() { "$PY" "$W/ptyrun.py" "$1@$R/install.log" bash "$SCRIPT" install "$R/src" bno08x /dev/null 0x4B; }
 backup_of() { grep -o "$R/imu-module-backup-[0-9-]*" <<<"$1" | head -1; }
 toml() { "$PY" -c "import tomllib,sys;d=tomllib.load(open(sys.argv[1],'rb'));$2" "$3"; }
 
@@ -411,6 +436,24 @@ flock "$R/lock" sleep 5 & HOLDER=$!; sleep 0.3
 bash "$SCRIPT" install "$R/src" bno08x /dev/i2c-4 0x4B >/dev/null 2>&1; rc=$?
 kill $HOLDER 2>/dev/null; wait $HOLDER 2>/dev/null
 ok "另一个服务管理操作占着锁 → 拒绝，什么都没改" "[ $rc -ne 0 ] && grep -q '已有服务管理操作在进行' $R/install.log && [ \"\$(state)\" = $orig ]"
+
+# --- review C: the ssh session drops (HUP ignored, the terminal gone) ------------------------------
+board b
+fake_before '{"mode": "motion", "phase": "control", "armed": true}'
+printf '#!/bin/bash\nsleep 0.5\nexec /usr/bin/install "$@"\n' > "$R/bin/install"; chmod +x "$R/bin/install"
+hangup_after '已备份到'; rc=$?; rm -f "$R/bin/install"
+ok "B 备份后 ssh 断线（换文件中途）→ 照样装完：服务都起来、没有意外退出" "[ $rc -eq 0 ] && ! grep -q '意外退出' $R/install.log && [ \"\$(cat $R/units/robotd.active)\" = active ] && grep -qx 'restart padd.service' $R/systemctl.log && cmp -s $R/opt/robotd $R/src/robotd"
+
+board b; orig=$(state)
+fake_before '{"mode": "motion", "phase": "control", "armed": true}'
+echo '{"mode": "motion", "phase": "control", "startup_ok": false}' > "$R/robotd-after.json"
+hangup_after '已备份到'; rc=$?
+ok "B 备份后断线、随后启动失败 → 自动撤回照样做完，文件回原样" "[ $rc -ne 0 ] && ! grep -q '意外退出' $R/install.log && grep -q '自动撤回到' $R/install.log && grep -q '文件已恢复\|已撤回' $R/install.log && [ \"\$(state)\" = $orig ]"
+
+board b
+fake_before '{"mode": "motion", "phase": "control", "armed": true, "restore_delay": 3}'
+hangup_after '运动模式控制中'; rc=$?
+ok "B 等卸力时断线（padd 已停）→ 照样装完，服务都起来" "[ $rc -eq 0 ] && ! grep -q '意外退出' $R/install.log && [ \"\$(cat $R/units/robotd.active)\" = active ] && [ \"\$(cat $R/units/padd.active)\" = active ]"
 
 stop_fake
 echo "== $PASS passed, $FAIL failed, $SKIP skipped (work dir $W)"

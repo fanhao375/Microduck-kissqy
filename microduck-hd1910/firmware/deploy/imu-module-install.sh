@@ -54,8 +54,18 @@ STOPPED=0          # set once padd (then robotd) was stopped; a failure before t
 IN_DIE=0
 SOURCE_KIND=''     # bno08x / lsm6dsv16x, for the post-start check
 PARTOF_BEFORE=''   # units that are PartOf robotd, with their state before
+ROLLBACK_FROM=''   # the backup a manual rollback is restoring; an interrupted one says to run it again
 
-log() { local level=$1 cat=$2; shift 2; printf '%s [%s][%s] %s\n' "$(date '+%F %T')" "$level" "$cat" "$*" | tee -a "$LOG" >&2; }
+# The log file first; the terminal only if it is still there. After an ssh session drops (HUP is
+# ignored, so the run goes on), writing to the dead terminal fails with EIO: that must never reach the
+# ERR trap, or the automatic rollback would stop at its own first log line.
+log() {
+    local level=$1 cat=$2 line; shift 2
+    line=$(printf '%s [%s][%s] %s' "$(date '+%F %T')" "$level" "$cat" "$*")
+    printf '%s\n' "$line" >>"$LOG"
+    { printf '%s\n' "$line" >&2; } 2>/dev/null || true
+}
+say() { { printf '%s\n' "$*"; } 2>/dev/null || true; }   # stdout, same rule
 
 die() {
     # In a $(...) subshell only leave it: the caller's assignment fails and the main shell dies once.
@@ -71,7 +81,7 @@ die() {
             # A robotd / padd this run may have started (limp: no HOME has run) must not keep the new
             # programs loaded while the old files go back.
             if [ "$NO_SYSTEMD" != 1 ]; then systemctl stop padd.service robotd.service >/dev/null 2>&1 || true; fi
-            restore_from "$BACKUP" || rc=$?
+            restore_from "$BACKUP" auto || rc=$?
             if [ "$rc" = 1 ]; then
                 log ERROR rollback "备份没能复制回去，robotd 没有启动；请手动：sudo bash $0 rollback $BACKUP"
             else
@@ -90,8 +100,11 @@ die() {
             else log ERROR start '原来的 robotd / padd 没起来；看 journalctl -u robotd -u padd'; fi
             partof_report
         fi
+        if [ -n "$ROLLBACK_FROM" ]; then
+            log ERROR rollback "撤回没有做完：请重跑 sudo bash $0 rollback $ROLLBACK_FROM"
+        fi
     fi
-    echo "失败：$2（日志：$LOG）" >&2
+    { echo "失败：$2（日志：$LOG）" >&2; } 2>/dev/null || true
     exit 1
 }
 trap 'die unexpected "第 $LINENO 行意外退出（$BASH_COMMAND）"' ERR
@@ -195,8 +208,9 @@ elif action == 'verify':
 PY
 }
 
-# Units that are PartOf robotd (a recorder, say) stop with it and do not start with it: report them
-# before and after, never start them.
+# Units that are PartOf robotd (a recorder, say) stop with it; they come back with robotd only if
+# robotd also wants them (WantedBy=robotd.service and enabled). Report them before and after,
+# name one that stayed down, never start them.
 partof_record() {
     [ "$NO_SYSTEMD" = 1 ] && return 0
     local unit units
@@ -231,9 +245,9 @@ relax_and_stop() {
     local state before
     before=$(systemctl is-active robotd.service 2>/dev/null || true)
     partof_record
+    STOPPED=1   # before the stop: an interrupted stop still brings padd back
     systemctl stop padd.service || [ "$(systemctl show padd.service -p LoadState --value 2>/dev/null || true)" = not-found ] \
         || die stop 'systemctl stop padd 失败；什么都没改'
-    STOPPED=1
     log INFO stop 'padd 已停止（它的程序要换，也不让手柄在卸力和停 robotd 之间再上力）'
     state=$(robotd_rpc state)
     case $state in
@@ -504,7 +518,7 @@ replace_file() {   # src dst: new inode then rename, so a running padd never mak
     cp -a "$1" "$tmp" && mv -f "$tmp" "$2"
 }
 
-# $1 backup, $2 install (automatic, after a failed install) | rollback (on request).
+# $1 backup, $2 auto (after a failed install) | rollback (on request).
 # Programs, scripts and manifests, robotd.toml (both) and an older servo parameter file come back;
 # the calibration files never do (an IMU re-confirmed since is kept; a difference is reported). A
 # rollback first keeps the configs it replaces in $backup/etc-at-rollback/.
@@ -737,8 +751,8 @@ PY
         log WARN tuning "有舵机参数文件 $(tr -d '\n' < "$CONFIG_DIR/servo-test-parameters.json")：下次 HOME 上力时生效"
     fi
     input_report
-    echo "完成。备份：$backup"
-    echo "撤回（回到这次安装之前）：sudo bash $0 rollback $backup"
+    say "完成。备份：$backup"
+    say "撤回（回到这次安装之前）：sudo bash $0 rollback $backup"
 }
 
 cmd_rollback() {
@@ -758,6 +772,7 @@ cmd_rollback() {
         fi
     done
     take_lock
+    ROLLBACK_FROM=$backup
     log INFO rollback "从 $backup 恢复（回到那次安装之前；标定文件保持现在的）"
     relax_and_stop
     STOPPED=0   # from here on a failure must not start anything on half-restored files
