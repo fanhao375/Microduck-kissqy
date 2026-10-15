@@ -1,4 +1,4 @@
-// Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; see IMU-MODULE.md at the repository root.
+// Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; BNO08x gyro-integrated attitude; see IMU-MODULE.md at the repository root.
 //! Exercise the real policy/control loop, including writes on missing reads.
 use super::*;
 use duck_control::io::{IoError, Result, Sensors};
@@ -149,6 +149,7 @@ impl RobotIo for RecoveryIo {
                 },
             },
             hd1910: d.hd1910,
+            imu_fusion: None,
         })
     }
 }

@@ -1,4 +1,4 @@
-// Added 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; see IMU-MODULE.md at the repository root.
+// Added 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; BNO08x gyro-integrated attitude; see IMU-MODULE.md at the repository root.
 //! An LSM6DSV16X on a breakout, as bytes: its bring-up as data and its FIFO, with no I/O.
 //!
 //! The chip the bus board carries, wired to the board's own I²C instead. Its SFLP fusion
@@ -390,6 +390,7 @@ impl Lsm6dsv16xAssembler {
                     epoch: self.epoch,
                     epoch_started_at: self.epoch_started_at,
                     accuracy: None,
+                    fusion: None,
                 })
             }
             _ => {

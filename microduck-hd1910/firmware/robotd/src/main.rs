@@ -1,4 +1,4 @@
-// Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; optional servo P/D/torque-limit file; see IMU-MODULE.md at the repository root.
+// Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; optional servo P/D/torque-limit file; BNO08x gyro-integrated attitude; see IMU-MODULE.md at the repository root.
 //! `robotd` — the robot control daemon.
 //!
 //! The 50 Hz control loop, the `robot.*` socket, and the health the updater gates on
@@ -7010,6 +7010,7 @@ mod tests {
                         },
                     },
                     hd1910: duck_control::hd1910::State::default().diagnostics(),
+                    imu_fusion: None,
                 })
             }
         }

@@ -1,4 +1,4 @@
-// Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; see IMU-MODULE.md at the repository root.
+// Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; BNO08x gyro-integrated attitude; see IMU-MODULE.md at the repository root.
 //! Read-only, owned facts for a reporter on another thread. No UART owner and no JSON tree.
 use std::sync::Arc;
 
@@ -139,4 +139,19 @@ pub struct Snapshot {
     pub dynamic: Dynamic,
     // This existing immutable register cache is replaced only by a real inspection.
     pub hd1910: crate::hd1910::Diagnostics,
+    /// What a BNO08x's gyro fusion made of the sample the last read used — for the state
+    /// stream's `imu.fusion`, not for busStatus: nothing serialises it from here.
+    pub imu_fusion: Option<ImuFusionTick>,
+}
+
+/// [`Snapshot::imu_fusion`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ImuFusionTick {
+    pub mode: crate::gyro_fusion::FusionMode,
+    pub verdict: crate::gyro_fusion::Verdict,
+    /// Tilt between chip and fusion before that report's correction, degrees.
+    pub theta_deg: f64,
+    /// The orientation the read did not use — the fusion's when the mode is `chip`, the
+    /// chip's when it is `gyro` — trunk→world under the same mount as the one it did.
+    pub other_quat: [f64; 4],
 }

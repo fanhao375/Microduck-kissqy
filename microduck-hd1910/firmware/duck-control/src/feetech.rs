@@ -1,4 +1,4 @@
-// Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; optional servo P/D/torque-limit file; see IMU-MODULE.md at the repository root.
+// Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; optional servo P/D/torque-limit file; BNO08x gyro-integrated attitude; see IMU-MODULE.md at the repository root.
 //! Native Feetech TTL packets. No Dynamixel packets or address translation.
 //!
 //! HD1910 telemetry uses only the 15-byte feedback block at 56..=70.
@@ -1272,6 +1272,8 @@ enum TrunkImu {
         latest_age_ms: Option<u16>,
         /// Epoch of the last sample a tick accepted: a new one restarts the frame's median.
         accepted_epoch: Option<u32>,
+        /// The gyro fusion's view of that sample, in the frame's axes.
+        fusion: Option<crate::feetech_snapshot::ImuFusionTick>,
     },
 }
 
@@ -1317,6 +1319,12 @@ impl TrunkImu {
         match self {
             Self::Bus { .. } => None,
             Self::Host { reader, .. } => Some(reader.health()),
+        }
+    }
+    fn fusion(&self) -> Option<crate::feetech_snapshot::ImuFusionTick> {
+        match self {
+            Self::Bus { .. } => None,
+            Self::Host { fusion, .. } => *fusion,
         }
     }
 }
@@ -1435,6 +1443,7 @@ impl FeetechIo {
             reader,
             latest_age_ms: None,
             accepted_epoch: None,
+            fusion: None,
         };
         Ok(Self::with_trunk_imu(bus, calibration, imu))
     }
@@ -1586,6 +1595,7 @@ impl FeetechIo {
                 gate,
                 frame,
                 accepted_epoch,
+                fusion,
                 ..
             } => {
                 let sample = gate.check(reader.latest(), Instant::now())?;
@@ -1597,6 +1607,18 @@ impl FeetechIo {
                     gyro: sample.gyro,
                     quat: Some(sample.quat),
                 };
+                *fusion = sample.fusion.and_then(|f| {
+                    let other = match f.mode {
+                        crate::gyro_fusion::FusionMode::Chip => f.fused_quat,
+                        crate::gyro_fusion::FusionMode::Gyro => f.chip_quat,
+                    };
+                    Some(crate::feetech_snapshot::ImuFusionTick {
+                        mode: f.mode,
+                        verdict: f.verdict,
+                        theta_deg: f.theta_deg,
+                        other_quat: frame.trunk_quat(other)?,
+                    })
+                });
                 (frame.push(reading), None, gate.last_age())
             }
         };
@@ -2076,6 +2098,7 @@ impl RobotIo for FeetechIo {
                 },
             },
             hd1910,
+            imu_fusion: self.imu.fusion(),
         })
     }
 }
@@ -3148,6 +3171,7 @@ mod hd1910_transport_tests {
                 epoch,
                 epoch_started_at: now - Duration::from_secs(5),
                 accuracy: None,
+                fusion: None,
             })
         }
         fn health(&self) -> HostImuHealth {
@@ -3244,6 +3268,92 @@ mod hd1910_transport_tests {
                 "the reporter sees the reader too"
             );
         }
+    }
+
+    /// A BNO08x sample's gyro-fusion view reaches the snapshot in the trunk's axes, under the
+    /// mount the tick's own orientation went through — the other orientation in each mode. The
+    /// bus board has none, and busStatus does not change shape for it.
+    #[test]
+    fn the_fusion_view_reaches_the_snapshot_in_trunk_axes() {
+        use crate::gyro_fusion::{FusionCounts, FusionMode, FusionSample, Verdict};
+        struct Fused {
+            sequence: std::sync::atomic::AtomicU32,
+            mode: FusionMode,
+        }
+        const CHIP: [f64; 4] = [0.5, 0.5, 0.5, 0.5];
+        const FUSED: [f64; 4] = [0.6, 0.4, 0.5, 0.48];
+        impl HostImu for Fused {
+            fn kind(&self) -> TrunkImuKind {
+                TrunkImuKind::Bno08x
+            }
+            fn latest(&self) -> Option<crate::trunk_imu::HostImuSample> {
+                let now = Instant::now();
+                Some(crate::trunk_imu::HostImuSample {
+                    quat: match self.mode {
+                        FusionMode::Chip => CHIP,
+                        FusionMode::Gyro => FUSED,
+                    },
+                    gyro: [0.0; 3],
+                    received_at: now,
+                    sequence: self.sequence.fetch_add(1, Ordering::Relaxed) + 1,
+                    epoch: 1,
+                    epoch_started_at: now - Duration::from_secs(5),
+                    accuracy: Some(3),
+                    fusion: Some(FusionSample {
+                        mode: self.mode,
+                        verdict: Verdict::Rejected,
+                        chip_quat: CHIP,
+                        fused_quat: FUSED,
+                        theta_deg: 7.5,
+                        counts: FusionCounts::default(),
+                        period_us: None,
+                    }),
+                })
+            }
+            fn health(&self) -> HostImuHealth {
+                HostImuHealth {
+                    state: "streaming",
+                    ..HostImuHealth::default()
+                }
+            }
+        }
+        let mount = [0.459554518, 0.539556409, 0.532044137, 0.463268349];
+        for mode in FusionMode::ALL {
+            let (bus, _device) = emulator(false);
+            let mut c = calibration();
+            c.set_imu_mount(
+                TrunkImuKind::Bno08x,
+                ImuMount {
+                    quat: mount,
+                    verified: true,
+                },
+            );
+            let host = Fused {
+                sequence: std::sync::atomic::AtomicU32::new(0),
+                mode,
+            };
+            let mut io = FeetechIo::from_bus_with_imu(bus, c, Box::new(host)).unwrap();
+            for _ in 0..3 {
+                io.read().unwrap();
+            }
+            let tick = io.feetech_snapshot().unwrap().imu_fusion.unwrap();
+            let frame = TrunkFrame::new(mount);
+            let other = match mode {
+                FusionMode::Chip => FUSED,
+                FusionMode::Gyro => CHIP,
+            };
+            assert_eq!(tick.other_quat, frame.trunk_quat(other).unwrap());
+            assert_eq!(
+                (tick.mode, tick.verdict, tick.theta_deg),
+                (mode, Verdict::Rejected, 7.5)
+            );
+            let wire = serde_json::to_value(io.feetech_diagnostics().unwrap()).unwrap();
+            assert!(wire.get("imu_fusion").is_none());
+        }
+        let (bus, _device) = emulator(false);
+        let mut io = FeetechIo::from_bus(bus, calibration()).unwrap();
+        io.read().unwrap();
+        assert!(io.feetech_snapshot().unwrap().imu_fusion.is_none());
     }
 
     /// With the board, a missing servo still leaves a frame the control loop could coast on

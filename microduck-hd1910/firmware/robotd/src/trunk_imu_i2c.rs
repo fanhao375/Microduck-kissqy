@@ -1,4 +1,4 @@
-// Added 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; see IMU-MODULE.md at the repository root.
+// Added 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; BNO08x gyro-integrated attitude; see IMU-MODULE.md at the repository root.
 //! A trunk IMU module on the board's I²C: the reader thread behind `trunk_imu::HostImu`.
 //!
 //! With `[trunk_imu] source` set to a module, the trunk IMU is not on the servo bus and the
@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwapOption;
 use duck_control::bno08x::{self, Bno08xAssembler, ControlReply, Header, Packet, Writer};
 use duck_control::lsm6dsv16x::{self, FifoStatus, Lsm6dsv16xAssembler, Op};
-use duck_control::trunk_imu::{HostImu, HostImuHealth, HostImuSample, TrunkImuKind};
+use duck_control::trunk_imu::{FusionHealth, HostImu, HostImuHealth, HostImuSample, TrunkImuKind};
 
 use crate::params::{TrunkImuParams, TrunkImuSource};
 
@@ -812,6 +812,12 @@ impl Shared {
             errors: self.errors.load(Ordering::Relaxed),
             dropped: self.dropped.load(Ordering::Relaxed),
             last_error: self.last_error.load().as_deref().cloned(),
+            fusion: self
+                .sample
+                .load()
+                .as_deref()
+                .and_then(|s| s.fusion.as_ref().map(FusionHealth::from)),
+            raw_log: None,
         }
     }
 }

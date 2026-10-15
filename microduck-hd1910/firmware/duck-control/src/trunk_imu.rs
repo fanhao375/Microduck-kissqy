@@ -1,4 +1,4 @@
-// Added 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; see IMU-MODULE.md at the repository root.
+// Added 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; BNO08x gyro-integrated attitude; see IMU-MODULE.md at the repository root.
 //! Where the trunk IMU is wired, and how a sensor off the bus reaches the control loop.
 //!
 //! Chosen by configuration and never probed for:
@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
+use crate::gyro_fusion::{FusionCounts, FusionMode, FusionSample};
 use crate::imu::SflpDecoder;
 use crate::io::{ImuStale, IoError, Result};
 
@@ -87,6 +88,17 @@ pub struct HostImuSample {
     /// The chip's own estimate of the orientation's accuracy, where it makes one: a BNO08x
     /// report's status bits, 0 unreliable … 3 high. For the operator; nothing gates on it.
     pub accuracy: Option<u8>,
+    /// A BNO08x's gyro fusion as of this sample (`crate::gyro_fusion`): both orientations and
+    /// what the fusion made of this one. `None` for any other chip.
+    pub fusion: Option<FusionSample>,
+}
+
+impl HostImuSample {
+    /// The chip's own orientation, whichever one [`Self::quat`] is: what commissioning measures
+    /// a mount against, so a mount is never fitted to the host's fusion.
+    pub fn chip_quat(&self) -> [f64; 4] {
+        self.fusion.map_or(self.quat, |f| f.chip_quat)
+    }
 }
 
 /// What the reader is doing, for diagnostics. Its vocabulary, not the gate's verdict.
@@ -104,6 +116,51 @@ pub struct HostImuHealth {
     /// is noise and a reopen costs a second of trunk IMU.
     pub dropped: u64,
     pub last_error: Option<String>,
+    /// A BNO08x's gyro fusion, as of the newest sample. Absent for any other chip, and before
+    /// the first sample.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fusion: Option<FusionHealth>,
+    /// The raw report log, when `[trunk_imu] bno08x_raw_log` names one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_log: Option<RawLogHealth>,
+}
+
+/// [`HostImuHealth::fusion`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FusionHealth {
+    /// Which orientation the samples publish.
+    pub mode: FusionMode,
+    /// The fusion panicked and is off; the samples carry the chip's orientation.
+    pub disabled: bool,
+    /// Since the reader started.
+    pub counts: FusionCounts,
+    /// The report period measured against the host clock, µs; absent until ten seconds of
+    /// unbroken reports.
+    pub period_us: Option<f64>,
+}
+
+impl From<&FusionSample> for FusionHealth {
+    fn from(sample: &FusionSample) -> Self {
+        Self {
+            mode: sample.mode,
+            disabled: sample.verdict == crate::gyro_fusion::Verdict::Disabled,
+            counts: sample.counts,
+            period_us: sample.period_us,
+        }
+    }
+}
+
+/// [`HostImuHealth::raw_log`]: where the log goes and how it is keeping up.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct RawLogHealth {
+    pub path: String,
+    /// Report lines written.
+    pub lines: u64,
+    /// Report lines not written: the writer had fallen behind, or the file reached its cap.
+    pub dropped: u64,
+    pub bytes: u64,
+    /// Why nothing is being written, if nothing is.
+    pub error: Option<String>,
 }
 
 /// A trunk IMU the host reads on a thread of its own.
@@ -219,6 +276,7 @@ mod tests {
             epoch: 1,
             epoch_started_at: received_at - Duration::from_secs(5),
             accuracy: None,
+            fusion: None,
         }
     }
 

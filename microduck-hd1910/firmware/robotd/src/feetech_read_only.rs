@@ -1,4 +1,4 @@
-// Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; see IMU-MODULE.md at the repository root.
+// Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; BNO08x gyro-integrated attitude; see IMU-MODULE.md at the repository root.
 //! Raw telemetry mode of robotd. The control thread owns the same native Feetech
 //! Bus used by FeetechIo; IPC only reads snapshots. No fabricated calibration.
 use super::{Ordering, RobotState};
@@ -594,6 +594,7 @@ mod tests {
                 epoch: 1,
                 epoch_started_at: now - Duration::from_secs(5),
                 accuracy: Some(3),
+                fusion: None,
             })
         }
         fn health(&self) -> duck_control::trunk_imu::HostImuHealth {

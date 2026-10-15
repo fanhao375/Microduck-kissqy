@@ -508,6 +508,11 @@ pub(crate) mod tests {
     const Y: [f64; 3] = [0.0, 1.0, 0.0];
     const Z: [f64; 3] = [0.0, 0.0, 1.0];
 
+    /// `q` turned at body `rate` for `dt`.
+    pub(crate) fn turned(q: Quat, rate: [f64; 3], dt: f64) -> Quat {
+        normalise(mul(q, exp_rotation(rate, dt)))
+    }
+
     /// Whole rotation angle between two orientations, degrees.
     pub(crate) fn apart_deg(a: Quat, b: Quat) -> f64 {
         let d = mul(conj(a), b);

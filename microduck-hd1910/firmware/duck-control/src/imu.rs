@@ -1,4 +1,4 @@
-// Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; see IMU-MODULE.md at the repository root.
+// Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; BNO08x gyro-integrated attitude; see IMU-MODULE.md at the repository root.
 //! The robot's trunk orientation: what every trunk IMU shares, and the bus board's bytes.
 //!
 //! Two parts, because the sensor can be wired more than one way
@@ -116,6 +116,22 @@ impl TrunkFrame {
     /// detection must not run before it.
     pub fn ready(&self) -> bool {
         self.quat_samples >= SFLP_READY_SAMPLES
+    }
+
+    /// A sensor→world orientation as this frame's trunk→world one: the transform
+    /// [`Self::push`] applies to the quaternion it keeps, with no state touched. `None` for
+    /// one that is no rotation. How a second orientation — the gyro fusion's, beside the one
+    /// the frame was given — is put in the same axes as the first.
+    pub fn trunk_quat(&self, sensor_quat: [f64; 4]) -> Option<[f64; 4]> {
+        let mount_inv = [
+            self.mount[0],
+            -self.mount[1],
+            -self.mount[2],
+            -self.mount[3],
+        ];
+        let q = mul(sensor_quat, mount_inv);
+        let norm = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+        (norm > 0.5).then(|| [q[0] / norm, q[1] / norm, q[2] / norm, q[3] / norm])
     }
 
     pub fn push(&mut self, reading: SensorReading) -> ImuData {
@@ -331,6 +347,26 @@ const _: () = assert!(NUM_JOINTS > 0);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`TrunkFrame::trunk_quat`] is exactly what [`TrunkFrame::push`] keeps, and changes
+    /// nothing.
+    #[test]
+    fn the_mount_transform_alone_is_what_push_keeps() {
+        let mount = [0.459554518, 0.539556409, 0.532044137, 0.463268349];
+        let mut frame = TrunkFrame::new(mount);
+        let sensor = [0.8, 0.1, -0.5, 0.3];
+        let alone = frame.trunk_quat(sensor).unwrap();
+        assert_eq!(
+            frame
+                .push(SensorReading {
+                    gyro: [0.0; 3],
+                    quat: Some(sensor)
+                })
+                .quat,
+            alone
+        );
+        assert_eq!(frame.trunk_quat([0.0; 4]), None);
+    }
 
     /// Half-precision decoding is hand-rolled, so pin the cases that matter: zero, one,
     /// a negative, and a subnormal. A wrong exponent bias here silently tilts the horizon.
