@@ -121,7 +121,7 @@ fn host_imu_report(
                 .as_secs_f64()
                 * 1000.0
         );
-        report["quaternion_wxyz"] = json!(sample.quat);
+        report["quaternion_wxyz"] = json!(sample.chip_quat());
         report["gyro_rad_s"] = json!(sample.gyro);
         report["accuracy"] = json!(sample.accuracy);
     }
@@ -604,6 +604,51 @@ mod tests {
                 ..Default::default()
             }
         }
+    }
+
+    /// With `bno08x_fusion = "gyro"` a sample's `quat` is the host's fusion; the service
+    /// still reports the chip's own orientation, the raw value it promises.
+    #[test]
+    fn a_gyro_fused_sample_is_reported_as_the_chips_own_quaternion() {
+        use duck_control::gyro_fusion::{FusionCounts, FusionMode, FusionSample, Verdict};
+        const CHIP: [f64; 4] = [0.5; 4];
+        const FUSED: [f64; 4] = [1.0, 0.0, 0.0, 0.0];
+        struct GyroHost;
+        impl HostImu for GyroHost {
+            fn kind(&self) -> duck_control::trunk_imu::TrunkImuKind {
+                duck_control::trunk_imu::TrunkImuKind::Bno08x
+            }
+            fn latest(&self) -> Option<duck_control::trunk_imu::HostImuSample> {
+                let now = Instant::now();
+                Some(duck_control::trunk_imu::HostImuSample {
+                    quat: FUSED,
+                    gyro: [0.0; 3],
+                    received_at: now,
+                    sequence: 1,
+                    epoch: 1,
+                    epoch_started_at: now - Duration::from_secs(5),
+                    accuracy: Some(3),
+                    fusion: Some(FusionSample {
+                        mode: FusionMode::Gyro,
+                        verdict: Verdict::Rejected,
+                        chip_quat: CHIP,
+                        fused_quat: FUSED,
+                        theta_deg: 7.5,
+                        counts: FusionCounts::default(),
+                        period_us: None,
+                    }),
+                })
+            }
+            fn health(&self) -> duck_control::trunk_imu::HostImuHealth {
+                duck_control::trunk_imu::HostImuHealth {
+                    state: "streaming",
+                    epoch: 1,
+                    ..Default::default()
+                }
+            }
+        }
+        let (report, _) = host_imu_report(&GyroHost, &mut HostImuGate::default(), Instant::now());
+        assert_eq!(report["quaternion_wxyz"], json!(CHIP));
     }
 
     /// With a module as the trunk IMU, the service identifies nothing at ID 200 and reads

@@ -184,30 +184,54 @@ sudo bash $S joint-filters <模型标识> 0.50 0.70   # 头部 腿部，0.10～1
 | `bno08x_fusion` | `"chip"`（不写就是它）/ `"gyro"` | 发给策略和倒地判断的是芯片的姿态还是积分姿态。两种模式下融合都在跑 |
 | `bno08x_raw_log` | `"off"`（不写就是它）/ 绝对路径 | 把芯片发来的每一条报告追加写进这个 CSV 文件（陀螺、姿态的原始值、序号、延迟），用来在真机 100 Hz 数据上重新定门限。约 1 MB/分钟，64 MB 封顶；写盘跟不上就丢行并计数，不会拖慢 IMU |
 
-改的办法：两份 `robotd.toml` 都要改（`robotd.saved.toml` 是升级、重建配置时的来源），改完用 `reconnect` 重启：它先让鸭子卸力，再重启 robotd、拉起 padd，**扶住鸭子**。别直接 `systemctl restart robotd`（不卸力，见 4.3）：
+改的办法：两份 `robotd.toml` 都要改（`robotd.saved.toml` 是升级、重建配置时的来源）。**用下面这条命令改，别用 nano 或 sed 手加**：同一节里同一个键写了两行，TOML 就坏了，这一版、之前的 fork 版、kissqy 原版的 robotd 都会在启动第 1 步退出，换回旧版也救不回来。这条命令用板上 kissqy 自己的 `configure.py`（`dumps` + `atomic_write`，中控改动作缩放用的也是它）来写，执行几次结果都一样；`robotd.toml` 的旧内容会留成 `robotd.toml.previous`；文件第一行的 `# Derived from …` 注释会丢，不影响什么。改完用 `reconnect` 重启：它先让鸭子卸力，再重启 robotd、拉起 padd，**扶住鸭子**。别直接 `systemctl restart robotd`（不卸力，见 4.3）。整段粘贴之前先 `sudo -v` 输一次密码，免得 sudo 把后面粘进去的行当密码读走：
 
 ```bash
 C=/etc/robot/feetech-ft5; S=/opt/robot/feetech-ft5-r5/service.sh
-sudo grep -A6 'trunk_imu' $C/robotd.toml          # 看现在的 [trunk_imu]
-sudo nano $C/robotd.toml $C/robotd.saved.toml      # 在 [trunk_imu] 那一节里加或改：bno08x_fusion = "gyro"
+sudo grep -n 'trunk_imu\|i2c_address\|bno08x' $C/robotd.toml $C/robotd.saved.toml   # 先看：每份 i2c_address 只有一行，在 ["trunk_imu"] 下面
+# 第一个参数 chip 或 gyro；第二个参数可选：原始日志的绝对路径，或 off（不写就不动这个键）
+sudo python3 - gyro <<'PY'
+import sys, tomllib; from pathlib import Path
+sys.path.insert(0, '/opt/robot/feetech-ft5-r5'); from configure import dumps, atomic_write
+mode, log = sys.argv[1], (sys.argv[2] if len(sys.argv) > 2 else None)
+assert mode in ('chip', 'gyro') and (log is None or log == 'off' or log.startswith('/')), sys.argv
+for p in (Path('/etc/robot/feetech-ft5/robotd.toml'), Path('/etc/robot/feetech-ft5/robotd.saved.toml')):
+    d = tomllib.loads(p.read_text()); t = d['trunk_imu']; assert t.get('source') == 'bno08x', p
+    t['bno08x_fusion'] = mode
+    if log: t['bno08x_raw_log'] = log
+    atomic_write(p, dumps(d)); print(p.name, tomllib.loads(p.read_text())['trunk_imu'])
+PY
 sudo bash $S reconnect                             # 先卸力，再重启 robotd、拉起 padd
+```
+
+下面说「用上面的命令 `gyro`」「`chip off`」，指的就是把 `sudo python3 -` 后面的参数换成这些，其余照抄。看融合计数和日志状态（robotd 在运动模式下才有；只读、调试、等总线时 `report` 里没有 `native`，会打印「没有 imu_reader」）：
+
+```bash
+sudo bash $S report 2>/dev/null | python3 -c 'import json,sys;r=((json.load(sys.stdin) or {}).get("native") or {}).get("imu_reader");f=(r or {}).get("fusion") or {};print("没有 imu_reader（robotd 不在运动模式？）" if r is None else (f.get("mode"),"disabled=",f.get("disabled"),f.get("counts"),"raw_log=",r.get("raw_log")))'
 ```
 
 **上机顺序**（每一步出问题就停，退回上一步）：
 
-1. **影子模式（默认，零风险）**：装上这一版什么都不用改，发给策略的跟以前一样。顺手把原始日志打开（两份文件加 `bno08x_raw_log = "/var/lib/robot/feetech-ft5/r5/bno08x-raw.csv"`，`reconnect`）。`sudo bash $S report` 里 `native.imu_reader.fusion` 的计数在涨、`mode` 是 `chip`、`disabled` 是 `false`；`raw_log` 的 `lines` 在涨、`error` 为空。录几段：静站 60 秒、各方向倾斜、推几次摇杆走路（录像里每帧多一个 `imu.fusion`，`fused` 就是积分那一路），连同原始日志拿回来分析。用完把 `bno08x_raw_log` 改回 `"off"`。
-2. **gyro 静态**：改成 `bno08x_fusion = "gyro"`、`reconnect`。静站 5 分钟，积分姿态跟芯片的倾斜差中位应 < 0.5°，`realign_long` 不涨；再做一遍倾斜。
+1. **影子模式（默认，零风险）**：装上这一版什么都不用改，发给策略的跟以前一样。顺手把原始日志打开：先把上次的日志挪走，因为 64 MB 封顶是跨重启累计的，满了就不再写：`sudo mv /var/lib/robot/feetech-ft5/r5/bno08x-raw.csv{,.$(date +%m%d-%H%M)} 2>/dev/null`。再用上面的命令 `chip /var/lib/robot/feetech-ft5/r5/bno08x-raw.csv`，然后 `reconnect`。计数里 `mode` 是 `chip`、`disabled` 是 `false`、各判定在涨；`raw_log` 的 `lines` 在涨、`error` 为空。录几段：静站 60 秒、各方向倾斜、推几次摇杆走路（录像里每帧多一个 `imu.fusion`，`fused` 就是积分那一路），连同原始日志拿回来分析。走路前后各看一次计数：直立走路中 `gyro_gaps`、`realign_gap` 在涨，就先别进第 2 步（见「要知道的」最后一条）。用完用上面的命令 `chip off` 关日志。
+2. **gyro 静态**：用上面的命令 `gyro`、`reconnect`。静站 5 分钟，`imu.fusion.theta_deg`（积分姿态跟芯片的倾斜差）每个 10 s 窗口中位应 < 0.5°、P90 < 1°，`realign_long`、`realign_gap`、`fallback` 不涨；再做一遍倾斜（倾斜那几段不算静站）。
 3. **gyro 走路 A/B**：同参数、同地面，先跑一段 `chip` 当基线，再 `gyro`、`chip`、`gyro` 轮着来，记下起止时间。主指标是推摇杆走路每分钟摔几次（或走多久才摔）；另看晃动不要比 `chip` 大一成以上。
 4. **故意摔、抱起来放平**：静止后 2 秒内，积分姿态应回到跟芯片差 1° 以内，HOME 起始检查正常。
 
-**立刻退回 `chip` 的情况**：静站时倾斜差 > 1°；走路中出现一拍 > 5° 的台阶；`realign_long` 在没倒的时候涨；IMU 过期次数比 `chip` 时多；`disabled` 变成 `true`（融合内部出错已自己关掉，发的是芯片姿态，把日志发给我们）。退回就是把两份文件里的 `bno08x_fusion` 改回 `"chip"`（或删掉这行），`reconnect`。
+**立刻退回 `chip` 的情况**（前三条在 50 Hz 回放的正常数据上都不会触发；台阶和静站两条要从录像里算，脚本还没公开，可以把录像发给我们算）：
+- **台阶**：只数直立走路的帧，即 `policy` 是 `walk`、没卸力、`safety.fallen` 为假。用本帧陀螺把上一帧发布的重力（`safety.gravity`，gyro 模式下就是策略看到的）往前推 20 ms，跟本帧比，差 > 5° 算一次，出现 1 次就退回。回放里直立走路中是 0 次。倒地之后的整步对齐是预期的，不算：回放里有 4 次，都在倒地后 0.5–0.9 s；
+- **计数**：每段前后各看一次上面的计数，后一次要在卸力（包括 `reconnect`）之前读。这一段没摔过、也没卸过力，`realign_long`、`realign_gap` 或 `fallback` 却涨了，就退回。`disabled` 变成 `true` 也退回：融合内部出错已经自己关掉，发的是芯片姿态，把日志发给我们；
+- **静站**：HOME 静站的每个 10 s 窗口分别算，倾斜、推动的那几段按时间去掉；`imu.fusion.theta_deg` 中位 > 0.5° 或 P90 > 1° 就退回（回放：中位 0.011°、P90 0.12°）。别看单帧最大值，芯片自己跳一下就会把它拉大：回放 HOME 帧里有 0.5 % 超过 1°；
+- IMU 过期次数比 `chip` 时多。
+
+退回：用上面的命令 `chip`，`reconnect`。
 
 **要知道的**：
 - 安装脚本重写 `[trunk_imu]` 时会保留这两个键；撤回时两份 `robotd.toml` 回到安装前的样子；
-- 装回不认识这两个键的 robotd（这条分支之前的 fork 版本）时，它们**不会**让 robotd 起不来：robotd 读到不认识的键会在日志里警告一句「this build has no such keys; they are ignored」，照常启动，行为就是 `chip`。kissqy 原版连 `[trunk_imu]` 都不认，见第 6 节；
+- 装回不认识这两个键的 robotd（这条分支之前的 fork 版本）时，它们**不会**让 robotd 起不来：robotd 读到不认识的键会在日志里警告一句「this build has no such keys; they are ignored」，照常启动，行为就是 `chip`。kissqy 原版连 `[trunk_imu]` 都不认，整节忽略，见第 6 节。唯一会让所有版本都起不来的是上面说的重复键；
 - 这次没升 `API_VERSION`：只在已有的消息里加了可选字段（`busStatus` 的 `imu_reader.fusion` / `raw_log`、状态流的 `imu.fusion`），只有 BNO08x 才出现，旧客户端读不到也不出错；没有新方法、没有改旧字段，所以不需要中控、btd、configd 跟着升级；
-- `verify-imu` 和标定永远拿芯片自己的姿态去比，不会把安装方向拟合到积分姿态上；
-- 门限 6°、5°/s、0.5 s 这些数是从 50 Hz 录像定的初值，等影子模式的原始日志回来再定。
+- `verify-imu`、标定、只读模式回显的 `quaternion_wxyz` 永远是芯片自己的姿态，不会把安装方向拟合到积分姿态上；
+- 门限 6°、5°/s、0.5 s 这些数是从 50 Hz 录像定的初值，等影子模式的原始日志回来再定；
+- 两条陀螺报告之间主机时间隔了 100 ms 以上，哪怕序号连续，这一版也当成空档：芯片平稳 0.5 s 后连偏航一起整步对齐，而且不要求机身静止，走路中也可能发生。这是保守做法，读取线程卡一下就会触发。影子阶段如果看到直立走路中 `gyro_gaps`、`realign_gap` 在涨，先改这条再试 gyro。
 
 ## 5. UDP 手柄与掉线坐下
 
@@ -264,7 +288,7 @@ uvx duckctl@0.17.1 udp-pad 192.168.x.x     # 一定写鸭子的 IP；推杆前�
 | 位置 | 改动 |
 |---|---|
 | `duck-control/src/` | 陀螺积分姿态：新增 `gyro_fusion.rs`；`bno08x.rs`（每条报告按包内顺序交给融合，发布逻辑不变）、`trunk_imu.rs`、`imu.rs`、`feetech.rs`、`feetech_snapshot.rs`、`lsm6dsv16x.rs`、`lib.rs`。IMU：新增 `bno08x.rs`（BNO08x 的 SHTP / SH-2 编解码）、`lsm6dsv16x.rs`（LSM6DSV16X 的上电配置和 FIFO 解码）、`trunk_imu.rs`（主板读的 IMU 的样本、新鲜度门限、各型号安装方向）；`feetech.rs`、`feetech_snapshot.rs`、`imu.rs`、`io.rs`、`lib.rs` 接入这三种来源；`Cargo.toml`。调参：`hd1910.rs`（有参数文件时的上力 / 卸力分支）、`hd1910_test.rs`（读参数文件、范围；kissqy 原有这个文件但没接入，这里接入）、`feetech.rs`（`gain_mode`、测试，包括跟原版逐字节比对的金样） |
-| `robotd/src/` | 陀螺积分姿态：新增 `trunk_imu_raw_log.rs`（原始报告落盘）；`trunk_imu_i2c.rs`、`main.rs`、`feetech_commissioning.rs`（标定用芯片姿态）、`raw_stream.rs` 和几处测试。IMU：新增 `trunk_imu_i2c.rs`（读 I²C 的后台线程，坏包丢弃、断线重开）；`main.rs`、`feetech_commissioning.rs`（`verify-imu` 的模块分支）、`feetech_read_only.rs`、`home_start.rs`、`raw_stream.rs` 和几处测试。调参：`main.rs` 开串口前读参数文件 |
+| `robotd/src/` | 陀螺积分姿态：新增 `trunk_imu_raw_log.rs`（原始报告落盘）；`trunk_imu_i2c.rs`、`main.rs`、`feetech_commissioning.rs`（标定用芯片姿态）、`feetech_read_only.rs`（只读模式回显芯片姿态）、`raw_stream.rs` 和几处测试。IMU：新增 `trunk_imu_i2c.rs`（读 I²C 的后台线程，坏包丢弃、断线重开）；`main.rs`、`feetech_commissioning.rs`（`verify-imu` 的模块分支）、`feetech_read_only.rs`、`home_start.rs`、`raw_stream.rs` 和几处测试。调参：`main.rs` 开串口前读参数文件 |
 | `robotd-params/src/` | 新增 `[trunk_imu]`（含 `bno08x_fusion`、`bno08x_raw_log`）、`[netpad]` 配置节和校验 |
 | `duck-ipc-proto/src/lib.rs`（kissqy 原文件） | 状态流的 `ImuState` 加可选的 `fusion`（只有 BNO08x 才有，不升 `API_VERSION`） |
 | `robotctl/src/configure.rs` | 认得 `[trunk_imu]`；`[netpad]` 改了之后提示重启 padd |
@@ -300,7 +324,7 @@ This is a fork maintained by [microduck-replica](https://github.com/fanhao375/mi
 2. **Servo tuning**: `service.sh servo-parameters P D limit` writes `servo-test-parameters.json` (P 1–32, D 0–64, torque limit 200–1000); the next HOME writes it to all 15 servos in one 4-byte write at register 48 and reads it back; relax leaves P restored, D=0 and limit 1000, exactly as V167 does. Without the file, the frames robotd sends the servos are V167's, byte for byte (a golden test passes on both); the diagnostics only add `native.hd1910.servo_parameters: null`. `servo-parameters-clear` removes it; `joint-filters <id> head legs` edits the joint Walk's head/legs lowpass (the first original kept as `.orig`). Each command relaxes the robot and restarts robotd — hold the duck. robotd never relaxes on stop/restart/crash; after a power cycle, relax before HOME. `service.sh install/start/upgrade/reset-models` and kissqy's console upgrade delete the file.
 3. **UDP pad and pad-loss sit** (padd ported from Pollen microduck 0.17.1): a driving pad (Bluetooth, or `uvx duckctl@0.17.1 udp-pad <robot IP>` over the LAN) that stays gone a second is expected to make the robot ask and sit down (from the code and a host run; not yet seen on a robot). The UDP pad is off by default; `service.sh netpad on [port] [timeout_ms]` / `netpad off` switch it, checking both `robotd.toml` copies against their own deadman. It is unauthenticated: LAN you trust only.
 
-4. **BNO085 gyro-integrated attitude** (optional, experimental): walking, the BNO085's own orientation sometimes jumps 20–60° within one tick while its gyro says the trunk barely turned. robotd integrates that gyro into an attitude of its own and checks every chip orientation against it (tilt under 6° taken slowly, over it refused; long refusals realigned only on a calm, still trunk, otherwise slewed at 5°/s). `[trunk_imu] bno08x_fusion = "chip"` (default) publishes the chip's orientation exactly as before, the fused one only in diagnostics (`busStatus` `native.imu_reader.fusion`, the state stream's `imu.fusion`); `"gyro"` publishes the fused one. `bno08x_raw_log = "<absolute path>"` appends every report to a CSV file, for settling the numbers on 100 Hz data. The installer keeps both keys. An older robotd ignores them with a warning and behaves as `chip`; no `API_VERSION` step, since only optional fields were added. Unit-tested and replayed on 50 Hz recordings only — not yet run on a robot. Order on a robot: shadow (chip) with the raw log, gyro standing, gyro walking A/B against chip, deliberate falls; back to chip at once on a standing tilt difference over 1°, a step over 5° while walking, `realign_long` rising while upright, more stale IMU samples, or `disabled`.
+4. **BNO085 gyro-integrated attitude** (optional, experimental): walking, the BNO085's own orientation sometimes jumps 20–60° within one tick while its gyro says the trunk barely turned. robotd integrates that gyro into an attitude of its own and checks every chip orientation against it (tilt under 6° taken slowly, over it refused; long refusals realigned only on a calm, still trunk, otherwise slewed at 5°/s). `[trunk_imu] bno08x_fusion = "chip"` (default) publishes the chip's orientation exactly as before, the fused one only in diagnostics (`busStatus` `native.imu_reader.fusion`, the state stream's `imu.fusion`); `"gyro"` publishes the fused one. `bno08x_raw_log = "<absolute path>"` appends every report to a CSV file, for settling the numbers on 100 Hz data. The installer keeps both keys. An older robotd ignores them with a warning and behaves as `chip`; no `API_VERSION` step, since only optional fields were added. Unit-tested and replayed on 50 Hz recordings only — not yet run on a robot. Set the keys with the `configure.dumps` snippet in §4.4, never by hand: a key written twice stops every robotd version, old or new, at startup step 1. Order on a robot: shadow (chip) with the raw log (move the old file away first: the 64 MB cap counts across restarts; if `gyro_gaps` or `realign_gap` rise while walking upright, fix the 100 ms host-time hole rule before trying gyro), gyro standing, gyro walking A/B against chip, deliberate falls. Back to chip at once on: a step over 5° in the published gravity on an upright walking tick (the realign after a fall is expected and does not count); `realign_long`, `realign_gap` or `fallback` rising in a block with neither a fall nor a relax (read the counts before relaxing); a `theta_deg` median over 0.5° or P90 over 1° in any 10 s standing window (not the single-tick maximum, which the chip's own jumps inflate); more stale IMU samples; or `disabled`. The step and standing checks are computed from recordings; the script is not published yet.
 
 Status: the IMU part (BNO085) runs on our robot on V167 (stood and walked, 2026-10-14). The gyro-integrated attitude has not run on a robot. LSM6DSV16X has only been tested against a fake bus. Tuning and the UDP pad pass their unit tests (and a host end-to-end run for the UDP pad) but have not run on a robot; the cross-built padd has never run on a board. The installer has only been tested on fake boards.
 

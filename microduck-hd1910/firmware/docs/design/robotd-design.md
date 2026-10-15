@@ -726,10 +726,11 @@ orientation, the samples field for field what they were before the fusion existe
 against a frozen copy of the old assembler over random packet streams); `gyro`, the fused
 attitude. Everything else about a sample — when there is one, its rate, its age, its sequence —
 is the same in both. Commissioning and `verify-imu` always measure the chip's own orientation
-(`HostImuSample::chip_quat`). The numbers are an initial setting from a 50 Hz replay of recorded
-walks; `[trunk_imu] bno08x_raw_log` names a CSV file every report is appended to (a bounded
-queue and a writer thread of its own, so the reader never waits on a disk: a full queue drops
-and counts; 64 MB cap), for settling them on 100 Hz data
+(`HostImuSample::chip_quat`), and the read-only service reports it as the raw value it says it
+is. The numbers are an initial setting from a 50 Hz replay of recorded walks;
+`[trunk_imu] bno08x_raw_log` names a CSV file every report is appended to (a bounded queue and
+a writer thread of its own, so the reader never waits on a disk: a full queue drops and counts;
+64 MB cap), for settling them on 100 Hz data
 ([`trunk-imu-i2c.zh-CN.md`](../project/trunk-imu-i2c.zh-CN.md)).
 
 **Each source has its own mount**, because the sensors sit in different places: the calibration
