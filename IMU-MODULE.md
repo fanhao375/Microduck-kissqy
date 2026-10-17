@@ -23,7 +23,7 @@
 
 V167 本身的「修复鸭身抖动」（每次上力把舵机 RAM 里的 D 写成 0、转矩限制写成 1000）原样保留。
 
-## 现在的状态（2026-10-15）
+## 现在的状态（2026-10-17）
 
 | | 状态 |
 |---|---|
@@ -31,8 +31,9 @@ V167 本身的「修复鸭身抖动」（每次上力把舵机 RAM 里的 D 写�
 | 舵机调参 | 单元测试过：不设参数文件时，上力 / 卸力发到串口的每一帧跟 kissqy 原版 V167 逐字节相同（同一个测试在原版代码上也通过）；诊断输出只多一个 `native.hd1910.servo_parameters: null`。10-15 这一版的 robotd 已在板上跑，但没设参数文件，只走了「不设文件」那条路（上力日志 `RAM D=0 and limit=1000 written`）；**设了参数文件的那条路还没上真机** |
 | UDP 手柄 / 掉线坐下 | padd 单元测试 79 项、电脑上的端到端联调 14 项（假 robotd + 模拟 duckctl）都过；10-15 这一版的 padd 已在板上跑，蓝牙手柄（G50 Pro）开着鸭子走了十几分钟；**UDP 手柄（默认关）和掉线坐下还没在真机上试过** |
 | LSM6DSV16X | 只对模拟总线测过，**没上过真机** |
+| 安装脚本自动识别（`detect` / `install … auto`，10-17） | 只在假板子上测过（假 I²C 总线，新增 51 项），**没上过真机**。同一次改动修了安装脚本一个老问题：它的进度和失败原因以前只写进日志文件、终端上看不到，现在两边都有 |
 | BNO085 陀螺积分姿态 | **10-15 晚上过真机**（新卡，全默认参数，硅胶脚）：`chip` 模式推摇杆 9 s 摔 2 次；`gyro` 模式推摇杆 60 s 一次没摔，在 walk 模式里直立 634 s（推杆 60 s）只摔 1 次，同期芯片乱跳 745 次，策略那一路没跟着跳；静站时跟芯片的倾斜差最差 10 s 窗口中位 0.026°；计数里没有整步对齐、空档、出错。**没做完整的轮流 A/B**（现场看差别太大，直接定用 `gyro`）。默认仍是 `chip`，要自己切。原始报告落盘真机跑过（一个文件约 37 MB，没丢行），只用来核对了停止规则，还没用来重定门限。见 4.4 节和[上机记录](https://github.com/fanhao375/microduck-replica/blob/master/docs/HD1910-20261015-IMU乱跳根因与陀螺融合上机.md) |
-| 安装脚本 `imu-module-install.sh` | 在假板子上测过 73 项（模拟 systemd 和 robotd）；10-15 在真板上装这一版，`check`、`install` 一次通过，没触发撤回；**`rollback` 还没在真板上跑过**。上一版在真板上暴露的两个问题已改：robotd 卡在「等总线」时卸力确认必失败；kissqy 中控升级后清单里本来就有对不上的行，全量核对必失败 |
+| 安装脚本 `imu-module-install.sh` | 在假板子上测过 124 项（模拟 systemd 和 robotd，其中 73 项是 10-15 那一版就有的）；10-15 在真板上装这一版，`check`、`install` 一次通过，没触发撤回；**`rollback` 还没在真板上跑过**。上一版在真板上暴露的两个问题已改：robotd 卡在「等总线」时卸力确认必失败；kissqy 中控升级后清单里本来就有对不上的行，全量核对必失败 |
 | 已知问题 | ① IMU 偶尔有过期帧，约 1.7%（当时主板过热降频，没分清原因）；② `verify-imu` 只能在调试模式下做，而调试模式一启动就卸力（见第 3 节）；③ V167 默认的 P5 / D0 在我们的鸭子上策略站立时，机身前后约 2.5 Hz 晃动（俯仰角速度 RMS 约 12°/s；旧卡 P3 / D0 / 转矩 700 时约 1～2°/s），要用调参在同一张卡上对比；④ 转向弱：原地转只有指令的四分之一左右，边走边转基本不转；关节只跟到目标的 30～55%（髋横滚）到 45～55%（髋俯仰、膝），跟 IMU 无关；⑤ 10-15 新卡又整机重启一次（站着、没推摇杆，电池 7.59 V），掉电还是死机没定 |
 
 实施记录、跟计划的出入、还没验证的项：[IMU 部分](microduck-hd1910/firmware/docs/project/trunk-imu-i2c.zh-CN.md)、[调参与 UDP 手柄部分](microduck-hd1910/firmware/docs/project/replica-v167.zh-CN.md)。机制本身：[`robotd-design.md` §2.6](microduck-hd1910/firmware/docs/design/robotd-design.md)（IMU）、同一文件「R17 HD1910 合同 P（control.33）」一节的 fork 注（调参）、[`docs/robot/udp-pad.md`](microduck-hd1910/firmware/docs/robot/udp-pad.md)（UDP 手柄）。
@@ -49,6 +50,9 @@ V167 本身的「修复鸭身抖动」（每次上力把舵机 RAM 里的 D 写�
 | 官方 HAT 的 J5（40 针 3 / 5 脚） | I2C3，`/dev/i2c-3` | kissqy 的镜像默认已经开了 `i2c3-pihat`，不用改 | 没测过 |
 
 - **J5 那条线上已经有板载芯片**，地址别撞：C1 版 HAT 有音频 aic3104（0x18）、BMI088（0x19 / 0x68）；D1 版 HAT 有板载 LSM6DSV16X（0x6A）。BNO085（0x4A / 0x4B）两版都不撞；**D1 上的 LSM6DSV16X 模块必须用 0x6B**（模块的 SA0 接高）。接之前 `i2cdetect -y 3` 看一眼已占的地址；
+- **J5 线序**（JST SH 1.0 mm 4 针）：1 GND、2 3.3 V、3 SDA、4 SCL；
+- **只用 J5 和 27 / 28 脚**：HAT 上的 J6 / J7 / J8 也是这种 4 针口，但在 Zero 3W 上凑不成 I²C（J6 默认接 40 针 7 / 29 脚，要改 DNP 的 R16 / R17 才接到 27 / 28；J7 接 24 / 21；J8 接 19 / 23），安装脚本的自动识别也不探它们；
+- **以后要加 ToF**：ToF 也走 J5 这条线。建议 IMU 留在 J5，ToF 改到 I2C4：tofd 加 `--bus /dev/i2c-4`。副作用：`--bus` 同时决定 tofd 去哪条线上找头部 IMU，C1 上 `head_imu.stream` 就找不到 BMI088 了（`[head_imu]` 默认关，影响小）。不建议 ToF 和 IMU 挤在一条线上：ToF 开机要往芯片里灌好几秒固件；
 - **开 `i2c4-m0`**（用 27 / 28 脚时）：
   - kissqy 原版镜像（Armbian 引导）：在 `/boot/armbianEnv.txt` 的 `overlays=` 那一行加上 `i2c4-m0`，重启（这条我们没在原版引导上试过）；
   - V1.12 主板换了瑞莎引导的（microduck-replica 的 [`tools/radxa/kissqy-r1-v112.sh`](https://github.com/fanhao375/microduck-replica/tree/master/tools/radxa)）：做卡时加 `--overlay i2c4-m0`；已经做好的卡，要改 `/boot/extlinux/extlinux.conf` 的 `fdtoverlays`，`armbianEnv.txt` 不生效；
@@ -77,7 +81,25 @@ cargo board --locked -p robotd -p robotctl -p padd   # 产物在 target/aarch64-
 - `microduck-hd1910/firmware/packaging/` 下的 `calibration-config.py`、`rebuild-config.py`、`runtime.py`、`voice-setup.py`、`service.sh`；
 - `microduck-hd1910/firmware/deploy/imu-module-install.sh`。
 
-**第 3 步：舵机电源开着，扶住鸭子（会卸力），在板上运行：**
+**第 3 步：舵机电源开着，扶住鸭子（装的时候会卸力），在板上先看接了什么，再装：**
+
+```bash
+sudo bash ~/replica/imu-module-install.sh detect                  # 只读：两条线上接了哪颗模块
+sudo bash ~/replica/imu-module-install.sh install ~/replica auto  # 恰好认出一颗才装
+```
+
+自动识别只探 J5（`/dev/i2c-3`）和 27 / 28 脚（`/dev/i2c-4`），别的线不碰；只读，不写芯片寄存器、不复位芯片：
+- **27 / 28 脚**：0x4A / 0x4B 上的 BNO08x、0x6A / 0x6B 上的 LSM6DSV16X 都算；
+- **J5**：0x4A / 0x4B 上的 BNO08x 算。LSM6DSV16X 看插的是哪版 HAT：
+  - 认出 C1（BMI088 的 0x19、0x68 两个地址都对上）：0x6A、0x6B 都算；
+  - 没认出 C1：0x6A 当成 D1 板载的头部 IMU，**永远不算**；0x6B 只有旁边有 D1 板载的那颗 0x6A 时才算；**J5 上只有一颗 0x6B 时拒绝**——R30 没焊好的 D1，板载的头部 IMU 会落到 0x6B。头部 IMU 当成躯干，后面确认安装方向也拦不住（方向按型号存，整只鸭子倾斜时头也跟着倾斜）；
+- 每个地址读两次，前后一样才算。有一条线被别的程序占着、读出错（EIO、超时都算，只有「没应答」才当没有）、有应答但认不出，都算「没探全」，不装；
+- **恰好一颗才装**。两颗及以上：列出每一颗和对应的显式命令，不替你选；一颗都没有：说清每条线看到了什么。都是什么都不改。`detect` 的退出码：0 一颗、2 多颗、3 没有、4 没探全或认不准；
+- `install … auto` 停服务之前先探一遍，明摆着装不了的，鸭子不用卸力就停。robotd 占着某条线时，先卸力、停 robotd，再探一遍，以这一遍为准；这一遍不行，服务按原样起回来。装完还要等 robotd 自己读 IMU 进入 `streaming`（最多 15 秒），不然自动撤回；
+- 接法变了（比如从 27 / 28 挪到 J5），而这个型号的方向以前确认过：照样装，但会醒目提醒重新确认（见第 3 节）；
+- 两条报错：「WHO_AM_I 不是 0x70」——LSM6DSV16X 可能停在嵌入功能的寄存器页，断电重上再试；「读到 ff ff ff ff」——BNO08x 正在复位，过几秒再试。
+
+显式写法照旧能用，自动识别认不准时用它（比如确认是 C1 HAT、只是 BMI088 读不出来）：
 
 ```bash
 sudo bash ~/replica/imu-module-install.sh install ~/replica bno08x /dev/i2c-4 0x4B
@@ -294,7 +316,7 @@ uvx duckctl@0.17.1 udp-pad 192.168.x.x     # 一定写鸭子的 IP；推杆前�
 
 - **别在 kissqy 的中控里点「安装 / 升级固件」**：它会装回他的 robotd（不认 IMU 模块，鸭子读不到 IMU、上不了力）和他的 padd，删掉参数文件；他的安装脚本还会把总线小板那份安装方向标成已确认、关掉运动开关，升级完多半报「启动超时」。点了也不要紧，重新跑一遍第 2 节的安装就行。kissqy 出新版时，等这里合进去再升；
 - **换了模块、拆装过，要重新确认安装方向**；
-- 别的程序在读同一个 I²C 节点时，robotd 打不开它，报错会说明（代码里说的 servo-web 是 microduck-replica 的网页调试台，它的 I²C 读 IMU 部分目前还没公开）；
+- 别的程序在读同一个 I²C 节点时，robotd 打不开它，报错会说明（代码里说的 servo-web 是 microduck-replica 的网页调试台，它的 I²C 读 IMU 部分目前还没公开）。`detect` 也拿同一把锁，只占几毫秒；碰巧撞上 robotd 重新打开设备时，robotd 的日志会说「servo-web 占着」，它会自己重试，没有影响；
 - 看板上跑的是不是这一版：`imu-module-install.sh check`，或者看 `robot.busStatus` 里有没有 `imu_source`、`native.hd1910.servo_parameters` 这两个字段（只有这一版有）。
 
 ## 7. 改了什么（修改说明）
@@ -310,7 +332,7 @@ uvx duckctl@0.17.1 udp-pad 192.168.x.x     # 一定写鸭子的 IP；推杆前�
 | `robotctl/src/configure.rs` | 认得 `[trunk_imu]`；`[netpad]` 改了之后提示重启 padd |
 | `padd/` | 新增 `src/loss.rs`（掉线坐下）、`src/udp.rs`、`src/udp/{health,receiver,wire}.rs`（UDP 手柄），移植自 Pollen Robotics 官方 microduck 0.17.1 的 `pad-map`、`netpadd`；`src/main.rs` 接入；`systemd/padd.service` 允许 AF_INET |
 | `packaging/` | IMU：`calibration-config.py`、`rebuild-config.py`（每种 IMU 一份安装方向，重装时保留）、`runtime.py`（启动配置允许 `char-i2c`，回读核对模块的安装方向）、`voice-setup.py`（没有 HAT 声卡时跳过音频设置）。调参与 UDP：`service.sh`（`servo-parameters`、`servo-parameters-clear`、`joint-filters`、`netpad`）、`runtime.py`（同上）、`padd.service`（AF_INET）、`fixtures/robotd-board-v167.toml`（板上真实的配置格式，测试用）。以及相应测试，新增 `test_tunable_parameters.py`、`test_netpad.py` |
-| `deploy/` | `robotd.toml` 加 `[trunk_imu]` 的说明（含两个融合键）；新增 `imu-module-install.sh`（装整套，重写 `[trunk_imu]` 时保留两个融合键）和它的假板子测试 `test-imu-module-install.sh` |
+| `deploy/` | `robotd.toml` 加 `[trunk_imu]` 的说明（含两个融合键）；新增 `imu-module-install.sh`（装整套，重写 `[trunk_imu]` 时保留两个融合键；10-17 加 `detect` 和 `install … auto` 自动识别模块）和它的假板子测试 `test-imu-module-install.sh` |
 | `test-data/bno08x-fusion-replay/` | 新增：4 段 BNO085 录像（CSV，约 300 KB），融合的回放测试用 |
 | `scripts/pad-link-test.sh` | 统计掉线时只数 padd 的 `pad gone —` |
 | `docs/` | `design/robotd-design.md`（§2.6，含陀螺积分姿态一段；padd 一段加掉线坐下和 UDP；control.33 一节加 fork 注）；新增 `robot/udp-pad.md`、`project/trunk-imu-i2c.zh-CN.md`、`project/replica-v167.zh-CN.md`；`README.md` 加索引 |
@@ -342,9 +364,9 @@ This is a fork maintained by [microduck-replica](https://github.com/fanhao375/mi
 
 4. **BNO085 gyro-integrated attitude** (optional, experimental): walking, the BNO085's own orientation sometimes jumps 20–60° within one tick while its gyro says the trunk barely turned. robotd integrates that gyro into an attitude of its own and checks every chip orientation against it (tilt under 6° taken slowly, over it refused; long refusals realigned only on a calm, still trunk, otherwise slewed at 5°/s). `[trunk_imu] bno08x_fusion = "chip"` (default) publishes the chip's orientation exactly as before, the fused one only in diagnostics (`busStatus` `native.imu_reader.fusion`, the state stream's `imu.fusion`); `"gyro"` publishes the fused one. `bno08x_raw_log = "<absolute path>"` appends every report to a CSV file, for settling the numbers on 100 Hz data. The installer keeps both keys. An older robotd ignores them with a warning and behaves as `chip`; no `API_VERSION` step, since only optional fields were added. On our robot on 2026-10-15 (default servo gains, silicone feet): in `chip` mode 9 s of pushing the stick gave 2 falls; in `gyro` mode 60 s of pushing gave none and 634 s in walk mode (60 s of it pushing the stick) one, while the chip jumped 745 times, none of which reached the policy; standing, the worst 10 s window differed from the chip by a 0.026° median; no realign, gap or fallback. No interleaved A/B was run — the difference was plain on site and we kept `gyro`. For a BNO085 we recommend `gyro`; the default stays `chip`. Set the keys with the `configure.dumps` snippet in §4.4, never by hand: a key written twice stops every robotd version, old or new, at startup step 1. Order on a robot: shadow (chip) with the raw log (move the old file away first: the 64 MB cap counts across restarts; if `gyro_gaps` or `realign_gap` rise while walking upright, fix the 100 ms host-time hole rule before trying gyro), gyro standing, gyro walking A/B against chip, deliberate falls. Back to chip at once on: a step over 5° in the published gravity on an upright walking tick with `realign_long`, `realign_gap`, `fallback` or `follow` within ±2 ticks (once is enough); with only `accepted`, `rejected` or `slew` around it, steps in the last 1 s before a fall or after a tick already tilted ≥ 30° do not count, and three or more of the rest in a block send it back (revised on 10-15: the recorded gyro is a median, a tick late, so a fast fall alone made the fused path miss by 5°; check the fused raw path against the next tick's gyro); `realign_long`, `realign_gap` or `fallback` rising in a block with neither a fall nor a relax (read the counts before relaxing); a `theta_deg` median over 0.5° or P90 over 1° in any 10 s standing window (not the single-tick maximum, which the chip's own jumps inflate); more stale IMU samples; or `disabled`. The step and standing checks are computed from recordings with microduck-replica's [`judge_block.py`](https://github.com/fanhao375/microduck-replica/blob/master/tools/radxa/onboard-analysis/judge_block.py) (standard library only).
 
-Status: the IMU part (BNO085) runs on our robot on V167 (stood and walked, 2026-10-14; this whole set reinstalled and walked on 2026-10-15). The gyro-integrated attitude ran on our robot on 2026-10-15 (results above). Known: turning is weak (the joints reach about half their targets; measured in `gyro` only, and unrelated to the IMU change as far as the code goes), and the board rebooted once on 10-15 (cause not settled). LSM6DSV16X has only been tested against a fake bus. Servo tuning ran on the board on 10-15 without a parameter file (with a file: not yet on a robot); this padd drove the duck over Bluetooth on 10-15 (the UDP pad and the pad-loss sit have not been tried on a robot); the installer installed this version on a real board on 10-15 at the first attempt (`rollback` not yet run on a real board).
+Status: the IMU part (BNO085) runs on our robot on V167 (stood and walked, 2026-10-14; this whole set reinstalled and walked on 2026-10-15). The gyro-integrated attitude ran on our robot on 2026-10-15 (results above). Known: turning is weak (the joints reach about half their targets; measured in `gyro` only, and unrelated to the IMU change as far as the code goes), and the board rebooted once on 10-15 (cause not settled). LSM6DSV16X has only been tested against a fake bus. Servo tuning ran on the board on 10-15 without a parameter file (with a file: not yet on a robot); this padd drove the duck over Bluetooth on 10-15 (the UDP pad and the pad-loss sit have not been tried on a robot); the installer installed this version on a real board on 10-15 at the first attempt (`rollback` not yet run on a real board). Since 10-17 the installer can find the module itself: `detect` (read only) and `install <dir> auto` look at `/dev/i2c-3` (HAT J5) and `/dev/i2c-4` (pins 27/28) and nowhere else, read every address twice, and install exactly one module or nothing (several: it lists them with their explicit commands; none, a bus held by another process, an error or an answer it does not recognise: nothing changes). On J5 a 0x6A LSM6DSV16X counts only beside a C1 HAT's BMI088 (0x19 and 0x68 both answering) — on a D1 HAT it is the head IMU — and a lone 0x6B is refused, since a D1 whose R30 is missing puts its head IMU there. After an auto install, robotd's own IMU reader must reach `streaming` within 15 s or the install rolls back. Tested on fake boards only. The same change makes the installer's progress lines and failure message reach the terminal (they only went to the log file before).
 
-Install on a duck already upgraded to V167 through kissqy's console: `python3 prepare-V167.py`, `sh scripts/cross-sysroot.sh` (export what it prints), `cargo board --locked -p robotd -p robotctl -p padd` (do not run `build-V167.sh`, and do not use `packaging/robotd` / `packaging/padd`, which are kissqy's); copy the three binaries, `calibration-config.py`, `rebuild-config.py`, `runtime.py`, `voice-setup.py`, `service.sh` and `deploy/imu-module-install.sh` to the board; with servo power on, `sudo bash imu-module-install.sh install <dir> bno08x /dev/i2c-4 0x4B`. It relaxes the robot according to its state, backs everything up, waits for robotd's four startup steps, checks busStatus and padd, and restores the backup by itself on any failure; `rollback <backup>` returns to the state before that install — use the backup this install printed: an older one may bring back kissqy's robotd, which cannot read the calibration's `[imu_mounts]` and waits for the bus forever (the script refuses that while the calibration has them). The calibration files themselves are never rolled back. It never marks the IMU mount verified — confirm it with `service.sh bus verify-imu --confirmed` in commissioning mode (upright, then tip nose-down 15–30° within 20 s), not through kissqy's console (it gives up after 15 s).
+Install on a duck already upgraded to V167 through kissqy's console: `python3 prepare-V167.py`, `sh scripts/cross-sysroot.sh` (export what it prints), `cargo board --locked -p robotd -p robotctl -p padd` (do not run `build-V167.sh`, and do not use `packaging/robotd` / `packaging/padd`, which are kissqy's); copy the three binaries, `calibration-config.py`, `rebuild-config.py`, `runtime.py`, `voice-setup.py`, `service.sh` and `deploy/imu-module-install.sh` to the board; with servo power on, `sudo bash imu-module-install.sh detect`, then `install <dir> auto` (or the explicit `install <dir> bno08x /dev/i2c-4 0x4B`). It relaxes the robot according to its state, backs everything up, waits for robotd's four startup steps, checks busStatus and padd, and restores the backup by itself on any failure; `rollback <backup>` returns to the state before that install — use the backup this install printed: an older one may bring back kissqy's robotd, which cannot read the calibration's `[imu_mounts]` and waits for the bus forever (the script refuses that while the calibration has them). The calibration files themselves are never rolled back. It never marks the IMU mount verified — confirm it with `service.sh bus verify-imu --confirmed` in commissioning mode (upright, then tip nose-down 15–30° within 20 s), not through kissqy's console (it gives up after 15 s).
 
 Do not press "install/upgrade firmware" in kissqy's console afterwards: it reinstalls his robotd, which cannot read the module, and his padd, and deletes the servo parameter file; if you did, run the installer again.
 
