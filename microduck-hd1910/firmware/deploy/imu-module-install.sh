@@ -64,7 +64,9 @@ log() {
     local level=$1 cat=$2 line; shift 2
     line=$(printf '%s [%s][%s] %s' "$(date '+%F %T')" "$level" "$cat" "$*")
     printf '%s\n' "$line" >>"$LOG"
-    { printf '%s\n' "$line" >&2; } 2>/dev/null || true
+    # >&2 first, then 2>/dev/null: the line reaches the terminal and only a failed write's own
+    # complaint is dropped (in a { ...; } 2>/dev/null group the line itself went to /dev/null).
+    printf '%s\n' "$line" >&2 2>/dev/null || true
 }
 say() { { printf '%s\n' "$*"; } 2>/dev/null || true; }   # stdout, same rule
 
@@ -105,7 +107,7 @@ die() {
             log ERROR rollback "撤回没有做完：请重跑 sudo bash $0 rollback $ROLLBACK_FROM"
         fi
     fi
-    { echo "失败：$2（日志：$LOG）" >&2; } 2>/dev/null || true
+    echo "失败：$2（日志：$LOG）" >&2 2>/dev/null || true   # same order as in log()
     exit 1
 }
 trap 'die unexpected "第 $LINENO 行意外退出（$BASH_COMMAND）"' ERR
