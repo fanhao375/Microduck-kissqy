@@ -15,7 +15,7 @@
 #   sudo bash imu-module-install.sh detect
 #        Read only: which trunk IMU module answers on /dev/i2c-3 (HAT J5) and /dev/i2c-4 (40-pin
 #        27/28), by the rules at probe_i2c. Exit 0 = exactly one, 2 = several, 3 = none,
-#        4 = not everything could be looked at (or a 0x6B on J5 that may be a D1 HAT's head IMU).
+#        4 = not everything could be looked at, or a 0x6B on J5 may be a D1 HAT's head IMU; 1 = failed.
 #   sudo bash imu-module-install.sh install <dir> auto
 #        The install below with the module detect finds; anything but exactly one stops it.
 #   sudo bash imu-module-install.sh install <dir> <bno08x|lsm6dsv16x> <i2c device> <address>
@@ -63,6 +63,7 @@ SOURCE_KIND=''     # bno08x / lsm6dsv16x, for the post-start check
 VERIFY_STREAMING=0 # install auto: the post-start check also waits for the IMU reader to stream
 FAKE_BUS=''        # tests only: I2C_FAKE, honoured off the real board paths (fake_bus_setup)
 DETECT_VERDICT='' DETECT_CANDS='' DETECT_HELD=0 DETECT_UNSURE='' DETECT_HINTS=''   # set by detect_run
+DETECT_HELD_BY='' DETECT_NCANDS=0 DETECT_OTHER=0                                    # set by detect_run
 INSTALL_SOURCE='' INSTALL_DEVICE='' INSTALL_ADDRESS='' MOVED_WARNING=''            # set by detect_take
 PARTOF_BEFORE=''   # units that are PartOf robotd, with their state before
 ROLLBACK_FROM=''   # the backup a manual rollback is restoring; an interrupted one says to run it again
@@ -499,9 +500,12 @@ PY
 #     C1 (BMI088 answering at BOTH 0x19 = 0x1E and 0x68 = 0x0F): 0x6A and 0x6B are both modules;
 #     otherwise 0x6A is the D1 HAT's own head IMU (SA0 to ground through R30), never a trunk module:
 #     0x6B is the module only with that 0x6A next to it; 0x6B alone is refused, since a D1 whose R30
-#     is missing puts its head IMU there, and a head IMU taken for the trunk is the one mistake the
-#     mount check that follows cannot catch (it is kept per chip type, and tilting the whole duck
-#     tilts the head too).
+#     is missing may put its head IMU there (SA0 then floats; no default level found in the datasheet),
+#     and a head IMU taken for the trunk is the one mistake the mount check that follows cannot catch
+#     (it is kept per chip type, and tilting the whole duck tilts the head too).
+#     What no rule can tell: a D1 whose R30 is missing (head IMU possibly at 0x6B) AND a module wrongly
+#     set to 0x6A look exactly like D1 + module, and 0x6B is taken; only the documented rule (on a D1
+#     the module is at 0x6B) covers it.
 # Read only, as robotd reads: the node flocked LOCK_EX|LOCK_NB, then per address I2C_SLAVE first —
 # EBUSY there means a kernel driver owns the address, and I2C_RDWR alone would not check that — then
 # a register read (pointer, repeated start, one byte) or one 4-byte read of a BNO08x header (robotd
@@ -512,7 +516,8 @@ PY
 # controller's). Anything that could not be looked at, or answered but was not recognised, makes the
 # verdict "unsure" and nothing is installed.
 # Prints LOG / WARN lines (each bus and address, errno names, raw bytes), CAND "<source> <device>
-# <decimal address>", HELD <device>, UNSURE <why>, HINT <advice>, and last VERDICT one|many|none|unsure.
+# <decimal address>", HELD <device> <holder's comm>, UNSURE <why>, HINT <advice>, COUNTS <candidates>
+# <unsure lines not from a held bus>, and last VERDICT one|many|none|unsure.
 probe_i2c() {
     python3 - "$FAKE_BUS" <<'PY'
 import ctypes, errno, fcntl, json, os, sys, time
@@ -552,9 +557,17 @@ class Dev:
         return data
     def close(self): os.close(self.fd)
 
+def fake_spec():
+    spec = json.load(open(FAKE))
+    after = spec.get('_after_stop')   # another bus once robotd is stopped: {"file": <robotd.active>, "bus": {...}}
+    if after and open(after['file']).read().strip() != 'active':
+        spec = dict(after['bus'], _ops_log=spec.get('_ops_log'))
+    return spec
+
 class FakeDev:
-    """Tests only: the same calls, answered from the I2C_FAKE file and failing with real errnos."""
-    spec = json.load(open(FAKE)) if FAKE else {}
+    """Tests only: the same calls, answered from the I2C_FAKE file and failing with real errnos.
+    A register or raw value may be a list: one element per read, the last repeating."""
+    spec = fake_spec() if FAKE else {}
     counts = {}
     def __init__(self, path):
         self.path, bus = path, self.spec.get(path)
@@ -568,6 +581,10 @@ class FakeDev:
         if self.spec.get('_ops_log'):
             with open(self.spec['_ops_log'], 'a') as f: f.write(f'{self.path} {text}\n')
     def fail(self, code): raise OSError(getattr(errno, code), code)
+    def nth(self, key, value):
+        if not isinstance(value, list): return value
+        n = self.counts[key] = self.counts.get(key, -1) + 1
+        return value[min(n, len(value) - 1)]
     def scripted(self, addr):   # errors: every access fails; flaky: one outcome per access, the last repeating
         key = f'{addr:#04x}'
         if key in self.bus.get('errors', {}): self.fail(self.bus['errors'][key])
@@ -583,27 +600,32 @@ class FakeDev:
         self.scripted(addr)
         regs = self.bus.get('regs', {}).get(f'{addr:#04x}')
         if regs is None: self.fail('ENXIO')
-        return int(regs.get(f'{reg:#04x}', '0x00'), 16)
+        return int(self.nth((self.path, 'reg', addr, reg), regs.get(f'{reg:#04x}', '0x00')), 16)
     def read4(self, addr):
         self.op(f'READ {addr:#04x}')
         self.scripted(addr)
         raw = self.bus.get('raw', {}).get(f'{addr:#04x}')
         if raw is None: self.fail('ENXIO')
-        return bytes.fromhex(raw)
+        return bytes.fromhex(self.nth((self.path, 'raw', addr), raw))
     def close(self): pass
 
 def holder(path):
-    """Who holds the node's flock, from /proc/locks: robotd, or servo-web's imu_i2c.py (python)."""
-    if FAKE: return (FakeDev.spec[path].get('held') or {}).get('by', '另一个进程')
+    """(comm, pid) of the process holding the node's flock, from /proc/locks: robotd, or servo-web's
+    imu_i2c.py (python3). A line reads "1: FLOCK ADVISORY WRITE <pid> <major>:<minor>:<inode> ...", the
+    device numbers in hex; both they and the inode must match. (None, None) when it cannot tell."""
+    if FAKE: return (FakeDev.spec[path].get('held') or {}).get('by'), None
     try:
-        inode = os.stat(path).st_ino
+        st = os.stat(path)
+        node = (os.major(st.st_dev), os.minor(st.st_dev), st.st_ino)
         with open('/proc/locks') as f:
             for line in f:
                 parts = line.split()
-                if len(parts) >= 6 and parts[1] == 'FLOCK' and int(parts[5].rsplit(':', 1)[1]) == inode:
-                    with open(f'/proc/{parts[4]}/comm') as c: return f'{c.read().strip()}，pid {parts[4]}'
+                if len(parts) < 6 or parts[1] != 'FLOCK': continue
+                major, minor, inode = parts[5].split(':')
+                if (int(major, 16), int(minor, 16), int(inode)) == node:
+                    with open(f'/proc/{parts[4]}/comm') as c: return c.read().strip(), parts[4]
     except (OSError, ValueError, IndexError): pass
-    return '另一个进程'
+    return None, None
 
 def header(b):
     length, channel = (b[0] | b[1] << 8) & 0x7FFF, b[2]
@@ -637,7 +659,7 @@ def look(dev, addr, reg):
     if same[0] != same[1]: return 'unstable', None, text
     return seen[0][0], seen[0][1], text
 
-cands, unsure, hints, buses = [], [], [], 0
+cands, unsure, hints, buses, held = [], [], [], 0, 0
 for path in BUSES:
     wire = 'J5（i2c3-pihat）' if path.endswith('3') else '40 针 27/28 脚（i2c4-m0）'
     try:
@@ -645,9 +667,10 @@ for path in BUSES:
     except FileNotFoundError:
         emit('WARN', f'{path} 不存在：{wire} 的 overlay 没开，这条线不探'); continue
     except BlockingIOError:
-        who = holder(path)
-        emit('WARN', f'{path} 被 {who} 占用（同一把 flock），这条线没探'); emit('HELD', path)
-        unsure.append(f'{path} 被 {who} 占用，没探'); continue
+        comm, pid = holder(path)
+        who = f'{comm}，pid {pid}' if comm and pid else comm or '另一个进程'
+        emit('WARN', f'{path} 被 {who} 占用（同一把 flock），这条线没探'); emit('HELD', f'{path} {comm or "?"}')
+        unsure.append(f'{path} 被 {who} 占用，没探'); held += 1; continue
     except OSError as e:
         emit('WARN', f'{path} 打不开（{ename(e)}）'); unsure.append(f'{path} 打不开（{ename(e)}）'); continue
     buses += 1
@@ -677,10 +700,18 @@ for path in BUSES:
                                                 'unstable': f'两次读得不一样：{text}'}.get(state, f'有应答，但 WHO_AM_I 不是 0x70：{text}'))
         if state == 'value':
             hints.append(f'{path} {addr:#04x} 的 WHO_AM_I 不是 0x70：LSM6DSV16X 可能停在嵌入功能的寄存器页，断电重上再试')
+        if state == 'busy' and path == '/dev/i2c-3' and addr == 0x6A:
+            hints.append('J5 的 0x6a 被内核驱动占着：D1 版 HAT 上可能是给板载 IMU 绑的驱动。'
+                         '确认躯干模块是 0x6B 后，用显式命令：install <文件目录> lsm6dsv16x /dev/i2c-3 0x6B')
     if path == '/dev/i2c-4':
         cands += [('lsm6dsv16x', path, a) for a in lsm]
         continue
     c1 = found[ACC][:2] == ('value', ACC_ID) and found[GYRO][:2] == ('value', GYRO_ID)
+    for addr in (ACC, GYRO):   # EBUSY or no answer: just no C1; an error or a wavering answer: a bad bus
+        state, value, text = found[addr]
+        if state in ('error', 'unstable'):
+            unsure.append(f'{path} {addr:#04x}（BMI088 的地址）' + ('读出错' if state == 'error' else '两次读得不一样')
+                          + f'：{text}；这条线本身可能有问题，别的地址的「没应答」也不可信')
     emit('LOG', f'{path}：' + ('认出 C1 版 HAT（BMI088 0x19 = 0x1e，0x68 = 0x0f）' if c1 else
                               '没认出 C1 版 HAT（BMI088 的 0x19 = 0x1e、0x68 = 0x0f 没有同时对上）'))
     if c1:
@@ -703,6 +734,7 @@ if not buses and not unsure:
 for source, path, addr in cands: emit('CAND', f'{source} {path} {addr}')
 for why in unsure: emit('UNSURE', why)
 for hint in hints: emit('HINT', hint)
+emit('COUNTS', f'{len(cands)} {len(unsure) - held}')
 emit('VERDICT', 'unsure' if unsure else 'one' if len(cands) == 1 else 'many' if cands else 'none')
 PY
 }
@@ -723,6 +755,7 @@ fake_bus_setup() {
 detect_run() {
     local out rc=0 line
     DETECT_VERDICT='' DETECT_CANDS='' DETECT_HELD=0 DETECT_UNSURE='' DETECT_HINTS=''
+    DETECT_HELD_BY='' DETECT_NCANDS=0 DETECT_OTHER=0
     out=$(probe_i2c 2>>"$LOG") || rc=$?
     [ "$rc" = 0 ] || die detect "探测程序本身出错（$1，退出码 $rc，见日志）"
     while IFS= read -r line; do
@@ -730,7 +763,8 @@ detect_run() {
             'LOG '*) log INFO detect "${line#LOG }" ;;
             'WARN '*) log WARN detect "${line#WARN }" ;;
             'CAND '*) DETECT_CANDS+="${line#CAND }"$'\n' ;;
-            'HELD '*) DETECT_HELD=1 ;;
+            'HELD '*) DETECT_HELD=1; DETECT_HELD_BY+="${line#HELD }"$'\n' ;;
+            'COUNTS '*) read -r DETECT_NCANDS DETECT_OTHER <<<"${line#COUNTS }" ;;
             'UNSURE '*) DETECT_UNSURE+="${line#UNSURE }"$'\n'; log WARN detect "认不准：${line#UNSURE }" ;;
             'HINT '*) DETECT_HINTS+="${line#HINT }"$'\n' ;;
             'VERDICT '*) DETECT_VERDICT=${line#VERDICT } ;;
@@ -770,13 +804,33 @@ cmd_detect() {
     [ $# -eq 0 ] || die usage '用法：detect（不带参数）'
     need_root
     fake_bus_setup
-    take_lock   # an install's probe and this one never meet; it is held for milliseconds
+    take_lock   # an install's probe and this one never meet; held for a few tenths of a second
     detect_run detect   # every bus and address is on the terminal already, through log
     local summary
     summary=$(detect_summary '<文件目录>')
-    log INFO detect "$(echo $summary)"
+    log INFO detect "$(tr '\n' ' ' <<<"$summary")"
     say "$summary"
     case $DETECT_VERDICT in one) exit 0 ;; many) exit 2 ;; none) exit 3 ;; unsure) exit 4 ;; esac
+}
+
+# install auto, first pass (robotd still running): relaxing the duck for a second look is worth it only
+# when the one thing in the way is robotd holding a bus. Prints why not (for die); 0 = go on.
+first_pass_blocker() {
+    local device comm others=''
+    [ "$DETECT_VERDICT" = one ] && return 0
+    if [ "$DETECT_HELD" = 0 ]; then echo '（停服务之前就已经清楚，鸭子没有卸力）'; return 1; fi
+    while read -r device comm; do
+        [ -n "$device" ] || continue
+        [ "$comm" = robotd ] || others+=" $device（$comm）"
+    done <<<"$DETECT_HELD_BY"
+    if [ -n "$others" ]; then
+        echo "占着线的不是 robotd：$others。停 robotd 也放不开，先停掉它再来（鸭子没有卸力）"; return 1
+    fi
+    if [ "$DETECT_NCANDS" -ge 2 ]; then echo '已经认出两颗以上，停了 robotd 也只会一样多或更多（鸭子没有卸力）'; return 1; fi
+    if [ "$DETECT_OTHER" -gt 0 ]; then
+        echo '除了 robotd 占着的线，别处还有没探全或认不准的，停了 robotd 也解决不了（鸭子没有卸力）'; return 1
+    fi
+    return 0
 }
 
 # install auto: the module detect_run found, into source / device / address and SOURCE_KIND, in the
@@ -992,7 +1046,7 @@ check_source() {   # source device address(decimal) auto
 }
 
 cmd_install() {
-    local src source='' device='' address='' auto=0 f
+    local src source='' device='' address='' auto=0 f first_cands='' first_held=0 why
     if [ $# -eq 2 ] && [ "$2" = auto ]; then
         src=$1 auto=1
     elif [ $# -eq 4 ]; then
@@ -1060,10 +1114,11 @@ PY
     log INFO precheck '检查通过'
 
     if [ "$auto" = 1 ]; then
-        # A first look while robotd still runs: a plain answer (none, several, unsure with no bus held)
-        # stops here, before the duck is relaxed for nothing. A bus robotd holds is looked at below.
+        # A first look while robotd still runs: unless robotd holding a bus is all that is in the way,
+        # the answer is already final and stops here, before the duck is relaxed for nothing.
         detect_run '停服务之前'
-        if [ "$DETECT_HELD" = 0 ] && [ "$DETECT_VERDICT" != one ]; then die detect "$(detect_summary "$src")"; fi
+        first_cands=$DETECT_CANDS first_held=$DETECT_HELD
+        why=$(first_pass_blocker) || die detect "$(detect_summary "$src")"$'\n'"$why"
     fi
 
     relax_and_stop
@@ -1072,6 +1127,9 @@ PY
         # The one that counts: robotd is stopped, so nothing of ours holds a bus any more.
         detect_run '停了 robotd 之后'
         [ "$DETECT_VERDICT" = one ] || die detect "$(detect_summary "$src")"
+        if [ "$first_held" = 0 ] && [ "$DETECT_CANDS" != "$first_cands" ]; then   # the same bus, looked at twice
+            die detect "停 robotd 前后两遍看到的不一样（之前：$(tr '\n' ' ' <<<"$first_cands")；之后：$(tr '\n' ' ' <<<"$DETECT_CANDS")）：总线或接线可能在变，不装"
+        fi
         detect_take
         source=$INSTALL_SOURCE device=$INSTALL_DEVICE address=$INSTALL_ADDRESS
         check_source "$source" "$device" "$address" 1
@@ -1172,5 +1230,5 @@ case ${1:-} in
     detect) shift; cmd_detect "$@" ;;
     install) shift; cmd_install "$@" ;;
     rollback) shift; cmd_rollback "$@" ;;
-    *) sed -n '2,34p' "$0"; exit 2 ;;
+    *) sed -n '2,34p' "$0"; exit 1 ;;
 esac
