@@ -94,7 +94,8 @@ def report():
             if scenario.get('servo_parameters_key', True): hd['servo_parameters'] = None
             r['native'] = {'torque_state_confirmed': state['torque'], 'imu_source': scenario.get('imu_source', 'bno08x'),
                            'gain_mode': scenario.get('gain_mode', 'hd1910_model_contract_p_restore_on_relax_native_d_torque_limit_preserved'),
-                           'hd1910': hd}
+                           'hd1910': hd,
+                           'imu_reader': {'state': scenario.get('imu_reader_state', 'streaming'), 'last_fault': None}}
         return r
 
 class Handler(socketserver.StreamRequestHandler):
@@ -139,6 +140,7 @@ EOF
 board() {   # a fresh fake board at $R; $1 = a (NO_SYSTEMD) | b (stubbed systemd + fake robotd);
             # $2 = original: kissqy's robotd installed instead of the IMU-only one
     stop_fake
+    unset I2C_FAKE   # a fake I2C bus is per board (fakebus)
     R=$W/board-$((++BOARDS)); mkdir -p "$R"/{opt,etc,src,systemd,bin,units}
     cp -a "$KISSQY/." "$R/opt/"
     if [ "${2:-}" != original ]; then
@@ -462,6 +464,139 @@ board b
 fake_before '{"mode": "motion", "phase": "control", "armed": true, "restore_delay": 3}'
 hangup_after '运动模式控制中'; rc=$?
 ok "B 等卸力时断线（padd 已停）→ 照样装完，服务都起来" "[ $rc -eq 0 ] && ! grep -q '意外退出' $R/install.log && [ \"\$(cat $R/units/robotd.active)\" = active ] && [ \"\$(cat $R/units/padd.active)\" = active ]"
+
+# --- auto / detect: the module found on a fake I2C bus (I2C_FAKE, read by probe_i2c's FakeDev) ----
+fakebus() { printf '%s\n' "$1" > "$R/bus.json"; export I2C_FAKE=$R/bus.json; }
+C1='"0x19": {"0x00": "0x1e"}, "0x68": {"0x00": "0x0f"}'   # the C1 HAT's BMI088, both halves
+L6A='"0x6a": {"0x0f": "0x70"}' L6B='"0x6b": {"0x0f": "0x70"}' BNO='"raw": {"0x4b": "14010000"}'
+trunk_is() { toml x "t=d.get('trunk_imu') or {};assert (t.get('source'),t.get('i2c_device'),t.get('i2c_address'))==($1),t" "$R/etc/$2"; }
+untouched() { [ "$(state)" = "$1" ] && ! grep -q trunk_imu "$R/etc/robotd.toml" && ! ls -d "$R"/imu-module-backup-* >/dev/null 2>&1; }
+auto_ok() {   # name, bus JSON, expected "'source','device',address"
+    board a; fakebus "$2"
+    bash "$SCRIPT" install "$R/src" auto >"$R/out.txt" 2>&1; rc=$?
+    ok "auto $1 → 装成 $3" "[ $rc -eq 0 ] && trunk_is \"$3\" robotd.toml && trunk_is \"$3\" robotd.saved.toml && grep -q '按识别到的装' $R/install.log && grep -q '测试模式：总线是假的' $R/install.log"
+}
+auto_refused() {   # name, bus JSON, text the log must contain
+    board a; fakebus "$2"; local before; before=$(state)
+    bash "$SCRIPT" install "$R/src" auto >"$R/out.txt" 2>&1; rc=$?
+    ok "auto $1 → 拒绝，什么都没改" "[ $rc -ne 0 ] && untouched $before && grep -qF \"$3\" $R/install.log"
+}
+
+auto_ok 'J5：C1 + 0x6B' '{"/dev/i2c-3": {"busy": ["0x18"], "regs": {'"$C1, $L6B"'}}, "/dev/i2c-4": {}}' "'lsm6dsv16x','/dev/i2c-3',107"
+ok "auto 打印识别到的模块（地址十六进制）、接法没变就不警告" "grep -q 'IMU 模块（自动识别）：lsm6dsv16x /dev/i2c-3 0x6b' $R/out.txt && grep -q '按识别到的装：lsm6dsv16x /dev/i2c-3 0x6b' $R/install.log && ! grep -q '接法变了' $R/install.log"
+ok "auto 进度和每个地址的读数写到终端（log 的终端输出修好了）" "grep -q '\[detect\] /dev/i2c-3 0x6b WHO_AM_I：0x70 / 0x70' $R/out.txt"
+auto_ok 'J5：C1 + 0x6A' '{"/dev/i2c-3": {"regs": {'"$C1, $L6A"'}}}' "'lsm6dsv16x','/dev/i2c-3',106"
+auto_ok 'J5：D1 板载 0x6A + 模块 0x6B' '{"/dev/i2c-3": {"regs": {'"$L6A, $L6B"'}}, "/dev/i2c-4": {}}' "'lsm6dsv16x','/dev/i2c-3',107"
+ok "auto D1：日志写明 0x6a 当头部 IMU 跳过" "grep -q '0x6a 当作 D1 版 HAT 板载的头部 IMU 跳过' $R/install.log"
+auto_ok '27/28：BNO085 0x4B' '{"/dev/i2c-4": {'"$BNO"'}}' "'bno08x','/dev/i2c-4',75"
+auto_ok '27/28：LSM6DSV16X 0x6A' '{"/dev/i2c-4": {"regs": {'"$L6A"'}}, "/dev/i2c-3": {"regs": {'"$C1"'}}}' "'lsm6dsv16x','/dev/i2c-4',106"
+auto_ok 'J5：C1 + BNO 0x4A' '{"/dev/i2c-3": {"regs": {'"$C1"'}, "raw": {"0x4a": "00000000"}}}' "'bno08x','/dev/i2c-3',74"
+
+auto_refused 'J5 只有 D1 板载 0x6A' '{"/dev/i2c-3": {"regs": {'"$L6A"'}}, "/dev/i2c-4": {}}' 'D1 版 HAT 板载的头部 IMU，不是躯干模块'
+ok "auto D1 只有板载：提示 D1 上模块必须 0x6B" "grep -q '躯干模块必须设成 0x6B' $R/install.log"
+auto_refused 'J5 只有 0x6B、没认出 C1（R30 没焊的 D1）' '{"/dev/i2c-3": {"regs": {'"$L6B"'}}}' '分不清它是躯干模块还是头部 IMU'
+auto_refused '半个 C1（0x68 没应答）+ 0x6A' '{"/dev/i2c-3": {"regs": {"0x19": {"0x00": "0x1e"}, '"$L6A"'}}}' '没认出 C1 版 HAT'
+auto_refused 'BMI088 两个地址 EBUSY + 0x6A' '{"/dev/i2c-3": {"regs": {'"$C1, $L6A"'}, "busy": ["0x19", "0x68"]}}' '没认出 C1 版 HAT'
+auto_refused 'C1 + 0x6A + 0x6B' '{"/dev/i2c-3": {"regs": {'"$C1, $L6A, $L6B"'}}}' '找到 2 颗 IMU 模块'
+auto_refused 'BNO（27/28）+ D1 + 模块 0x6B' '{"/dev/i2c-4": {'"$BNO"'}, "/dev/i2c-3": {"regs": {'"$L6A, $L6B"'}}}' '找到 2 颗 IMU 模块'
+ok "auto 多颗：只给真候选的命令（0x6b、0x4b），跳过的 0x6a 没有命令" "grep -q 'install $R/src lsm6dsv16x /dev/i2c-3 0x6b' $R/install.log && grep -q 'install $R/src bno08x /dev/i2c-4 0x4b' $R/install.log && ! grep -q 'install $R/src lsm6dsv16x /dev/i2c-3 0x6a' $R/install.log"
+auto_refused '两条线都不存在' '{}' '都不存在'
+auto_refused '两条线都空' '{"/dev/i2c-3": {}, "/dev/i2c-4": {}}' '两条线上都没找到躯干 IMU 模块'
+auto_refused '27/28 被 python3 占着、J5 上 C1 + 0x6B' '{"/dev/i2c-4": {"held": {"by": "python3"}}, "/dev/i2c-3": {"regs": {'"$C1, $L6B"'}}}' '被 python3 占用'
+auto_refused '27/28 打不开（EACCES）、J5 上 C1 + 0x6B' '{"/dev/i2c-4": {"open_error": "EACCES"}, "/dev/i2c-3": {"regs": {'"$C1, $L6B"'}}}' '打不开（EACCES）'
+auto_refused '0x4B ETIMEDOUT、J5 上 C1 + 0x6B' '{"/dev/i2c-4": {"errors": {"0x4b": "ETIMEDOUT"}}, "/dev/i2c-3": {"regs": {'"$C1, $L6B"'}}}' 'ETIMEDOUT'
+auto_refused '0x6B EIO（不当没有）、27/28 上 BNO' '{"/dev/i2c-3": {"regs": {'"$C1"'}, "errors": {"0x6b": "EIO"}}, "/dev/i2c-4": {'"$BNO"'}}' '读出错：出错（EIO）'
+auto_refused '0x6B WHO_AM_I 读到 0x6c' '{"/dev/i2c-3": {"regs": {'"$C1"', "0x6b": {"0x0f": "0x6c"}}}}' 'WHO_AM_I 不是 0x70'
+auto_refused 'BNO 头通道 9' '{"/dev/i2c-4": {"raw": {"0x4b": "14000900"}}}' '不像 BNO08x'
+auto_refused '0x4B 两次读数不一致（一次应答一次没有）' '{"/dev/i2c-4": {'"$BNO"', "flaky": {"0x4b": ["ok", "ENXIO"]}}}' '两次读得不一样'
+
+board a; before=$(state)
+fakebus '{"_ops_log": "'"$R"'/ops.log", "/dev/i2c-3": {"regs": {'"$C1, $L6B"'}, "busy": ["0x6b"]}}'
+bash "$SCRIPT" install "$R/src" auto >/dev/null 2>&1; rc=$?
+ok "auto 候选地址 0x6b EBUSY → 拒绝；先 I2C_SLAVE 拿到 EBUSY，这个地址一次读都没做" "[ $rc -ne 0 ] && untouched $before && grep -q '被内核驱动占着' $R/install.log && grep -q '/dev/i2c-3 SLAVE 0x6b' $R/ops.log && ! grep -q '/dev/i2c-3 \(RDWR\|READ\) 0x6b' $R/ops.log"
+
+board a; before=$(state)
+bash "$SCRIPT" install "$R/src" auto extra >/dev/null 2>&1; rc1=$?
+bash "$SCRIPT" install "$R/src" >/dev/null 2>&1; rc2=$?
+bash "$SCRIPT" install "$R/src" bno08x /dev/i2c-4 >/dev/null 2>&1; rc3=$?
+ok "用法：auto 多一个参数 / 只给目录 / 显式少地址 → 用法错，什么都没改" "[ $rc1 -ne 0 ] && [ $rc2 -ne 0 ] && [ $rc3 -ne 0 ] && untouched $before && [ \$(grep -c '用法：install <文件目录> auto' $R/install.log) -eq 3 ]"
+
+board a; fakebus '{"/dev/i2c-3": {"regs": {'"$C1, $L6B"'}}}'
+CONFIG_DIR=/etc/robot/feetech-ft5 INSTALL_DIR=/opt/robot/feetech-ft5-r5 bash "$SCRIPT" detect >/dev/null 2>&1; rc=$?
+ok "I2C_FAKE 在真路径上不认（die，退出码 1）" "[ $rc -eq 1 ] && grep -q 'I2C_FAKE 只给假板子测试用' $R/install.log"
+
+detect_rc() {   # bus JSON -> sets rc, out; checks nothing changed
+    fakebus "$1"; out=$(bash "$SCRIPT" detect 2>"$R/detect.err"); rc=$?
+}
+board a; before=$(state)
+detect_rc '{"/dev/i2c-3": {"regs": {'"$C1, $L6B"'}}}'
+ok "detect 一颗 → 0，打印识别到的（十六进制），每个地址的读数在终端" "[ $rc -eq 0 ] && grep -q '识别到：lsm6dsv16x /dev/i2c-3 0x6b' <<<\"\$out\" && grep -q '/dev/i2c-3 0x19 chip ID：0x1e / 0x1e' $R/detect.err"
+detect_rc '{"/dev/i2c-3": {"regs": {'"$C1, $L6A, $L6B"'}}}'
+ok "detect 多颗 → 2，列出两条命令" "[ $rc -eq 2 ] && [ \$(grep -c 'install <文件目录> lsm6dsv16x /dev/i2c-3' <<<\"\$out\") -eq 2 ]"
+detect_rc '{"/dev/i2c-3": {}, "/dev/i2c-4": {}}'
+ok "detect 没有 → 3，提到总线小板不归这个脚本管" "[ $rc -eq 3 ] && grep -q 'ID 200' <<<\"\$out\""
+detect_rc '{"/dev/i2c-4": {"held": {"by": "robotd"}}, "/dev/i2c-3": {}}'
+ok "detect 没探全（被 robotd 占着）→ 4，说出是谁占着" "[ $rc -eq 4 ] && grep -q '被 robotd 占用' <<<\"\$out\""
+ok "detect 从头到尾什么都没改（没备份、没 trunk_imu、安装目录一样）" "untouched $before"
+for case in 00000000:0 04000000:0 00100000:0 14800000:0 01100000:4 ffffffff:4 14000600:4; do
+    detect_rc '{"/dev/i2c-4": {"raw": {"0x4b": "'"${case%%:*}"'"}}}'
+    ok "detect BNO 头 ${case%%:*} → 退出码 ${case##*:}" "[ $rc -eq ${case##*:} ]"
+done
+detect_rc '{"/dev/i2c-4": {"raw": {"0x4b": "ffffffff"}}}'
+ok "BNO 头 ff ff ff ff → 提示芯片可能正在复位" "[ $rc -eq 4 ] && grep -q '可能正在复位' <<<\"\$out\""
+
+board a
+for f in robotd.toml robotd.saved.toml; do printf '\n["trunk_imu"]\n"source" = "bno08x"\n"i2c_device" = "/dev/i2c-4"\n"i2c_address" = 75\n' >> "$R/etc/$f"; done
+fakebus '{"/dev/i2c-3": {"regs": {'"$C1"'}, "raw": {"0x4a": "14010000"}}, "/dev/i2c-4": {}}'
+out=$(bash "$SCRIPT" install "$R/src" auto 2>/dev/null); rc=$?
+ok "auto 接法变了（bno08x i2c-4 0x4B → i2c-3 0x4A）而方向是以前确认的 → 装上并醒目提醒重新确认" "[ $rc -eq 0 ] && trunk_is \"'bno08x','/dev/i2c-3',74\" robotd.toml && grep -q 'IMU 的接法变了' $R/install.log && grep -q '^注意：IMU 的接法变了' <<<\"\$out\""
+
+# B: stubbed systemd + fake robotd
+board b; orig=$(state)
+fake_before '{"mode": "motion", "phase": "control", "armed": true}'
+echo '{"mode": "motion", "phase": "control", "imu_source": "lsm6dsv16x"}' > "$R/robotd-after.json"
+fakebus '{"/dev/i2c-3": {"busy": ["0x18"], "regs": {'"$C1, $L6B"'}}, "/dev/i2c-4": {}}'
+out=$(bash "$SCRIPT" install "$R/src" auto 2>&1); rc=$?; BK=$(backup_of "$out")
+ok "B auto 控制中：先卸力确认、停 robotd，再识别，之后才备份；装成 lsm6dsv16x i2c-3 0x6B" "[ $rc -eq 0 ] && grep -q 'torque OFF, restore finished' $R/install.log && trunk_is \"'lsm6dsv16x','/dev/i2c-3',107\" robotd.toml && \"$PY\" -c \"
+log=open('$R/install.log',encoding='utf-8').read().splitlines()
+at=lambda s: next(i for i,l in enumerate(log) if s in l)
+order=[at('停服务之前：结论 one'),at('robotd 已停止'),at('停了 robotd 之后：结论 one'),at('按识别到的装'),at('已备份到')]
+assert order==sorted(order),order\""
+ok "B auto 启动核对等到 IMU 读取 streaming，imu_source = 识别出的型号" "grep -q '\"imu_source\": \"lsm6dsv16x\".*\"imu_reader\": \"streaming\"' $R/install.log"
+: > "$R/systemctl.log"
+bash "$SCRIPT" rollback "$BK" >/dev/null 2>&1; rc=$?
+ok "B auto 装完手动撤回 → 目录回原样、没有 trunk_imu" "[ $rc -eq 0 ] && [ \"\$(state)\" = $orig ] && ! grep -q trunk_imu $R/etc/robotd.toml"
+
+board b; orig=$(state)
+fake_before '{"mode": "motion", "phase": "control", "armed": true}'
+fakebus '{"/dev/i2c-3": {"regs": {'"$L6A"'}}, "/dev/i2c-4": {}}'
+bash "$SCRIPT" install "$R/src" auto >/dev/null 2>&1; rc=$?
+ok "B auto 停服务之前就明摆着没有 → 拒绝，一个服务都没停、没卸力" "[ $rc -ne 0 ] && untouched $orig && ! grep -q '^stop' $R/systemctl.log && ! grep -q robot.relax $R/robotd-calls.log && [ \"\$(cat $R/units/robotd.active)\" = active ]"
+
+board b; orig=$(state)
+fake_before '{"mode": "motion", "phase": "control", "armed": true}'
+fakebus '{"/dev/i2c-4": {"held": {"by": "robotd", "while_file": "'"$R"'/units/robotd.active"}, '"$BNO"'}, "/dev/i2c-3": {"busy": ["0x18"], "regs": {'"$C1"'}}}'
+out=$(bash "$SCRIPT" install "$R/src" auto 2>&1); rc=$?
+ok "B auto 27/28 被运行中的 robotd 占着 → 先卸力停 robotd，再探到 BNO 并装上" "[ $rc -eq 0 ] && grep -q '被 robotd 占用' $R/install.log && grep -q '停服务之前：结论 unsure' $R/install.log && grep -q '停了 robotd 之后：结论 one' $R/install.log && trunk_is \"'bno08x','/dev/i2c-4',75\" robotd.toml && grep -qx 'stop robotd.service' $R/systemctl.log"
+
+board b; orig=$(state)
+fake_before '{"mode": "motion", "phase": "control", "armed": true}'
+fakebus '{"/dev/i2c-4": {"held": {"by": "robotd", "while_file": "'"$R"'/units/robotd.active"}}, "/dev/i2c-3": {"regs": {'"$L6A"'}}}'
+bash "$SCRIPT" install "$R/src" auto >/dev/null 2>&1; rc=$?
+ok "B auto 停了 robotd 再探还是没有 → 拒绝，原来的 robotd / padd 按原样起回来，文件没动" "[ $rc -ne 0 ] && untouched $orig && grep -q '停了 robotd 之后：结论 none' $R/install.log && grep -q '原来的 robotd / padd 已重新启动' $R/install.log && [ \"\$(cat $R/units/robotd.active)\" = active ] && grep -qx 'restart padd.service' $R/systemctl.log"
+
+board b; orig=$(state)
+fake_before '{"mode": "motion", "phase": "control", "armed": true}'
+echo '{"mode": "motion", "phase": "control", "imu_source": "lsm6dsv16x", "imu_reader_state": "opening"}' > "$R/robotd-after.json"
+fakebus '{"/dev/i2c-3": {"regs": {'"$C1, $L6B"'}}}'
+bash "$SCRIPT" install "$R/src" auto >/dev/null 2>&1; rc=$?
+ok "B auto 装完 IMU 读取一直不是 streaming（15 秒）→ 失败并自动撤回" "[ $rc -ne 0 ] && grep -q 'IMU 读取 opening，不是 streaming' $R/install.log && grep -q '已撤回，板子回到安装前的样子' $R/install.log && [ \"\$(state)\" = $orig ]"
+
+board b; orig=$(state)
+fake_before '{"mode": "motion", "phase": "control", "armed": true}'
+bash "$SCRIPT" install "$R/src" bno08x /dev/null 0x4C >/dev/null 2>&1; rc=$?
+ok "B 显式写法地址 0x4C → 卸力之前就拒绝（来源检查没被挪到停服务之后）" "[ $rc -ne 0 ] && ! grep -q '^stop' $R/systemctl.log && ! grep -q robot.relax $R/robotd-calls.log && [ \"\$(state)\" = $orig ]"
+unset I2C_FAKE
 
 stop_fake
 echo "== $PASS passed, $FAIL failed, $SKIP skipped (work dir $W)"
