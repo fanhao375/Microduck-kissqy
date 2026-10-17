@@ -68,8 +68,10 @@ PARTOF_BEFORE=''   # units that are PartOf robotd, with their state before
 ROLLBACK_FROM=''   # the backup a manual rollback is restoring; an interrupted one says to run it again
 
 # The log file first; the terminal only if it is still there. After an ssh session drops (HUP is
-# ignored, so the run goes on), writing to the dead terminal fails with EIO: that must never reach the
-# ERR trap, or the automatic rollback would stop at its own first log line.
+# ignored, so the run goes on), writing to the dead terminal fails with EIO; when the output is a pipe
+# whose reader is gone (ssh without -t, or | tee, killed), with EPIPE (PIPE is ignored too, or the
+# signal would kill bash before || true). Neither may reach the ERR trap, or the automatic rollback
+# would stop at its own first log line.
 log() {
     local level=$1 cat=$2 line; shift 2
     line=$(printf '%s [%s][%s] %s' "$(date '+%F %T')" "$level" "$cat" "$*")
@@ -122,7 +124,7 @@ die() {
 }
 trap 'die unexpected "第 $LINENO 行意外退出（$BASH_COMMAND）"' ERR
 trap 'die signal "收到中断"' INT TERM
-trap '' HUP   # an ssh session that drops must not leave the board half installed
+trap '' HUP PIPE   # a dropped ssh session or a closed output pipe must not leave the board half installed
 
 need_root() { [ "$(id -u)" = 0 ] || [ "$NO_SYSTEMD" = 1 ] || die precheck '要用 root 运行（sudo bash …）'; }
 

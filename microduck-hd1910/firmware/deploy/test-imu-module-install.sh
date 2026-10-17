@@ -598,6 +598,34 @@ bash "$SCRIPT" install "$R/src" bno08x /dev/null 0x4C >/dev/null 2>&1; rc=$?
 ok "B 显式写法地址 0x4C → 卸力之前就拒绝（来源检查没被挪到停服务之后）" "[ $rc -ne 0 ] && ! grep -q '^stop' $R/systemctl.log && ! grep -q robot.relax $R/robotd-calls.log && [ \"\$(state)\" = $orig ]"
 unset I2C_FAKE
 
+# --- the output is a pipe whose reader is gone (ssh without -t killed, | tee killed): SIGPIPE ------
+board b; orig=$(state)
+fake_before '{"mode": "motion", "phase": "control", "armed": true}'
+printf '#!/bin/bash\nsleep 0.5\nexec /usr/bin/install "$@"\n' > "$R/bin/install"; chmod +x "$R/bin/install"
+bash "$SCRIPT" install "$R/src" bno08x /dev/null 0x4B 2>&1 | head -c 200 >/dev/null; rc=${PIPESTATUS[0]}
+rm -f "$R/bin/install"
+ok "B 输出管道的读端提前退出（显式写法）→ 照样装完：服务都起来、没有意外退出" "[ $rc -eq 0 ] && ! grep -q '意外退出' $R/install.log && cmp -s $R/opt/robotd $R/src/robotd && [ \"\$(cat $R/units/robotd.active)\" = active ] && grep -qx 'restart padd.service' $R/systemctl.log"
+
+board b; orig=$(state)
+fake_before '{"mode": "motion", "phase": "control", "armed": true}'
+echo '{"mode": "motion", "phase": "control", "imu_source": "lsm6dsv16x"}' > "$R/robotd-after.json"
+fakebus '{"/dev/i2c-3": {"regs": {'"$C1, $L6B"'}}, "/dev/i2c-4": {}}'
+printf '#!/bin/bash\nsleep 0.5\nexec /usr/bin/install "$@"\n' > "$R/bin/install"; chmod +x "$R/bin/install"
+bash "$SCRIPT" install "$R/src" auto 2>&1 | head -c 200 >/dev/null; rc=${PIPESTATUS[0]}
+rm -f "$R/bin/install"
+ok "B 输出管道的读端提前退出（auto）→ 照样装完" "[ $rc -eq 0 ] && ! grep -q '意外退出' $R/install.log && trunk_is \"'lsm6dsv16x','/dev/i2c-3',107\" robotd.toml && [ \"\$(cat $R/units/robotd.active)\" = active ] && grep -qx 'restart padd.service' $R/systemctl.log"
+
+board b; orig=$(state)
+fake_before '{"mode": "motion", "phase": "control", "armed": true}'
+fakebus '{"/dev/i2c-4": {"held": {"by": "robotd", "while_file": "'"$R"'/units/robotd.active"}}, "/dev/i2c-3": {"regs": {'"$L6A"'}}}'
+bash "$SCRIPT" install "$R/src" auto 2>&1 | head -c 200 >/dev/null; rc=${PIPESTATUS[0]}
+ok "B 输出管道的读端提前退出、停了 robotd 后识别失败 → 照样把原来的服务起回来" "[ $rc -eq 1 ] && untouched $orig && grep -q '原来的 robotd / padd 已重新启动' $R/install.log && [ \"\$(cat $R/units/robotd.active)\" = active ] && grep -qx 'restart padd.service' $R/systemctl.log"
+
+board a; fakebus '{"/dev/i2c-3": {"regs": {'"$C1, $L6B"'}}}'
+bash "$SCRIPT" detect 2>&1 | (exit 0); rc=${PIPESTATUS[0]}
+ok "detect 输出管道的读端一开始就没了 → 照样探完，退出码 0，日志写完结论" "[ $rc -eq 0 ] && grep -q 'detect：结论 one' $R/install.log"
+unset I2C_FAKE
+
 stop_fake
 echo "== $PASS passed, $FAIL failed, $SKIP skipped (work dir $W)"
 [ "$FAIL" = 0 ]
