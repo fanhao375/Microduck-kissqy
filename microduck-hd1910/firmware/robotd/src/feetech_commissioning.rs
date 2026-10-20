@@ -1547,6 +1547,14 @@ pub async fn run(
                 }),
                 updated_at_us: state.started.elapsed().as_micros() as u64,
             })));
+            // robot.busStatus serves the startup report while its phase is a startup one
+            // (`configuring_bus` from main.rs), and commissioning never replaced it: clients saw
+            // "configuring_bus" forever and never this snapshot (`ready`, `last_sample`). Once a
+            // read has succeeded, drop it — the same thing motion does after its first complete
+            // observation (`motion_report_started` in main.rs).
+            if total_success > 0 {
+                state.bus_status.store(None);
+            }
             next_publish = tick + Duration::from_millis(100);
         }
         if tick.elapsed() > period {
