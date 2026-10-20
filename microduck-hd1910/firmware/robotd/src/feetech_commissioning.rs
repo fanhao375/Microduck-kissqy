@@ -81,6 +81,27 @@ pub enum BusCommand {
         #[serde(default)]
         mount_wxyz: Vec<f64>,
     },
+    /// Ramp all fifteen joints together to the HOME pose and keep them there, torque on, so
+    /// the robot can stand for a standing IMU check without leaving commissioning. Holds until
+    /// `relax` (robot.relax / robot.stop), a sustained bus failure or the service stopping.
+    /// The zero is each joint's saved `zero_raw`; `directions` (one -1/+1 per joint, in the
+    /// calibration's joint order) stands in for the saved ones, which on a fresh image are
+    /// still placeholders. Omit it to use the saved directions.
+    HoldHome {
+        #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
+        #[serde(default)]
+        directions: Vec<i8>,
+        #[arg(long, default_value_t = HOME_HOLD_RAMP_MS)]
+        #[serde(default = "home_hold_ramp_ms")]
+        duration_ms: u64,
+    },
+}
+
+/// The same two seconds motion's ramp to HOME (`HOME_RAMP` in main.rs) takes, plus one: here
+/// nothing balances, so a robot coming up from limp is given a little longer.
+const HOME_HOLD_RAMP_MS: u64 = 3000;
+fn home_hold_ramp_ms() -> u64 {
+    HOME_HOLD_RAMP_MS
 }
 
 fn command_timeout(command: &BusCommand) -> Duration {
@@ -93,6 +114,9 @@ fn command_timeout(command: &BusCommand) -> Duration {
                 + Duration::from_secs(8 * NUM_JOINTS as u64 + 15)
         }
         BusCommand::VerifyImu { .. } => NOSE_DOWN_WINDOW + Duration::from_secs(10),
+        BusCommand::HoldHome { duration_ms, .. } => {
+            Duration::from_millis((*duration_ms).min(60_000)) + HOLD_SETTLE + Duration::from_secs(10)
+        }
         _ => Duration::from_secs(15),
     }
 }
@@ -432,6 +456,178 @@ struct Motion {
     deadline: Instant,
 }
 
+/// After the ramp, joints carrying the robot's weight sit a few counts off their goal:
+/// `hold-home` answers once every joint is within [`HOLD_TOLERANCE`] or this much time has
+/// passed, and keeps holding either way.
+const HOLD_SETTLE: Duration = Duration::from_secs(2);
+/// About 2.6°.
+const HOLD_TOLERANCE: u32 = 30;
+/// A joint still this far off once settled (about 20°) is blocked or turning the wrong way:
+/// stop rather than keep pushing.
+const HOLD_GIVE_UP: u32 = 230;
+/// Consecutive failed reads a settled hold rides out: the servos keep their last goal, and
+/// dropping a standing robot on one lost packet would be the worse outcome. A ramp, like any
+/// commissioning movement, stops on the first.
+const HOLD_READ_FAILURES: u32 = 25;
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum HoldStage {
+    Preload,
+    Enable,
+    Ramping,
+    Holding,
+}
+
+/// All joints at once, in `ids` order. Unlike [`Motion`] it outlives its request: the reply
+/// goes out once the robot is at HOME, and the hold stays until something releases it.
+struct Hold {
+    from: Vec<i32>,
+    targets: Vec<i32>,
+    directions: Vec<i8>,
+    started: Instant,
+    duration: Duration,
+    stage: HoldStage,
+    reply: Option<oneshot::Sender<Reply>>,
+    last_written: Option<Vec<i32>>,
+    max_error: u32,
+}
+
+#[derive(Clone, Serialize)]
+pub struct HoldStatus {
+    stage: &'static str,
+    max_error_deg: f64,
+    directions: Vec<i8>,
+}
+
+/// HOME in raw counts for each joint, from its saved zero and `directions` (or its saved
+/// direction). Refuses anything a joint's saved limits or the single-turn encoder cannot hold.
+fn home_targets(calibration: &Calibration, directions: &[i8]) -> Result<(Vec<i32>, Vec<i8>), String> {
+    let joints = &calibration.joints;
+    if !directions.is_empty()
+        && (directions.len() != joints.len() || directions.iter().any(|d| ![-1, 1].contains(d)))
+    {
+        return Err(format!(
+            "hold-home directions need exactly {} values of -1/+1, in calibration joint order",
+            joints.len()
+        ));
+    }
+    let home = duck_control::deployment::home();
+    let mut targets = Vec::with_capacity(joints.len());
+    let mut used = Vec::with_capacity(joints.len());
+    for (i, joint) in joints.iter().enumerate() {
+        let direction = directions.get(i).copied().unwrap_or(joint.direction);
+        let angle = home[i];
+        if let (Some(min), Some(max)) = (joint.min_rad, joint.max_rad)
+            && !(min..=max).contains(&angle)
+        {
+            return Err(format!("{}: HOME is outside its saved physical limits", joint.name));
+        }
+        let raw = f64::from(joint.zero_raw)
+            + f64::from(direction) * angle * 4096.0 / std::f64::consts::TAU;
+        if !(0.0..=4095.0).contains(&raw) {
+            return Err(format!("{}: HOME falls outside the single-turn encoder", joint.name));
+        }
+        targets.push(raw.round() as i32);
+        used.push(direction);
+    }
+    Ok((targets, used))
+}
+
+fn hold_error(samples: &BTreeMap<u8, ServoSample>, ids: &[u8], targets: &[i32]) -> u32 {
+    ids.iter()
+        .zip(targets)
+        .map(|(id, target)| samples[id].feedback.position_signed_raw.abs_diff(*target))
+        .max()
+        .unwrap_or(0)
+}
+
+/// Forget the hold, telling its requester why if it is still waiting. Torque is the caller's.
+fn cancel_hold(hold: &mut Option<Hold>, reason: &str) {
+    if let Some(Hold { reply: Some(reply), .. }) = hold.take() {
+        let _ = reply.send(Err(format!("hold-home stopped: {reason}")));
+    }
+}
+
+/// Advance a hold by one cycle. Torque goes on only after every goal has been set to where
+/// the joint already is, as a single-joint move does, so enabling never jumps.
+fn step_hold(
+    bus: &mut Bus,
+    samples: &BTreeMap<u8, ServoSample>,
+    ids: &[u8],
+    hold: &mut Option<Hold>,
+    off_pending: &mut Option<String>,
+) {
+    let Some(h) = hold.as_mut() else {
+        return;
+    };
+    if h.reply.as_ref().is_some_and(|r| r.is_closed()) {
+        cancel_hold(hold, "request abandoned");
+        *off_pending = torque_off(bus, ids).err();
+        return;
+    }
+    let step = (|| -> Result<(), String> {
+        match h.stage {
+            HoldStage::Preload => {
+                let rows = ids
+                    .iter()
+                    .map(|id| (*id, samples[id].feedback.position_signed_raw))
+                    .collect::<Vec<_>>();
+                h.from = ids.iter().map(|id| samples[id].feedback.position_raw).collect();
+                bus.signed_positions(&rows).map_err(|e| e.to_string())?;
+                h.stage = HoldStage::Enable;
+            }
+            HoldStage::Enable => {
+                bus.torque(ids, true).map_err(|e| e.to_string())?;
+                bus.verify_torque(ids, true).map_err(|e| e.to_string())?;
+                h.started = Instant::now();
+                h.stage = HoldStage::Ramping;
+            }
+            HoldStage::Ramping => {
+                let elapsed = h.started.elapsed();
+                let fraction = (elapsed.as_secs_f64() / h.duration.as_secs_f64()).min(1.0);
+                let goals = h
+                    .from
+                    .iter()
+                    .zip(&h.targets)
+                    .map(|(from, to)| {
+                        (f64::from(*from) + f64::from(to - from) * fraction).round() as i32
+                    })
+                    .collect::<Vec<_>>();
+                if h.last_written.as_ref() != Some(&goals) {
+                    let rows = ids.iter().copied().zip(goals.iter().copied()).collect::<Vec<_>>();
+                    bus.signed_positions(&rows).map_err(|e| e.to_string())?;
+                    h.last_written = Some(goals);
+                }
+                h.max_error = hold_error(samples, ids, &h.targets);
+                if elapsed >= h.duration
+                    && (h.max_error <= HOLD_TOLERANCE || elapsed >= h.duration + HOLD_SETTLE)
+                {
+                    if h.max_error > HOLD_GIVE_UP {
+                        return Err(format!(
+                            "a joint is still {:.0}° from HOME; check its direction or what blocks it",
+                            f64::from(h.max_error) * 360.0 / 4096.0
+                        ));
+                    }
+                    h.stage = HoldStage::Holding;
+                    if let Some(reply) = h.reply.take() {
+                        let _ = reply.send(Ok(json!({"holding":true,"torque":"on",
+                            "max_error_deg":f64::from(h.max_error) * 360.0 / 4096.0,
+                            "directions":h.directions})));
+                    }
+                }
+            }
+            HoldStage::Holding => {
+                h.max_error = hold_error(samples, ids, &h.targets);
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = step {
+        cancel_hold(hold, &error);
+        *off_pending = torque_off(bus, ids).err();
+    }
+}
+
 fn torque_off(bus: &mut Bus, ids: &[u8]) -> Result<(), String> {
     bus.torque(ids, false).map_err(|e| e.to_string())?;
     bus.verify_torque(ids, false).map_err(|e| e.to_string())
@@ -695,6 +891,7 @@ fn process_job(
     off_pending: &mut Option<String>,
     imu: ImuContext,
     verifying: &mut Option<PendingVerify>,
+    hold: &mut Option<Hold>,
 ) {
     if job.reply.is_closed() {
         return;
@@ -705,6 +902,7 @@ fn process_job(
                 .reply
                 .send(Err("verify-imu cancelled by relax; nothing saved".into()));
         }
+        cancel_hold(hold, "relax");
         let stop_error = abort_motion(bus, ids, motion, "movement interrupted by relax");
         *off_pending = stop_error.clone();
         let result =
@@ -735,6 +933,19 @@ fn process_job(
         let _ = job.reply.send(Err(
             "a movement is already active; use bus relax to interrupt it".into(),
         ));
+        return;
+    }
+    // Standing on HOME: the IMU may be checked, nothing may move a joint.
+    if let Some(h) = hold.as_ref()
+        && !matches!(job.command, BusCommand::VerifyImu { .. })
+    {
+        let _ = job.reply.send(if matches!(job.command, BusCommand::HoldHome { .. })
+            && h.stage == HoldStage::Holding
+        {
+            Ok(json!({"holding":true,"torque":"on","already":true,"directions":h.directions}))
+        } else {
+            Err("the robot is holding HOME; relax first".into())
+        });
         return;
     }
     match job.command {
@@ -892,6 +1103,33 @@ fn process_job(
                 )
             };
             let _ = job.reply.send(result);
+        }
+        BusCommand::HoldHome {
+            directions,
+            duration_ms,
+        } => {
+            if !(500..=60_000).contains(&duration_ms) {
+                let _ = job.reply.send(Err("hold-home duration-ms must be 500..60000".into()));
+                return;
+            }
+            match home_targets(calibration, &directions) {
+                Ok((targets, directions)) => {
+                    *hold = Some(Hold {
+                        from: vec![],
+                        targets,
+                        directions,
+                        started: Instant::now(),
+                        duration: Duration::from_millis(duration_ms),
+                        stage: HoldStage::Preload,
+                        reply: Some(job.reply),
+                        last_written: None,
+                        max_error: 0,
+                    });
+                }
+                Err(error) => {
+                    let _ = job.reply.send(Err(error));
+                }
+            }
         }
         BusCommand::Relax
         | BusCommand::CalibrationStatus
@@ -1106,6 +1344,9 @@ pub struct Status {
     torque_off_pending: Option<String>,
     power_pending: bool,
     motion: Option<MotionStatus>,
+    /// Present while `hold-home` has the joints: `ramping`, then `holding`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hold: Option<HoldStatus>,
     policy_motion_enabled: bool,
     updated_at_us: u64,
 }
@@ -1173,6 +1414,7 @@ pub async fn run(
     let mut last_sequence = None;
     let mut stale_run = 0u64;
     let mut motion: Option<Motion> = None;
+    let mut hold: Option<Hold> = None;
     let mut off_pending = None;
     let mut imu_decoder = SflpDecoder::new(calibration.imu_mount_quat);
     let mut imu_frame = TrunkFrame::new(calibration.imu_mount(source).quat);
@@ -1311,6 +1553,12 @@ pub async fn run(
             if motion.is_some() {
                 off_pending = abort_motion(&mut bus, &ids, &mut motion, error);
             }
+            if hold.as_ref().is_some_and(|h| {
+                h.stage != HoldStage::Holding || consecutive >= HOLD_READ_FAILURES
+            }) {
+                cancel_hold(&mut hold, error);
+                off_pending = torque_off(&mut bus, &ids).err();
+            }
             if consecutive == 1 {
                 tracing::warn!(cycle,%error,"bus read failed");
             }
@@ -1330,6 +1578,7 @@ pub async fn run(
                             reading: None,
                         },
                         &mut verifying,
+                        &mut hold,
                     );
                 } else {
                     let _ = job.reply.send(Err(error.clone()));
@@ -1411,6 +1660,7 @@ pub async fn run(
                         reading: host_reading,
                     },
                     &mut verifying,
+                    &mut hold,
                 );
                 if changes_calibration {
                     state
@@ -1427,6 +1677,7 @@ pub async fn run(
                 }
             }
             step_motion(&mut bus, &samples, &ids, &mut motion, &mut off_pending);
+            step_hold(&mut bus, &samples, &ids, &mut hold, &mut off_pending);
         }
         if let Some(mut pending) = verifying.take() {
             let reading = if error.is_none() { host_reading } else { None };
@@ -1469,9 +1720,13 @@ pub async fn run(
                 }
             }
         }
-        state
-            .moving
-            .store(motion.is_some() || off_pending.is_some(), Ordering::Relaxed);
+        // A settled hold is standing, not moving: safe to restart, as motion's standing is.
+        state.moving.store(
+            motion.is_some()
+                || off_pending.is_some()
+                || hold.as_ref().is_some_and(|h| h.stage != HoldStage::Holding),
+            Ordering::Relaxed,
+        );
         state.ticks.store(cycle, Ordering::Relaxed);
         if error.is_none() && total_success == 1 {
             state.startup_step(2, "success", "标定采集第一份有效反馈已读取");
@@ -1504,8 +1759,12 @@ pub async fn run(
                     "read_error"
                 } else if off_pending.is_some() {
                     "stop_unconfirmed"
-                } else if motion.is_some() {
+                } else if motion.is_some()
+                    || hold.as_ref().is_some_and(|h| h.stage != HoldStage::Holding)
+                {
                     "moving"
+                } else if hold.is_some() {
+                    "holding"
                 } else {
                     "ready"
                 },
@@ -1527,6 +1786,12 @@ pub async fn run(
                     .map(|_| "verify-imu: tip the robot nose-down by 15-30 degrees and hold it"),
                 torque_state: if off_pending.is_some() {
                     "unknown"
+                } else if let Some(h) = &hold {
+                    match h.stage {
+                        HoldStage::Preload => "off",
+                        HoldStage::Enable => "unknown",
+                        HoldStage::Ramping | HoldStage::Holding => "all_enabled",
+                    }
                 } else if let Some(m) = &motion {
                     match m.torque_confirmed {
                         Some(true) => "single_joint_enabled",
@@ -1545,6 +1810,11 @@ pub async fn run(
                     action: if m.center { "center" } else { "move" },
                     completed_ids: m.completed.clone(),
                 }),
+                hold: hold.as_ref().map(|h| HoldStatus {
+                    stage: if h.stage == HoldStage::Holding { "holding" } else { "ramping" },
+                    max_error_deg: f64::from(h.max_error) * 360.0 / 4096.0,
+                    directions: h.directions.clone(),
+                }),
                 updated_at_us: state.started.elapsed().as_micros() as u64,
             })));
             // robot.busStatus serves the startup report while its phase is a startup one
@@ -1561,6 +1831,7 @@ pub async fn run(
             state.missed.fetch_add(1, Ordering::Relaxed);
         }
     }
+    cancel_hold(&mut hold, "service stopping");
     let stop_error = abort_motion(&mut bus, &ids, &mut motion, "service stopping");
     if let Some(error) = stop_error {
         tracing::error!(%error,"shutdown torque-off not confirmed");
@@ -1619,6 +1890,7 @@ mod tests {
             torque_off_pending: None,
             power_pending: false,
             motion: None,
+            hold: None,
             policy_motion_enabled: false,
             updated_at_us: 840_000,
         };
@@ -2129,6 +2401,52 @@ mod tests {
         }
         let error = wrong.observe(Some(sideways), now).unwrap().unwrap_err();
         assert!(error.contains("side going down"), "{error}");
+    }
+
+    /// `hold-home` stands on the policy's HOME: each joint's saved zero, turned by the
+    /// direction the caller gives (a fresh image's saved ones are placeholders) or the saved one.
+    #[test]
+    fn hold_home_targets_follow_zero_direction_and_home() {
+        let mut calibration = Calibration::commissioning(JOINT_IDS);
+        let home = duck_control::deployment::home();
+        let counts = |rad: f64| rad * 4096.0 / std::f64::consts::TAU;
+        let (saved, used) = home_targets(&calibration, &[]).unwrap();
+        assert_eq!(used, vec![1; NUM_JOINTS]);
+        for i in 0..NUM_JOINTS {
+            assert_eq!(saved[i], (2048.0 + counts(home[i])).round() as i32);
+        }
+        let mut flipped = vec![1i8; NUM_JOINTS];
+        flipped[5] = -1;
+        calibration.joints[5].zero_raw = 2000;
+        let (targets, used) = home_targets(&calibration, &flipped).unwrap();
+        assert_eq!(used, flipped);
+        assert_eq!(targets[5], (2000.0 - counts(home[5])).round() as i32);
+        assert_eq!(targets[0], saved[0]);
+    }
+
+    #[test]
+    fn hold_home_refuses_bad_directions_and_limits() {
+        let mut calibration = Calibration::commissioning(JOINT_IDS);
+        assert!(home_targets(&calibration, &[1, -1]).unwrap_err().contains("exactly"));
+        let mut zero = vec![1i8; NUM_JOINTS];
+        zero[3] = 0;
+        assert!(home_targets(&calibration, &zero).is_err());
+        // left_hip_pitch HOME is about -26°: a saved range that excludes it refuses.
+        calibration.joints[2].min_rad = Some(0.0);
+        calibration.joints[2].max_rad = Some(1.0);
+        assert!(home_targets(&calibration, &[]).unwrap_err().contains("limits"));
+    }
+
+    #[test]
+    fn hold_home_parses_with_and_without_its_options() {
+        let bare: BusCommand = serde_json::from_value(json!({"action":"hold-home"})).unwrap();
+        assert!(matches!(bare, BusCommand::HoldHome { ref directions, duration_ms: 3000 } if directions.is_empty()));
+        let full: BusCommand = serde_json::from_value(
+            json!({"action":"hold-home","directions":[1,-1,1,1,1,1,1,1,1,1,1,1,1,1,1],"duration_ms":2500}),
+        )
+        .unwrap();
+        assert!(matches!(full, BusCommand::HoldHome { ref directions, duration_ms: 2500 } if directions[1] == -1));
+        assert!(serde_json::from_value::<BusCommand>(json!({"action":"hold-home","speed":1})).is_err());
     }
 
     /// A verified mount lands in that module's slot; the bus board's mount is not touched, and
