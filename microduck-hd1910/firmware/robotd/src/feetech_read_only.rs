@@ -3,7 +3,7 @@
 //! Bus used by FeetechIo; IPC only reads snapshots. No fabricated calibration.
 use super::{Ordering, RobotState};
 use duck_control::feetech::{
-    Bus, IMU_ID, IMU_IDENTITY, ImuSample, SYNC_ADDRESS, SYNC_LENGTH, ServoSample, SyncTrace,
+    Bus, IMU_ID, ImuSample, SYNC_ADDRESS, SYNC_LENGTH, ServoSample, SyncTrace,
 };
 use duck_control::model::{JOINT_IDS, JOINT_NAMES};
 use duck_control::trunk_imu::{HostImu, HostImuGate};
@@ -86,12 +86,7 @@ fn publish(state: &RobotState, report: Value) {
 fn connect(port: &str, host: bool) -> Result<(Bus, Vec<Value>), String> {
     let mut bus = Bus::open_read_only(port).map_err(|e| e.to_string())?;
     if !host {
-        let identity = bus.read(IMU_ID, 0, 5).map_err(|e| e.to_string())?;
-        if identity != IMU_IDENTITY {
-            return Err(format!(
-                "expected FT6 IMU200 identity 06 00 00 00 f2, received {identity:02x?}"
-            ));
-        }
+        bus.identify_imu().map_err(|e| e.to_string())?;
     }
     let mut torque = Vec::new();
     for id in JOINT_IDS {
@@ -160,6 +155,10 @@ pub async fn run(port: &str, state: &RobotState, period: Duration, host_imu: Opt
             }
         }
     };
+    if host_imu.is_none() {
+        // FT6 answers first, our imu_to_dxl board last (Bus::identify_imu read which one in connect)
+        ids = duck_control::feetech::telemetry_ids(bus.imu_board(), &JOINT_IDS);
+    }
     state.startup_bus_failures.store(0, Ordering::Relaxed);
     tracing::warn!(
         build = BUILD,
@@ -465,7 +464,7 @@ mod tests {
                     assert!(matches!(inst, 2 | 0x82), "motor WRITE observed");
                     if inst == 2 {
                         let data = if id == 200 {
-                            IMU_IDENTITY.to_vec()
+                            duck_control::feetech::IMU_IDENTITY.to_vec()
                         } else {
                             vec![0]
                         };

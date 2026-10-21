@@ -5,7 +5,7 @@ use super::{Ordering, RobotState};
 use clap::Subcommand;
 use duck_control::feetech::ImuMount;
 use duck_control::feetech::{
-    Bus, Calibration, IMU_ID, IMU_IDENTITY, ImuSample, ServoSample, signed_position_word,
+    Bus, Calibration, IMU_ID, ImuSample, ServoSample, signed_position_word,
 };
 use duck_control::imu::{ImuData, SensorReading, SflpDecoder, TrunkFrame};
 use duck_control::model::{JOINT_IDS, NUM_JOINTS};
@@ -1385,8 +1385,8 @@ pub async fn run(
         let connect = (|| -> Result<Bus, String> {
             let mut bus = Bus::open(port).map_err(|e| e.to_string())?;
             torque_off(&mut bus, &ids)?;
-            if host_imu.is_none() && bus.read(IMU_ID, 0, 5).map_err(|e| e.to_string())? != IMU_IDENTITY {
-                return Err("IMU200 requires FT6 firmware (06 00 00 00 f2)".into());
+            if host_imu.is_none() {
+                bus.identify_imu().map_err(|e| format!("IMU200: {e}"))?;
             }
             Ok(bus)
         })();

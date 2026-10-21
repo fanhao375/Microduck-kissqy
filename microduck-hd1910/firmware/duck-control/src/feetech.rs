@@ -30,6 +30,59 @@ pub const IMU_DIAGNOSTIC_ADDRESS: u8 = 124;
 pub const IMU_LENGTH: u8 = 15;
 pub const IMU_DIAGNOSTIC_LENGTH: u8 = 20;
 pub const IMU_IDENTITY: [u8; 5] = [6, 0, 0, 0, 0xf2];
+/// Model number of microduck-replica's own bus IMU board (imu_to_dxl), little-endian at 3..5.
+pub const IMU_TO_DXL_MODEL: [u8; 2] = [0x44, 0x4d];
+
+/// Which board answers as ID 200, from its five identity bytes at address 0. Both serve the
+/// same 56/15 block (gyro i16 x3 at 17.5 mdps/LSB, SFLP fp16 x/y/z, counter, status, zero).
+/// They differ in where they can sit in the Sync Read:
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum BusImuBoard {
+    /// kissqy's FT6 board: first in the list, as its firmware expects.
+    Ft6,
+    /// microduck-replica's imu_to_dxl (Feetech protocol since firmware 0.2.0): last. It speaks
+    /// after hearing the device before it, while Feetech servos start their predicted slots on a
+    /// timer — first in the list, the next servo talks over its checksum (measured on firmware
+    /// 1.0.0 with Feetech 3.46 servos: 3/30 replies first, 30/30 middle or last).
+    ImuToDxl,
+}
+impl BusImuBoard {
+    pub fn from_identity(raw: &[u8]) -> Option<Self> {
+        if raw == IMU_IDENTITY {
+            Some(Self::Ft6)
+        } else if raw.len() == 5 && raw[2] == 0 && raw[3..5] == IMU_TO_DXL_MODEL {
+            Some(Self::ImuToDxl)
+        } else {
+            None
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ft6 => "ft6",
+            Self::ImuToDxl => "imu_to_dxl",
+        }
+    }
+}
+
+/// The Sync Read list for the 56/15 telemetry: the IMU first or last, by board.
+pub fn telemetry_ids(board: BusImuBoard, servo_ids: &[u8]) -> Vec<u8> {
+    let mut ids = Vec::with_capacity(servo_ids.len() + 1);
+    if board == BusImuBoard::Ft6 {
+        ids.push(IMU_ID);
+    }
+    ids.extend_from_slice(servo_ids);
+    if board == BusImuBoard::ImuToDxl {
+        ids.push(IMU_ID);
+    }
+    ids
+}
+
+fn unknown_imu(raw: &[u8]) -> IoError {
+    error(format!(
+        "ID 200 is neither FT6 (06 00 00 00 f2) nor imu_to_dxl (model 0x4D44, firmware 0.2.0 or later); \
+         it reported {raw:02x?}"
+    ))
+}
 /// FT6 sets status bit1 at TX when quaternion age exceeds this bound.
 pub const IMU_FRESH_BOUND_MS: u16 = 30;
 pub const BROADCAST: u8 = 254;
@@ -168,6 +221,8 @@ pub struct Bus {
     timeout: Duration,
     read_only: bool,
     pub last_sync: SyncTrace,
+    /// The bus IMU board, once `identify_imu` has read it; FT6 until then.
+    imu_board: BusImuBoard,
 }
 
 /// Minimal acquisition result. No recovery, raw-packet history or UART polling.
@@ -204,7 +259,21 @@ impl Bus {
             timeout: Duration::from_millis(30),
             read_only: false,
             last_sync: SyncTrace::default(),
+            imu_board: BusImuBoard::Ft6,
         })
+    }
+
+    /// Read ID 200's identity and remember which board it is, which sets where it goes in the
+    /// telemetry Sync Read. Anything else is refused.
+    pub fn identify_imu(&mut self) -> Result<BusImuBoard> {
+        let raw = self.read(IMU_ID, 0, 5)?;
+        let board = BusImuBoard::from_identity(&raw).ok_or_else(|| unknown_imu(&raw))?;
+        self.imu_board = board;
+        Ok(board)
+    }
+
+    pub fn imu_board(&self) -> BusImuBoard {
+        self.imu_board
     }
 
     /// Enforced at the packet boundary, including every existing write API.
@@ -492,8 +561,7 @@ impl Bus {
         if servo_ids.len() != NUM_JOINTS || servo_ids.contains(&IMU_ID) {
             return Err(error("telemetry requires all 15 joints plus IMU 200"));
         }
-        let mut ids = [IMU_ID; NUM_JOINTS + 1];
-        ids[1..].copy_from_slice(servo_ids);
+        let ids = telemetry_ids(self.imu_board, servo_ids);
         self.sync_read(SYNC_ADDRESS, SYNC_LENGTH, &ids)
     }
 
@@ -515,8 +583,7 @@ impl Bus {
         if servo_ids.len() != NUM_JOINTS || servo_ids.contains(&IMU_ID) {
             return Err(error("telemetry requires all 15 joints plus IMU 200"));
         }
-        let mut ids = vec![IMU_ID];
-        ids.extend_from_slice(servo_ids);
+        let ids = telemetry_ids(self.imu_board, servo_ids);
         self.sync_read_inner(SYNC_ADDRESS, SYNC_LENGTH, &ids, true)
     }
 
@@ -584,7 +651,8 @@ pub fn sync_read_packet(address: u8, length: u8, ids: &[u8]) -> Result<Vec<u8>> 
         || ids.is_empty()
         || ids.len() > 251
         || ids.iter().any(|id| *id >= BROADCAST || !unique.insert(*id))
-        || (ids.contains(&IMU_ID) && ids[0] != IMU_ID)
+        // The IMU answers first (FT6) or last (imu_to_dxl), never between servos.
+        || (ids.contains(&IMU_ID) && ids[0] != IMU_ID && ids[ids.len() - 1] != IMU_ID)
     {
         return Err(error("invalid Feetech Sync Read address/length/ID order"));
     }
@@ -1375,11 +1443,7 @@ impl FeetechIo {
     }
     pub fn from_bus(mut bus: Bus, calibration: Calibration) -> Result<Self> {
         calibration.validate()?;
-        if bus.read(IMU_ID, 0, 5)? != IMU_IDENTITY {
-            return Err(error(
-                "ID 200 requires FT6 firmware (06 00 00 00 f2); flash FT6 before enabling IMU",
-            ));
-        }
+        bus.identify_imu()?;
         Self::for_startup(bus, calibration)?.adopt_torque_state()
     }
     /// The servos on `bus`; the trunk IMU from `reader`, under that source's own mount. ID 200
@@ -1500,11 +1564,8 @@ impl FeetechIo {
         self.bus.verify_torque(&ids, false)?;
         self.torque_enabled = false;
         self.torque_state_confirmed = Some(false);
-        if matches!(self.imu, TrunkImu::Bus { .. }) && self.bus.read(IMU_ID, 0, 5)? != IMU_IDENTITY
-        {
-            return Err(error(
-                "ID 200 requires FT6 firmware (06 00 00 00 f2); flash FT6 before enabling IMU",
-            ));
+        if matches!(self.imu, TrunkImu::Bus { .. }) {
+            self.bus.identify_imu()?;
         }
         Ok(())
     }
@@ -2107,6 +2168,32 @@ impl RobotIo for FeetechIo {
 mod tests {
     use super::*;
 
+    /// ID 200 is kissqy's FT6 board or our own imu_to_dxl (0.2.0 and 1.0.0 report model 0x4D44);
+    /// anything else, including a big-endian flag, is refused.
+    #[test]
+    fn bus_imu_board_is_known_by_its_identity_bytes() {
+        assert_eq!(BusImuBoard::from_identity(&IMU_IDENTITY), Some(BusImuBoard::Ft6));
+        assert_eq!(BusImuBoard::from_identity(&[0, 2, 0, 0x44, 0x4d]), Some(BusImuBoard::ImuToDxl));
+        assert_eq!(BusImuBoard::from_identity(&[1, 0, 0, 0x44, 0x4d]), Some(BusImuBoard::ImuToDxl));
+        for raw in [&[1u8, 0, 1, 0x44, 0x4d][..], &[6, 0, 0, 0, 0xf3], &[0, 0, 0, 0, 0], &[6, 0, 0, 0]] {
+            assert_eq!(BusImuBoard::from_identity(raw), None, "{raw:02x?}");
+        }
+        assert!(unknown_imu(&[1, 2, 3, 4, 5]).to_string().contains("[01, 02, 03, 04, 05]"));
+    }
+
+    /// FT6 answers first; imu_to_dxl last, after hearing the servo before it (first in the list,
+    /// the next Feetech servo talks over it). Between servos is never sent.
+    #[test]
+    fn the_imu_is_first_for_ft6_and_last_for_imu_to_dxl() {
+        let servos = [10, 11, 12];
+        assert_eq!(super::telemetry_ids(BusImuBoard::Ft6, &servos), vec![IMU_ID, 10, 11, 12]);
+        assert_eq!(super::telemetry_ids(BusImuBoard::ImuToDxl, &servos), vec![10, 11, 12, IMU_ID]);
+        assert!(sync_read_packet(SYNC_ADDRESS, SYNC_LENGTH, &[IMU_ID, 10, 11]).is_ok());
+        assert!(sync_read_packet(SYNC_ADDRESS, SYNC_LENGTH, &[10, 11, IMU_ID]).is_ok());
+        assert!(sync_read_packet(SYNC_ADDRESS, SYNC_LENGTH, &[10, IMU_ID, 11]).is_err());
+        assert!(sync_read_packet(SYNC_ADDRESS, SYNC_LENGTH, &[IMU_ID]).is_ok());
+    }
+
     #[test]
     fn position_feedback_and_angles_keep_the_unmodified_signed_coordinate() {
         for (wire, expected) in [
@@ -2316,6 +2403,7 @@ mod tests {
             timeout: Duration::from_millis(30),
             read_only: false,
             last_sync: SyncTrace::default(),
+            imu_board: BusImuBoard::Ft6,
         };
         let mut io = FeetechIo::from_bus(bus, calibrated()).unwrap();
         for _ in 0..30 {
@@ -2409,6 +2497,7 @@ mod tests {
                 timeout: Duration::from_millis(30),
                 read_only: false,
                 last_sync: SyncTrace::default(),
+                imu_board: BusImuBoard::Ft6,
             };
             let result = bus.telemetry(&crate::model::JOINT_IDS);
             finish.send(()).unwrap();
@@ -2459,6 +2548,7 @@ mod tests {
             timeout: Duration::from_millis(30),
             read_only: false,
             last_sync: SyncTrace::default(),
+            imu_board: BusImuBoard::Ft6,
         };
         bus.verify_torque(&ids, false).unwrap();
         assert!(bus.last_sync.missing_ids.is_empty());
@@ -3096,6 +3186,7 @@ mod hd1910_transport_tests {
                 timeout: Duration::from_millis(30),
                 read_only: false,
                 last_sync: SyncTrace::default(),
+                imu_board: BusImuBoard::Ft6,
             },
             Emulator {
                 faults,
