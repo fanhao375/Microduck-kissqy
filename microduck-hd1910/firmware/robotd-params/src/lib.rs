@@ -1857,6 +1857,9 @@ mod protocol_tests {
 #[serde(deny_unknown_fields, default)]
 pub struct Bus {
     pub protocol: BusProtocol,
+    /// IMU at ID 200 may speak a different protocol from the servos. Detection
+    /// is read-only at startup; an explicit override never falls back.
+    pub imu_protocol: ImuBusProtocol,
     pub feetech_calibration: Option<PathBuf>,
     /// Serial port the servos and the IMU board share. The Radxa Zero 3W wires them to
     /// `/dev/ttyS2`.
@@ -1878,6 +1881,42 @@ pub struct Bus {
     /// the bus drops, `update_gate` sees an unhealthy robot, and a release that turned this on
     /// against firmware that cannot do it is rolled back on its own.
     pub fast_sync_read: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ImuBusProtocol {
+    #[default]
+    Auto,
+    Feetech,
+    Dxl2,
+}
+impl ImuBusProtocol {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Feetech => "feetech",
+            Self::Dxl2 => "dxl2",
+        }
+    }
+}
+
+#[cfg(test)]
+mod imu_bus_protocol_tests {
+    use super::*;
+
+    #[test]
+    fn imu_protocol_defaults_to_auto_and_accepts_only_known_overrides() {
+        assert_eq!(Bus::default().imu_protocol.label(), "auto");
+        for value in ["auto", "feetech", "dxl2"] {
+            let text = format!("[bus]\nprotocol='feetech'\nimu_protocol='{value}'\n");
+            let params: Params = toml::from_str(&text).unwrap();
+            assert_eq!(params.bus.imu_protocol.label(), value);
+            assert!(params.validate(Path::new("test.toml")).is_ok());
+        }
+        let text = "[bus]\nprotocol='feetech'\nimu_protocol='guess'\n";
+        assert!(toml::from_str::<Params>(text).is_err());
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1947,6 +1986,7 @@ impl Default for Bus {
     fn default() -> Self {
         Self {
             protocol: BusProtocol::Dynamixel,
+            imu_protocol: ImuBusProtocol::Auto,
             feetech_calibration: None,
             port: "/dev/ttyS2".into(),
             fast_sync_read: true,

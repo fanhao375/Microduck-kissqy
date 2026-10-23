@@ -2,9 +2,9 @@
 //! Raw telemetry mode of robotd. The control thread owns the same native Feetech
 //! Bus used by FeetechIo; IPC only reads snapshots. No fabricated calibration.
 use super::{Ordering, RobotState};
-use duck_control::feetech::{
-    Bus, IMU_ID, ImuSample, SYNC_ADDRESS, SYNC_LENGTH, ServoSample, SyncTrace,
-};
+use duck_control::feetech::{Bus, BusImuFreshness, IMU_ID, ServoSample, SyncTrace};
+#[cfg(test)]
+use duck_control::feetech::{SYNC_ADDRESS, SYNC_LENGTH};
 use duck_control::model::{JOINT_IDS, JOINT_NAMES};
 use duck_control::trunk_imu::{HostImu, HostImuGate};
 use serde_json::{Value, json};
@@ -83,8 +83,10 @@ fn publish(state: &RobotState, report: Value) {
 
 /// `host`: the trunk IMU is a module the host reads, so ID 200 is never addressed — a robot
 /// without the board has nothing there to identify.
-fn connect(port: &str, host: bool) -> Result<(Bus, Vec<Value>), String> {
+fn connect(port: &str, host: bool, imu_protocol: &str) -> Result<(Bus, Vec<Value>), String> {
     let mut bus = Bus::open_read_only(port).map_err(|e| e.to_string())?;
+    bus.set_imu_protocol(imu_protocol)
+        .map_err(|e| e.to_string())?;
     if !host {
         bus.identify_imu().map_err(|e| e.to_string())?;
     }
@@ -125,7 +127,13 @@ fn host_imu_report(
 
 /// `host_imu`: the trunk IMU module's reader when `[trunk_imu]` names one; the Sync Read is then
 /// the fifteen servos alone.
-pub async fn run(port: &str, state: &RobotState, period: Duration, host_imu: Option<&dyn HostImu>) {
+pub async fn run(
+    port: &str,
+    imu_protocol: &str,
+    state: &RobotState,
+    period: Duration,
+    host_imu: Option<&dyn HostImu>,
+) {
     let mut ids = if host_imu.is_some() {
         Vec::new()
     } else {
@@ -138,7 +146,7 @@ pub async fn run(port: &str, state: &RobotState, period: Duration, host_imu: Opt
         if state.shutdown.load(Ordering::Relaxed) {
             return;
         }
-        match connect(port, host_imu.is_some()) {
+        match connect(port, host_imu.is_some(), imu_protocol) {
             Ok(connected) => break connected,
             Err(error) => {
                 attempt += 1;
@@ -174,8 +182,7 @@ pub async fn run(port: &str, state: &RobotState, period: Duration, host_imu: Opt
     let mut rate_start = Instant::now();
     let mut rate_ticks = 0u64;
     let mut previous_tick: Option<Instant> = None;
-    let mut previous_sequence = None;
-    let mut stale_run = 0u64;
+    let mut bus_freshness = BusImuFreshness::default();
     let mut total_failures = 0u64;
     let mut total_success = 0u64;
     let mut total_imu_faults = 0u64;
@@ -199,7 +206,11 @@ pub async fn run(port: &str, state: &RobotState, period: Duration, host_imu: Opt
                 .push(tick_start.duration_since(previous).as_secs_f64() * 1000.0);
         }
         previous_tick = Some(tick_start);
-        let blocks = bus.sync_read(SYNC_ADDRESS, SYNC_LENGTH, &ids);
+        let blocks = if host_imu.is_some() {
+            bus.joint_telemetry(&JOINT_IDS)
+        } else {
+            bus.telemetry(&JOINT_IDS)
+        };
         let read_us = bus.last_sync.elapsed_us;
         window.read_ms.push(read_us as f64 / 1000.0);
         window.over_period += u64::from(Duration::from_micros(read_us) > period);
@@ -228,24 +239,26 @@ pub async fn run(port: &str, state: &RobotState, period: Duration, host_imu: Opt
                         .imu_ready
                         .store(imu_fault.is_none(), Ordering::Relaxed);
                 } else {
-                    match ImuSample::decode(&blocks[&IMU_ID]) {
+                    match bus.decode_imu(&blocks[&IMU_ID]) {
                         Ok(imu) => {
-                            let duplicate = previous_sequence == Some(imu.sequence);
-                            window.duplicate_imu += u64::from(duplicate);
-                            stale_run = if duplicate { stale_run + 1 } else { 0 };
-                            previous_sequence = Some(imu.sequence);
-                            if duplicate {
-                                state.imu_stale_blocks.fetch_add(1, Ordering::Relaxed);
-                            }
-                            state.imu_stale_run.store(stale_run, Ordering::Relaxed);
-                            let valid = imu.is_fresh(read_us) && stale_run < 3;
+                            let before = bus_freshness.stale;
+                            let valid = bus_freshness.check(&imu, read_us).is_ok();
+                            let duplicate_count = bus_freshness.stale.total - before.total;
+                            window.duplicate_imu += duplicate_count;
+                            state
+                                .imu_stale_blocks
+                                .fetch_add(duplicate_count, Ordering::Relaxed);
+                            state
+                                .imu_stale_run
+                                .store(bus_freshness.stale.run, Ordering::Relaxed);
                             state.imu_ready.store(valid, Ordering::Relaxed);
                             if !valid {
                                 imu_fault = Some("IMU not ready/stale".to_owned());
                             }
                             imu_json = json!({"id": IMU_ID, "sequence": imu.sequence,
                             "age_ms": imu.age_ms, "age_upper_bound_ms":imu.age_upper_bound_ms,
-                            "status":imu.status, "sequence_bits":8, "ready": imu.ready, "valid": valid,
+                            "status":imu.status, "sequence_bits":imu.sequence.map(|_|8), "ready": imu.ready, "valid": valid,
+                            "bus":bus.imu_info(),
                             "payload_12_hex": imu.block.iter().map(|b| format!("{b:02x}")).collect::<String>()});
                         }
                         Err(error) => {
@@ -534,7 +547,7 @@ mod tests {
         }
         let worker_state = Arc::clone(&state);
         let daemon = tokio::spawn(async move {
-            run(&path, &worker_state, Duration::from_millis(5), None).await;
+            run(&path, "auto", &worker_state, Duration::from_millis(5), None).await;
         });
         let result = tokio::time::timeout(Duration::from_secs(35), async {
             loop {
@@ -726,7 +739,14 @@ mod tests {
             let host = FreshHost {
                 sequence: std::sync::atomic::AtomicU32::new(0),
             };
-            run(&path, &worker_state, Duration::from_millis(5), Some(&host)).await;
+            run(
+                &path,
+                "auto",
+                &worker_state,
+                Duration::from_millis(5),
+                Some(&host),
+            )
+            .await;
         });
         let report = tokio::time::timeout(Duration::from_secs(10), async {
             loop {

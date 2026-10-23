@@ -666,9 +666,31 @@ address 0x4A or 0x4B) or `lsm6dsv16x` (the board's own chip on a breakout, 0x6A 
 must fail as a bus fault, not quietly start trusting whatever else is on I²C. `Params::load`
 refuses a module with the Dynamixel backend, and an address the chip cannot be strapped to.
 
-**Nothing about the bus board changes.** Its block is parsed as it always was — a golden test
-pins the decoder's output exactly — the `sync_read` is the same sixteen devices, and its mount
-stays in the calibration's top-level `imu_mount_quat` / `imu_mount_verified`.
+**The Feetech backend identifies the bus IMU once, before acquisition.**
+`[bus] imu_protocol` defaults to `"auto"`; `"feetech"` and `"dxl2"` force a wire format and
+never fall back. At the configured UART baud, ID 200 is probed with read-only requests:
+the FT6 identity or the compatible IMU-to-DXL Feetech identity selects the existing 56/15
+block and its first/last reply ordering. If that format does not answer, DXL 2.0 identity
+and a decodable 124/12 SFLP block select DXL2. An unknown responding Feetech identity or
+an unsupported DXL2 layout is an error. Detection changes neither IDs, baud nor EEPROM;
+there is no per-tick rescan or silent protocol switch after failure. This is layout
+compatibility, not a claim to support every manufacturer, Euler/full-float firmware or ID.
+
+**One owner and one telemetry deadline.** The same `Bus` reads a DXL2 IMU by unicast READ,
+then the fifteen Feetech servos by Sync Read, sharing one absolute 20 ms deadline. CRC errors,
+foreign packets or noise in either part disqualify a partial read. Feetech IMU telemetry keeps
+its original schema, sequence/status and age bound. DXL2 supplies only the real 12-byte
+SFLP core: no sensor sequence, status bits or sensor-side age are invented. Its host transaction
+must be on time; 25 identical core payloads are treated as frozen. Both paths retain the
+existing 25-valid-quaternion ready gate. Diagnostics identify the detected `imu_bus`
+protocol, board/layout and raw identity in commissioning and motion.
+
+**A verified mount is bound to its bus protocol.** Its quaternion remains in the top-level
+`imu_mount_quat` / `imu_mount_verified`, with `imu_bus_protocol = "feetech"` or `"dxl2"`
+saved by successful `verify-imu`. A legacy missing binding means Feetech. A mismatch keeps
+the daemon accessible and limp, but cannot authorize torque-on; redo the IMU mounting
+calibration. A physical mounting or module change also requires recalibration, even when
+the protocol is unchanged. I²C sources keep their existing separate calibration slots.
 
 **A module is read by a thread, not by the tick.** `robotd/src/trunk_imu_i2c.rs` owns the
 i2c-dev file and runs one state machine per chip on the codecs in `duck-control`

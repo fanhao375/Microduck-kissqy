@@ -6,8 +6,38 @@ use duck_control::model::JOINT_IDS;
 use std::io::{Read, Write};
 use std::os::fd::FromRawFd;
 
+fn dxl_crc(bytes: &[u8]) -> u16 {
+    let mut crc = 0u16;
+    for byte in bytes {
+        crc ^= u16::from(*byte) << 8;
+        for _ in 0..8 {
+            crc = (crc << 1) ^ if crc & 0x8000 != 0 { 0x8005 } else { 0 };
+        }
+    }
+    crc
+}
+
+fn dxl_status(payload: &[u8]) -> Vec<u8> {
+    assert!(!payload.windows(3).any(|w| w == [255, 255, 253]));
+    let mut raw = vec![255, 255, 253, 0, 200];
+    raw.extend_from_slice(&((payload.len() + 4) as u16).to_le_bytes());
+    raw.extend_from_slice(&[0x55, 0]);
+    raw.extend_from_slice(payload);
+    raw.extend_from_slice(&dxl_crc(&raw).to_le_bytes());
+    raw
+}
+
 #[test]
 fn r9_startup_cadence_and_motion_use_one_bus_without_recovery() {
+    commissioning_flow(false);
+}
+
+#[test]
+fn dxl2_commissioning_detects_samples_verifies_and_stops_on_a_servo_fault() {
+    commissioning_flow(true);
+}
+
+fn commissioning_flow(dxl2: bool) {
     let mut master = 0;
     let mut slave = 0;
     let mut name = [0i8; 128];
@@ -32,11 +62,11 @@ fn r9_startup_cadence_and_motion_use_one_bus_without_recovery() {
         libc::close(slave);
     }
 
-    let dir = std::env::temp_dir().join(format!("microduck-r9-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("microduck-r9-{}-{dxl2}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let calibration_path = dir.join("calibration.toml");
     let cal = duck_control::feetech::Calibration::commissioning(JOINT_IDS);
-    let original = toml::to_string(&cal).unwrap();
+    let mut original = toml::to_string(&cal).unwrap();
     std::fs::write(&calibration_path, &original).unwrap();
     let state = Arc::new(RobotState::new(
         &Params::default(),
@@ -86,6 +116,42 @@ fn r9_startup_cadence_and_motion_use_one_bus_without_recovery() {
             );
             pending.extend_from_slice(&bytes[..n]);
             while pending.len() >= 4 {
+                if pending[..4] == [255, 255, 253, 0] {
+                    if pending.len() < 7 {
+                        break;
+                    }
+                    let size = 7 + usize::from(u16::from_le_bytes([pending[5], pending[6]]));
+                    if pending.len() < size {
+                        break;
+                    }
+                    let packet = pending.drain(..size).collect::<Vec<_>>();
+                    assert_eq!(
+                        dxl_crc(&packet[..size - 2]),
+                        u16::from_le_bytes([packet[size - 2], packet[size - 1]])
+                    );
+                    assert_eq!(
+                        (packet[4], packet[7]),
+                        (200, 2),
+                        "only unicast reads may identify/sample the IMU"
+                    );
+                    if !dxl2 {
+                        continue;
+                    }
+                    let address = u16::from_le_bytes([packet[8], packet[9]]);
+                    let length = u16::from_le_bytes([packet[10], packet[11]]);
+                    let data = match (address, length) {
+                        (0, 3) => vec![0x44, 0x4d, 1],
+                        (124, 12) => {
+                            let mut data = vec![0; 12];
+                            data[0] = rounds;
+                            data[7] = 0x30;
+                            data
+                        }
+                        _ => panic!("unexpected DXL2 read"),
+                    };
+                    wire.write_all(&dxl_status(&data)).unwrap();
+                    continue;
+                }
                 let size = pending[3] as usize + 4;
                 if pending.len() < size {
                     break;
@@ -96,6 +162,9 @@ fn r9_startup_cadence_and_motion_use_one_bus_without_recovery() {
                 let args = &packet[5..size - 1];
                 let address = args[0];
                 let length = args[1] as usize;
+                if dxl2 && packet[2] == 200 {
+                    continue;
+                }
                 if packet[4] == 0x83 {
                     for row in args[2..].chunks_exact(length + 1) {
                         assert!(JOINT_IDS.contains(&row[0]));
@@ -134,7 +203,11 @@ fn r9_startup_cadence_and_motion_use_one_bus_without_recovery() {
                     assert_eq!(length, 15);
                     assert_eq!(
                         ids,
-                        std::iter::once(200).chain(JOINT_IDS).collect::<Vec<_>>()
+                        if dxl2 {
+                            JOINT_IDS.to_vec()
+                        } else {
+                            std::iter::once(200).chain(JOINT_IDS).collect::<Vec<_>>()
+                        }
                     );
                     rounds = rounds.wrapping_add(1);
                     writes_in_tick = 0;
@@ -190,6 +263,7 @@ fn r9_startup_cadence_and_motion_use_one_bus_without_recovery() {
             .unwrap()
             .block_on(run(
                 &port,
+                "auto",
                 &control_state,
                 Duration::from_millis(20),
                 &path,
@@ -209,6 +283,29 @@ fn r9_startup_cadence_and_motion_use_one_bus_without_recovery() {
         }
     };
     wait(&|| state.ticks.load(Ordering::Relaxed) >= 8);
+    if dxl2 {
+        wait(&|| state.imu_ready.load(Ordering::Relaxed));
+        let report =
+            serde_json::to_value(state.bus_snapshot.load_full().unwrap().as_ref()).unwrap();
+        assert_eq!(report["imu_bus"]["protocol"], "dxl2");
+        assert!(report["last_sample"]["imu"].get("sequence").is_none());
+        let reply = tokio::runtime::Runtime::new().unwrap().block_on(dispatch(
+            &state,
+            proto::Id::Number(80),
+            serde_json::json!({"action":"verify-imu","confirmed":true,
+                "mount_wxyz":[(1.0_f64-0.125_f64.powi(2)).sqrt(),0.125,0.0,0.0]}),
+        ));
+        let reply = serde_json::to_value(reply).unwrap();
+        assert!(reply.get("result").is_some(), "{reply}");
+        original = std::fs::read_to_string(&calibration_path).unwrap();
+        let saved: duck_control::feetech::Calibration = toml::from_str(&original).unwrap();
+        assert_eq!(
+            saved.imu_bus_protocol,
+            Some(duck_control::feetech::BusImuProtocol::Dxl2)
+        );
+        assert!(saved.imu_mount_verified);
+        assert!(!saved.motion_enabled);
+    }
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let (command_state, command_started) = (state.clone(), Arc::new(AtomicBool::new(false)));
     let entered = command_started.clone();

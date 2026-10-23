@@ -6,6 +6,15 @@
 
 ## 这是什么
 
+**2026-10-23 总线兼容更新（control.44）**：Feetech 舵机后端默认自动识别 ID 200 上的
+FT6 / 兼容 IMU-to-DXL Feetech 固件，以及采用 124/12 SFLP 布局的 DXL 2.0 IMU。
+也可以在 `[bus]` 中设置 `imu_protocol = "feetech"` 或 `"dxl2"` 固定协议。
+这次更新不改变既有 I²C 模块选择；不支持的寄存器布局、其他 ID/波特率需要适配。
+换模块或安装方向后请重新校准；旧 Feetech 的安装确认不能直接授权 DXL2 上力。
+探测、时限、冻结检查和标定绑定的机制见
+[`robotd-design.md` §2.6](microduck-hd1910/firmware/docs/design/robotd-design.md#26-where-the-trunk-imu-is-wired)。
+本次 DXL2 兼容通过串口仿真与软件回归，尚待真板验收。
+
 在 kissqy 的 HD-1910 整套（R17 V167 / control.43）上加三样东西，都是可选的，不打开就跟他的 V167 一样：
 
 1. **IMU 模块直连主板 I²C**：kissqy 的 robotd 只认舵机总线上的 IMU 小板（ID 200，刷他的 FT6 固件）。这里加了两种现成模块，`robotd.toml` 里一行选：

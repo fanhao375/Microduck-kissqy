@@ -5,7 +5,7 @@ use super::{Ordering, RobotState};
 use clap::Subcommand;
 use duck_control::feetech::ImuMount;
 use duck_control::feetech::{
-    Bus, Calibration, IMU_ID, ImuSample, ServoSample, signed_position_word,
+    Bus, BusImuFreshness, BusImuInfo, Calibration, IMU_ID, ServoSample, signed_position_word,
 };
 use duck_control::imu::{ImuData, SensorReading, SflpDecoder, TrunkFrame};
 use duck_control::model::{JOINT_IDS, NUM_JOINTS};
@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::oneshot;
 
-pub const BUILD: &str = "1fa8438-feetech-ft6-control.43";
+pub const BUILD: &str = "4734cbb-feetech-imu-auto-control.44";
 const MAX_PENDING: usize = 16;
 const POSITION_TOLERANCE: u16 = 8;
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(4);
@@ -1071,7 +1071,9 @@ fn process_job(
                     }
                 };
                 if imu.source == TrunkImuKind::Bus {
-                    save_verified(calibration, path, imu.source, mount, None).map(
+                    let mut candidate = calibration.clone();
+                    candidate.imu_bus_protocol = Some(bus.imu_board().protocol());
+                    save_verified(&candidate, path, imu.source, mount, None).map(
                         |(updated, status)| {
                             *calibration = updated;
                             status
@@ -1278,7 +1280,8 @@ pub struct ImuStatus {
     id: Option<u8>,
     /// Which trunk IMU: a `TrunkImuKind` label.
     source: &'static str,
-    sequence: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sequence: Option<u32>,
     ready: bool,
     valid: bool,
     gravity: [f64; 3],
@@ -1337,6 +1340,8 @@ pub struct Status {
     last_sample: Option<Sample>,
     calibrated: bool,
     imu_mount_verified: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    imu_bus: Option<BusImuInfo>,
     /// What `verify-imu` is waiting for, while it waits.
     #[serde(skip_serializing_if = "Option::is_none")]
     imu_verification: Option<&'static str>,
@@ -1356,6 +1361,7 @@ pub struct Status {
 /// that module's mount.
 pub async fn run(
     port: &str,
+    imu_protocol: &str,
     state: &RobotState,
     period: Duration,
     calibration_path: &Path,
@@ -1384,6 +1390,8 @@ pub async fn run(
         if state.shutdown.load(Ordering::Relaxed) { return; }
         let connect = (|| -> Result<Bus, String> {
             let mut bus = Bus::open(port).map_err(|e| e.to_string())?;
+            bus.set_imu_protocol(imu_protocol)
+                .map_err(|e| e.to_string())?;
             torque_off(&mut bus, &ids)?;
             if host_imu.is_none() {
                 bus.identify_imu().map_err(|e| format!("IMU200: {e}"))?;
@@ -1411,8 +1419,7 @@ pub async fn run(
     let mut rate_ticks = 0u64;
     let mut total_success = 0u64;
     let mut total_failures = 0u64;
-    let mut last_sequence = None;
-    let mut stale_run = 0u64;
+    let mut bus_freshness = BusImuFreshness::default();
     let mut motion: Option<Motion> = None;
     let mut hold: Option<Hold> = None;
     let mut off_pending = None;
@@ -1482,7 +1489,7 @@ pub async fn run(
                     imu_status = Some(ImuStatus {
                         id: None,
                         source: source.label(),
-                        sequence: sample.sequence,
+                        sequence: Some(sample.sequence),
                         ready: true,
                         valid,
                         gravity: decoded.gravity,
@@ -1501,18 +1508,19 @@ pub async fn run(
                 }
                 return Ok(());
             }
-            let imu = ImuSample::decode(&blocks[&IMU_ID]).map_err(|e| format!("IMU200: {e}"))?;
-            let duplicate = last_sequence == Some(imu.sequence);
-            stale_run = if duplicate { stale_run + 1 } else { 0 };
-            last_sequence = Some(imu.sequence);
-            if duplicate {
-                state.imu_stale_blocks.fetch_add(1, Ordering::Relaxed);
-            }
-            state.imu_stale_run.store(stale_run, Ordering::Relaxed);
+            let imu = bus
+                .decode_imu(&blocks[&IMU_ID])
+                .map_err(|e| format!("IMU200: {e}"))?;
+            let before = bus_freshness.stale;
+            let checked = bus_freshness.check(&imu, bus.last_sync.elapsed_us);
+            state
+                .imu_stale_blocks
+                .fetch_add(bus_freshness.stale.total - before.total, Ordering::Relaxed);
+            state
+                .imu_stale_run
+                .store(bus_freshness.stale.run, Ordering::Relaxed);
+            checked.map_err(|e| e.to_string())?;
             let decoded = imu_decoder.decode(&imu.block);
-            if !imu.is_fresh(bus.last_sync.elapsed_us) || stale_run >= 3 {
-                return Err("IMU200 data stale or not ready".into());
-            }
             let valid = imu_decoder.ready();
             state.imu_ready.store(valid, Ordering::Relaxed);
             if publish {
@@ -1525,7 +1533,10 @@ pub async fn run(
                     gravity: decoded.gravity,
                     gyro_rad_s: decoded.gyro,
                     quaternion_wxyz: decoded.quat,
-                    mount_verified: calibration.imu_mount_verified,
+                    mount_verified: calibration.imu_mount_verified
+                        && calibration
+                            .validate_bus_mount(bus.imu_board().protocol())
+                            .is_ok(),
                     age_ms: None,
                     epoch: None,
                     accuracy: None,
@@ -1780,7 +1791,12 @@ pub async fn run(
                 last_failure: last_failure.clone(),
                 last_sample: last_sample.clone(),
                 calibrated: calibration.joints.iter().all(|j| j.calibrated),
-                imu_mount_verified: calibration.imu_mount(source).verified,
+                imu_mount_verified: calibration.imu_mount(source).verified
+                    && (source != TrunkImuKind::Bus
+                        || calibration
+                            .validate_bus_mount(bus.imu_board().protocol())
+                            .is_ok()),
+                imu_bus: bus.imu_info(),
                 imu_verification: verifying
                     .as_ref()
                     .map(|_| "verify-imu: tip the robot nose-down by 15-30 degrees and hold it"),
@@ -1864,6 +1880,7 @@ mod tests {
             .bus_status
             .store(Some(Arc::new(json!({"phase":"older-value-cache"}))));
         let report = Status {
+            imu_bus: None,
             build: BUILD,
             port: "/dev/test-no-uart".into(),
             mode: "commissioning",
@@ -2663,6 +2680,7 @@ mod tests {
                 .unwrap()
                 .block_on(run(
                     &port,
+                    "auto",
                     &control_state,
                     Duration::from_millis(20),
                     &control_path,

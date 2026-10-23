@@ -494,6 +494,7 @@ pub(crate) mod tests {
             calibration_complete: true,
             imu_mount_verified: true,
             imu_source: "bus",
+            imu_bus: None,
             velocity_source: hd1910::VELOCITY_SOURCE,
             velocity_rad_s_per_count: Some(hd1910::SPEED_RAD_S_PER_COUNT),
             current_available: false,

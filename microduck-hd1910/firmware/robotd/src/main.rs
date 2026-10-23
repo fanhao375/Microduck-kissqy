@@ -1374,6 +1374,7 @@ fn spawn_control_thread(
                         });
                 runtime.block_on(feetech_commissioning::run(
                     &params.bus.port,
+                    params.bus.imu_protocol.label(),
                     &state,
                     period,
                     calibration_path,
@@ -1384,6 +1385,7 @@ fn spawn_control_thread(
             if read_only {
                 runtime.block_on(feetech_read_only::run(
                     &params.bus.port,
+                    params.bus.imu_protocol.label(),
                     &state,
                     period,
                     host,
@@ -1520,7 +1522,8 @@ fn open_bus(
             // Optional servo P/D/torque limit (servo-test-parameters.json), read before the
             // bus is opened: a bad file stops motion startup without touching the servos.
             let servo_test = duck_control::hd1910_test::load(path)?;
-            let raw = duck_control::feetech::Bus::open(port)?;
+            let mut raw = duck_control::feetech::Bus::open(port)?;
+            raw.set_imu_protocol(bus.imu_protocol.label())?;
             let mut io = match host_imu {
                 Some(reader) => duck_control::feetech::FeetechIo::for_startup_with_imu(
                     raw,
@@ -7028,6 +7031,7 @@ mod tests {
                 let metadata = Arc::new(snapshot::Metadata {
                     backend: "feetech_ft6",
                     imu_source: "bus",
+                    imu_bus: None,
                     read_timing_revision: "test",
                     motion_enabled: true,
                     calibration_complete: true,

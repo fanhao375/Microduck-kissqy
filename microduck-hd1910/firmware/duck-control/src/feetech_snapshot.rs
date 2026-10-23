@@ -23,6 +23,8 @@ pub struct Metadata {
     pub imu_mount_verified: bool,
     /// See [`crate::feetech::FeetechDiagnostics::imu_source`].
     pub imu_source: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub imu_bus: Option<crate::feetech::BusImuInfo>,
     pub velocity_source: &'static str,
     pub velocity_rad_s_per_count: Option<f64>,
     pub current_available: bool,
