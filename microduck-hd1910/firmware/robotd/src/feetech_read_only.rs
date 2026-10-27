@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-pub const BUILD: &str = "590b986-feetech-ft6-readonly.2";
+pub const BUILD: &str = super::feetech_commissioning::BUILD;
 const WINDOW: u64 = 3000;
 
 #[derive(Default)]
@@ -83,9 +83,16 @@ fn publish(state: &RobotState, report: Value) {
 
 /// `host`: the trunk IMU is a module the host reads, so ID 200 is never addressed — a robot
 /// without the board has nothing there to identify.
-fn connect(port: &str, host: bool, imu_protocol: &str) -> Result<(Bus, Vec<Value>), String> {
+fn connect(
+    port: &str,
+    host: bool,
+    imu_protocol: &str,
+    imu_profile: &str,
+) -> Result<(Bus, Vec<Value>), String> {
     let mut bus = Bus::open_read_only(port).map_err(|e| e.to_string())?;
     bus.set_imu_protocol(imu_protocol)
+        .map_err(|e| e.to_string())?;
+    bus.set_imu_profile(imu_profile)
         .map_err(|e| e.to_string())?;
     if !host {
         bus.identify_imu().map_err(|e| e.to_string())?;
@@ -130,6 +137,7 @@ fn host_imu_report(
 pub async fn run(
     port: &str,
     imu_protocol: &str,
+    imu_profile: &str,
     state: &RobotState,
     period: Duration,
     host_imu: Option<&dyn HostImu>,
@@ -146,7 +154,7 @@ pub async fn run(
         if state.shutdown.load(Ordering::Relaxed) {
             return;
         }
-        match connect(port, host_imu.is_some(), imu_protocol) {
+        match connect(port, host_imu.is_some(), imu_protocol, imu_profile) {
             Ok(connected) => break connected,
             Err(error) => {
                 attempt += 1;
@@ -154,6 +162,7 @@ pub async fn run(
                 publish(
                     state,
                     json!({"build": BUILD, "mode": "read_only", "phase": "waiting_for_bus",
+                    "configured_imu_profile":imu_profile,
                     "port": port, "ids": ids, "attempt": attempt, "error": error}),
                 );
                 if attempt == 1 || attempt.is_multiple_of(30) {
@@ -241,6 +250,7 @@ pub async fn run(
                 } else {
                     match bus.decode_imu(&blocks[&IMU_ID]) {
                         Ok(imu) => {
+                            let reading = imu.reading();
                             let before = bus_freshness.stale;
                             let valid = bus_freshness.check(&imu, read_us).is_ok();
                             let duplicate_count = bus_freshness.stale.total - before.total;
@@ -259,6 +269,7 @@ pub async fn run(
                             "age_ms": imu.age_ms, "age_upper_bound_ms":imu.age_upper_bound_ms,
                             "status":imu.status, "sequence_bits":imu.sequence.map(|_|8), "ready": imu.ready, "valid": valid,
                             "bus":bus.imu_info(),
+                            "gyro_rad_s":reading.gyro, "quaternion_wxyz":reading.quat,
                             "payload_12_hex": imu.block.iter().map(|b| format!("{b:02x}")).collect::<String>()});
                         }
                         Err(error) => {
@@ -341,6 +352,7 @@ pub async fn run(
             publish(
                 state,
                 json!({"build": BUILD, "mode": "read_only", "phase": "reading",
+                "configured_imu_profile":imu_profile, "imu_bus":bus.imu_info(),
                 "port": port, "baud": 1_000_000, "ids": ids, "target_hz": 1.0 / period.as_secs_f64(),
                 "calibrated": false, "motor_writes_blocked": true,
                 "total_cycles": cycle, "total_success": total_success, "total_communication_failures": total_failures,
@@ -428,6 +440,16 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn service_loop_counts_faults_without_any_motor_write() {
+        service_loop(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn qinmo_read_only_reports_explicit_units_identity_and_sensor_values() {
+        service_loop(true).await;
+    }
+
+    /// The Qinmo case is a specification model of protocol 1.2, not manufacturer firmware.
+    async fn service_loop(qinmo: bool) {
         let (mut master, mut slave) = (0, 0);
         let mut name = [0 as libc::c_char; 128];
         assert_eq!(
@@ -474,21 +496,45 @@ mod tests {
                     let id = frame[2];
                     let inst = frame[4];
                     worker_written.lock().unwrap().push(inst);
-                    assert!(matches!(inst, 2 | 0x82), "motor WRITE observed");
+                    assert!(
+                        matches!(inst, 2 | 0x82) || (qinmo && inst == 1),
+                        "motor WRITE observed"
+                    );
+                    if inst == 1 {
+                        master_file.write_all(&reply(200, &[])).unwrap();
+                        continue;
+                    }
                     if inst == 2 {
                         let data = if id == 200 {
-                            duck_control::feetech::IMU_IDENTITY.to_vec()
+                            if qinmo {
+                                assert_eq!(&frame[5..7], &[56, 15], "no Qinmo identity READ");
+                                vec![0; 15]
+                            } else {
+                                duck_control::feetech::IMU_IDENTITY.to_vec()
+                            }
                         } else {
                             vec![0]
                         };
                         master_file.write_all(&reply(id, &data)).unwrap();
                     } else {
-                        let mut expected = vec![SYNC_ADDRESS, SYNC_LENGTH, IMU_ID];
+                        let mut expected = vec![SYNC_ADDRESS, SYNC_LENGTH];
+                        if !qinmo {
+                            expected.push(IMU_ID);
+                        }
                         expected.extend(JOINT_IDS);
+                        if qinmo {
+                            expected.push(IMU_ID);
+                        }
                         assert_eq!(&frame[5..frame.len() - 1], expected);
                         cycle += 1;
-                        let mut ids = vec![200];
+                        let mut ids = Vec::new();
+                        if !qinmo {
+                            ids.push(200);
+                        }
                         ids.extend(JOINT_IDS);
+                        if qinmo {
+                            ids.push(200);
+                        }
                         let mut response = Vec::new();
                         for id in ids {
                             if cycle == 17 && id == 13 {
@@ -496,6 +542,9 @@ mod tests {
                             }
                             let mut data = [0u8; 15];
                             if id == 200 {
+                                if qinmo {
+                                    data[..2].copy_from_slice(&1640i16.to_le_bytes());
+                                }
                                 data[12] = cycle as u8;
                             } else {
                                 data[0..2].copy_from_slice(&2048u16.to_le_bytes());
@@ -547,12 +596,24 @@ mod tests {
         }
         let worker_state = Arc::clone(&state);
         let daemon = tokio::spawn(async move {
-            run(&path, "auto", &worker_state, Duration::from_millis(5), None).await;
+            run(
+                &path,
+                "auto",
+                if qinmo { "qinmo" } else { "legacy" },
+                &worker_state,
+                Duration::from_millis(5),
+                None,
+            )
+            .await;
         });
         let result = tokio::time::timeout(Duration::from_secs(35), async {
             loop {
                 if let Some(report) = state.bus_status.load_full()
-                    && !report["last_3000"].is_null()
+                    && ((!qinmo && !report["last_3000"].is_null())
+                        || (qinmo
+                            && report["last_sample"]["cycle"]
+                                .as_u64()
+                                .is_some_and(|c| c >= 50)))
                 {
                     break report;
                 }
@@ -566,6 +627,16 @@ mod tests {
         firmware.join().unwrap();
         drop(slave_file);
         let report = result.expect("service did not complete a 3000-cycle window");
+        if qinmo {
+            let imu = &report["last_sample"]["imu"];
+            assert_eq!(imu["bus"]["profile"], "qinmo");
+            assert_eq!(imu["bus"]["identification"], "configured_profile");
+            assert_eq!(imu["bus"]["identity"], json!([]));
+            assert!(imu["age_upper_bound_ms"].is_null());
+            assert_eq!(imu["quaternion_wxyz"], json!([1.0, 0.0, 0.0, 0.0]));
+            assert!((imu["gyro_rad_s"][0].as_f64().unwrap().to_degrees() - 100.0).abs() < 1e-10);
+            return;
+        }
         let window = &report["last_3000"];
         assert_eq!(window["cycles"], 3000);
         assert_eq!(window["success"], 2998, "{window}");
@@ -742,6 +813,7 @@ mod tests {
             run(
                 &path,
                 "auto",
+                "legacy",
                 &worker_state,
                 Duration::from_millis(5),
                 Some(&host),

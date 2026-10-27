@@ -185,6 +185,7 @@ fn peer_fault(
         last_sync: SyncTrace::default(),
         imu_board: BusImuBoard::Ft6,
         imu_protocol: BusImuProtocol::Auto,
+        imu_profile: BusImuProfile::Legacy,
         imu_identity: None,
     };
     (
@@ -205,6 +206,7 @@ fn auto_detects_feetech_without_sending_dxl2_or_writes() {
     assert_eq!(tx.len(), 1);
     assert_eq!(tx[0], packet(IMU_ID, READ, &[0, 5]).unwrap());
     assert_eq!(bus.imu_info().unwrap().protocol, "feetech");
+    assert_eq!(bus.imu_info().unwrap().identification, "legacy_identity");
 }
 
 #[test]
@@ -222,6 +224,7 @@ fn auto_detects_dxl2_and_reads_feetech_servos_separately() {
     assert_eq!(tx[4], sync_read_packet(56, 15, &ids).unwrap());
     assert!(bus.last_sync.missing_ids.is_empty());
     assert_eq!(bus.imu_info().unwrap().identity, [0x44, 0x4d, 1]);
+    assert_eq!(bus.imu_info().unwrap().identification, "compatibility_layout");
 }
 
 #[test]

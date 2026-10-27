@@ -1310,7 +1310,7 @@ fn spawn_control_thread(
         state.bus_status.store(Some(Arc::new(serde_json::json!({
             "build":feetech_commissioning::BUILD,
             "mode":if commissioning { "commissioning" } else { "motion" },
-            "phase":"configuring_bus","port":bus.port
+            "phase":"configuring_bus","port":bus.port,"configured_imu_profile":bus.imu_profile.label()
         }))));
     }
 
@@ -1375,6 +1375,7 @@ fn spawn_control_thread(
                 runtime.block_on(feetech_commissioning::run(
                     &params.bus.port,
                     params.bus.imu_protocol.label(),
+                    params.bus.imu_profile.label(),
                     &state,
                     period,
                     calibration_path,
@@ -1386,6 +1387,7 @@ fn spawn_control_thread(
                 runtime.block_on(feetech_read_only::run(
                     &params.bus.port,
                     params.bus.imu_protocol.label(),
+                    params.bus.imu_profile.label(),
                     &state,
                     period,
                     host,
@@ -1517,25 +1519,41 @@ fn open_bus(
             let calibration: duck_control::feetech::Calibration =
                 toml::from_str(&std::fs::read_to_string(path)?)?;
             let kind = host_imu.map_or(TrunkImuKind::Bus, |reader| reader.kind());
+            if let Some(state) = state {
+                let mut report =
+                    feetech_commissioning::calibration_status(&calibration, path, kind);
+                report["configured_imu_profile"] = serde_json::json!(bus.imu_profile.label());
+                state.bus_calibration.store(Some(Arc::new(report)));
+            }
             calibration.validate_motion_for(kind)?;
-            let report = feetech_commissioning::calibration_status(&calibration, path, kind);
             // Optional servo P/D/torque limit (servo-test-parameters.json), read before the
             // bus is opened: a bad file stops motion startup without touching the servos.
             let servo_test = duck_control::hd1910_test::load(path)?;
             let mut raw = duck_control::feetech::Bus::open(port)?;
             raw.set_imu_protocol(bus.imu_protocol.label())?;
+            raw.set_imu_profile(bus.imu_profile.label())?;
             let mut io = match host_imu {
                 Some(reader) => duck_control::feetech::FeetechIo::for_startup_with_imu(
                     raw,
-                    calibration,
+                    calibration.clone(),
                     Box::new(reader.clone()),
                 )?,
-                None => duck_control::feetech::FeetechIo::for_startup(raw, calibration)?,
+                None => duck_control::feetech::FeetechIo::for_startup(raw, calibration.clone())?,
             };
             io.set_servo_test(servo_test);
             io.confirm_startup_limp()?;
             if let Some(state) = state {
+                let report = feetech_commissioning::calibration_status_for_bus(
+                    &calibration,
+                    path,
+                    kind,
+                    &io.bus,
+                );
                 state.bus_calibration.store(Some(Arc::new(report)));
+            }
+            if kind == TrunkImuKind::Bus {
+                calibration
+                    .validate_bus_mount_for(io.bus.imu_board().protocol(), io.bus.imu_profile())?;
             }
             Ok(io)
         };
@@ -1551,7 +1569,7 @@ fn open_bus(
                     state.startup_step(2, "waiting", &e.to_string());
                     state.bus_status.store(Some(Arc::new(serde_json::json!({
                         "build":feetech_commissioning::BUILD,"mode":"motion",
-                        "phase":"waiting_for_bus","port":port,"error":e.to_string()
+                        "phase":"waiting_for_bus","port":port,"configured_imu_profile":bus.imu_profile.label(),"error":e.to_string()
                     }))));
                 }
                 if loud { tracing::warn!(error = %e, port, attempt, "hardware initialization waiting"); }
@@ -1809,9 +1827,12 @@ async fn adopt_startup_pose<T: RobotIo>(
                 // very first failure rather than after the first log line.
                 state.startup_bus_failures.store(attempt, Ordering::Relaxed);
                 state.startup_step(2, "waiting", &e.to_string());
+                let configured_imu_profile = safety
+                    .feetech_diagnostics()
+                    .map(|d| d.configured_imu_profile);
                 state.bus_status.store(Some(Arc::new(serde_json::json!({
                     "build":feetech_commissioning::BUILD,"mode":"motion",
-                    "phase":"waiting_for_bus","error":e.to_string()
+                    "phase":"waiting_for_bus","configured_imu_profile":configured_imu_profile,"error":e.to_string()
                 }))));
                 if attempt == 1 || attempt.is_multiple_of(STARTUP_READ_LOG_EVERY) {
                     tracing::warn!(
@@ -7029,6 +7050,7 @@ mod tests {
             fn feetech_snapshot(&self) -> Option<snapshot::Snapshot> {
                 let ready = self.stage.load(Ordering::Relaxed) >= 2;
                 let metadata = Arc::new(snapshot::Metadata {
+                    configured_imu_profile: "legacy",
                     backend: "feetech_ft6",
                     imu_source: "bus",
                     imu_bus: None,
@@ -9222,6 +9244,45 @@ mod tests {
             assert!(!error.contains("servo test"), "{error}");
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn configured_qinmo_profile_is_visible_when_discovery_cannot_start() {
+        let directory = tempfile::tempdir().unwrap();
+        let calibration = directory.path().join("calibration.toml");
+        std::fs::write(
+            &calibration,
+            include_str!("../../packaging/hd1910-calibration.robot.toml"),
+        )
+        .unwrap();
+        let bus = params::Bus {
+            protocol: params::BusProtocol::Feetech,
+            imu_profile: params::ImuBusProfile::Qinmo,
+            feetech_calibration: Some(calibration),
+            port: "/dev/definitely-not-a-qinmo-bus".into(),
+            ..Default::default()
+        };
+        let state = RobotState::new(
+            &Params::default(),
+            Path::new("/test/robotd.toml"),
+            false,
+            false,
+        );
+        assert!(open_bus(&bus, None, 0, Some(&state)).is_none());
+        let report = state.bus_status.load_full().unwrap();
+        assert_eq!(report["configured_imu_profile"], "qinmo");
+        assert!(report.get("imu_bus").is_none());
+        let calibration = state.bus_calibration.load_full().unwrap();
+        assert_eq!(calibration["configured_imu_profile"], "qinmo");
+        assert_eq!(calibration["imu_source"], "bus");
+        assert_eq!(calibration["imu_mount"]["verified"], false);
+        assert!(
+            calibration["imu_binding_validation"]
+                .as_str()
+                .unwrap()
+                .contains("discovery")
+        );
     }
 
     /// A silent bus must be *degraded*, not unhealthy: it reports the same before and after

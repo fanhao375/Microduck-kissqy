@@ -666,9 +666,10 @@ address 0x4A or 0x4B) or `lsm6dsv16x` (the board's own chip on a breakout, 0x6A 
 must fail as a bus fault, not quietly start trusting whatever else is on I²C. `Params::load`
 refuses a module with the Dynamixel backend, and an address the chip cannot be strapped to.
 
-**The Feetech backend identifies the bus IMU once, before acquisition.**
+**The Feetech backend discovers the bus IMU once, before acquisition.**
 `[bus] imu_protocol` defaults to `"auto"`; `"feetech"` and `"dxl2"` force a wire format and
-never fall back. At the configured UART baud, ID 200 is probed with read-only requests:
+never fall back. `[bus] imu_profile` defaults to `"legacy"`, preserving existing configurations.
+Under that profile, ID 200 is probed with read-only requests:
 the FT6 identity or the compatible IMU-to-DXL Feetech identity selects the existing 56/15
 block and its first/last reply ordering. If that format does not answer, DXL 2.0 identity
 and a decodable 124/12 SFLP block select DXL2. An unknown responding Feetech identity or
@@ -676,21 +677,63 @@ an unsupported DXL2 layout is an error. Detection changes neither IDs, baud nor 
 there is no per-tick rescan or silent protocol switch after failure. This is layout
 compatibility, not a claim to support every manufacturer, Euler/full-float firmware or ID.
 
+`imu_profile = "qinmo"` explicitly selects Qinmo IMU-DXL protocol 1.2 data semantics on the
+native fifteen-servo Feetech bus, ID 200 at 1 Mbps. With `imu_protocol = "auto"` or
+`"feetech"`, the first request is Feetech PING, followed by a bounded address-56/length-15
+READ. No identity READ at 0/5, DXL2 probe, protocol fallback or per-tick rescan occurs.
+`qinmo` plus `dxl2`, or plus Dynamixel servos, is refused at configuration validation. Qinmo
+locks to its first valid wire protocol until 20 seconds without valid communication;
+cross-protocol retries would defeat discovery. Its Wizard model 1030 / firmware 3 is a
+compatibility identity, not vendor authentication. Neither that identity, ID 200, packet
+shape, missing legacy identity nor gyro magnitude selects Qinmo automatically. Its data
+profile is one saved installation choice, made by the matching IMU webpage while the main
+program is stopped, followed by controlled reconnect. It is then used automatically at startup.
+
+Qinmo's signed little-endian gyro words are divided by 16.4 in degrees/s, then converted to
+rad/s. Binary16 XYZ reconstruct W >= 0 and normalize before the existing mount and median.
+Byte 12 is the real wrapping u8 sample counter; byte 13 permits only bit 0 (not ready), and
+byte 14 must be zero. Wrong lengths, reserved bits/bytes and nonfinite or grossly over-unit
+quaternions are rejected. Ready zero XYZ is identity; the legacy SFLP all-zero sentinel and
+17.5 mdps/LSB conversion remain unchanged. The 25-valid-quaternion ready gate still applies.
+The published reference is [Qinmo protocol 1.2 at commit 4644a9d](https://gitee.com/QinmoTech/IMU-DXL/blob/4644a9d19e07ac47f2c145c5e064c96683a5450b/docs/PROTOCOL.md);
+its repository provides documentation/debugger code, not manufacturer MCU firmware.
+
 **One owner and one telemetry deadline.** The same `Bus` reads a DXL2 IMU by unicast READ,
 then the fifteen Feetech servos by Sync Read, sharing one absolute 20 ms deadline. CRC errors,
-foreign packets or noise in either part disqualify a partial read. Feetech IMU telemetry keeps
-its original schema, sequence/status and age bound. DXL2 supplies only the real 12-byte
+foreign packets or noise in either part disqualify a partial read. Legacy Feetech IMU telemetry
+keeps its original schema, sequence/status and age bound. Qinmo joins the fifteen servos in
+one 56/15 Sync Read, answering last. Its control and read-only telemetry retain the 20 ms
+transaction deadline; the manufacturer's 60 ms debugger timeout is not a control budget.
+Qinmo reports no sensor-age guarantee, so age and age-upper-bound diagnostics remain absent.
+Freshness requires an on-time host transaction, ready/valid data and actual sample-counter
+progression: the third consecutive duplicate is refused. This bounds frozen streams; it
+does not prove a sensor acquisition timestamp. DXL2 supplies only the real 12-byte
 SFLP core: no sensor sequence, status bits or sensor-side age are invented. Its host transaction
 must be on time; 25 identical core payloads are treated as frozen. Both paths retain the
-existing 25-valid-quaternion ready gate. Diagnostics identify the detected `imu_bus`
-protocol, board/layout and raw identity in commissioning and motion.
+existing 25-valid-quaternion ready gate. Motion, commissioning and read-only sampling use
+the same profile-aware readings. Diagnostics include `configured_imu_profile` even before
+discovery succeeds, so the webpage can recover a wrong selection. A successful `imu_bus`
+report includes protocol, board/layout, profile, `gyro_dps_per_lsb`, identity and identification
+evidence. Qinmo uses `protocol="feetech"`, `board="qinmo"`, `profile="qinmo"`,
+`gyro_dps_per_lsb=1/16.4`, `identity=[]`, `identification="configured_profile"`.
+Legacy reports preserve existing semantic fields and add `profile="legacy"` and the 0.0175
+scale. Recognized FT6/imu_to_dxl identity uses `identification="legacy_identity"`; generic
+DXL2 identity plus a decodable SFLP block uses `identification="compatibility_layout"`.
+These labels do not authenticate a manufacturer.
 
-**A verified mount is bound to its bus protocol.** Its quaternion remains in the top-level
+**A verified mount is bound to its bus protocol and data profile.** Its quaternion remains in the top-level
 `imu_mount_quat` / `imu_mount_verified`, with `imu_bus_protocol = "feetech"` or `"dxl2"`
-saved by successful `verify-imu`. A legacy missing binding means Feetech. A mismatch keeps
-the daemon accessible and limp, but cannot authorize torque-on; redo the IMU mounting
+and `imu_bus_profile = "legacy"` or `"qinmo"` saved by successful `verify-imu`. Missing bindings
+mean Feetech and legacy. A mismatch keeps the daemon accessible and limp, but refuses motion
+startup and torque-on; use commissioning to redo the IMU mounting
 calibration. A physical mounting or module change also requires recalibration, even when
-the protocol is unchanged. I²C sources keep their existing separate calibration slots.
+the protocol is unchanged. Calibration status preserves the raw persisted document, while
+top-level `imu_mount={quat,verified}` and `imu_mount_verified` report the effective binding;
+`imu_binding_validation` explains a mismatch and also appears as `motion_validation`.
+Before discovery the effective bus mount is unverified. I²C sources keep their existing
+separate calibration slots. The configuration and metadata are additive; IPC API_VERSION
+remains 40, and version skew itself is never a blanket refusal. A Qinmo selection requires
+a matching runtime binary. [Selection and verification guide](../robot/qinmo-imu.md).
 
 **A module is read by a thread, not by the tick.** `robotd/src/trunk_imu_i2c.rs` owns the
 i2c-dev file and runs one state machine per chip on the codecs in `duck-control`

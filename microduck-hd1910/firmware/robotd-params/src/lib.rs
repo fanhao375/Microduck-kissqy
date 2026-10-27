@@ -1860,6 +1860,8 @@ pub struct Bus {
     /// IMU at ID 200 may speak a different protocol from the servos. Detection
     /// is read-only at startup; an explicit override never falls back.
     pub imu_protocol: ImuBusProtocol,
+    /// Data units/layout are an installation choice, never inferred from a compatible ID.
+    pub imu_profile: ImuBusProfile,
     pub feetech_calibration: Option<PathBuf>,
     /// Serial port the servos and the IMU board share. The Radxa Zero 3W wires them to
     /// `/dev/ttyS2`.
@@ -1901,9 +1903,51 @@ impl ImuBusProtocol {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ImuBusProfile {
+    #[default]
+    Legacy,
+    Qinmo,
+}
+impl ImuBusProfile {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Qinmo => "qinmo",
+        }
+    }
+}
+
 #[cfg(test)]
 mod imu_bus_protocol_tests {
     use super::*;
+
+    #[test]
+    fn imu_profile_defaults_to_legacy_and_accepts_only_explicit_qinmo_on_feetech() {
+        let defaults = toml::Value::try_from(Bus::default()).unwrap();
+        assert_eq!(
+            defaults.get("imu_profile").and_then(|v| v.as_str()),
+            Some("legacy")
+        );
+        for profile in ["legacy", "qinmo"] {
+            for protocol in ["auto", "feetech"] {
+                let text = format!(
+                    "[bus]\nprotocol='feetech'\nimu_protocol='{protocol}'\nimu_profile='{profile}'\n"
+                );
+                let params: Params = toml::from_str(&text).unwrap();
+                assert!(params.validate(Path::new("test.toml")).is_ok());
+            }
+        }
+        for text in [
+            "[bus]\nprotocol='feetech'\nimu_protocol='dxl2'\nimu_profile='qinmo'\n",
+            "[bus]\nprotocol='dynamixel'\nimu_profile='qinmo'\n",
+        ] {
+            let params: Params = toml::from_str(text).unwrap();
+            assert!(params.validate(Path::new("test.toml")).is_err());
+        }
+        assert!(toml::from_str::<Params>("[bus]\nimu_profile='guess'\n").is_err());
+    }
 
     #[test]
     fn imu_protocol_defaults_to_auto_and_accepts_only_known_overrides() {
@@ -1987,6 +2031,7 @@ impl Default for Bus {
         Self {
             protocol: BusProtocol::Dynamixel,
             imu_protocol: ImuBusProtocol::Auto,
+            imu_profile: ImuBusProfile::Legacy,
             feetech_calibration: None,
             port: "/dev/ttyS2".into(),
             fast_sync_read: true,
@@ -2269,6 +2314,15 @@ impl Params {
     /// Reject values that would produce a loop that cannot work, at startup rather than as
     /// a division by zero three seconds later.
     fn validate(&self, path: &Path) -> Result<(), ParamsError> {
+        if self.bus.imu_profile == ImuBusProfile::Qinmo
+            && (self.bus.protocol != BusProtocol::Feetech
+                || self.bus.imu_protocol == ImuBusProtocol::Dxl2)
+        {
+            return Err(ParamsError::TrunkImu {
+                path: path.display().to_string(),
+                reason: "bus.imu_profile=qinmo requires native Feetech servos and imu_protocol=auto or feetech".into(),
+            });
+        }
         if self.control.hz == 0 || self.control.hz > 1000 {
             return Err(ParamsError::Rate {
                 path: path.display().to_string(),

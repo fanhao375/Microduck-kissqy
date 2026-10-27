@@ -29,15 +29,20 @@ fn dxl_status(payload: &[u8]) -> Vec<u8> {
 
 #[test]
 fn r9_startup_cadence_and_motion_use_one_bus_without_recovery() {
-    commissioning_flow(false);
+    commissioning_flow(false, false);
 }
 
 #[test]
 fn dxl2_commissioning_detects_samples_verifies_and_stops_on_a_servo_fault() {
-    commissioning_flow(true);
+    commissioning_flow(true, false);
 }
 
-fn commissioning_flow(dxl2: bool) {
+#[test]
+fn qinmo_commissioning_uses_explicit_profile_and_persists_both_mount_bindings() {
+    commissioning_flow(false, true);
+}
+
+fn commissioning_flow(dxl2: bool, qinmo: bool) {
     let mut master = 0;
     let mut slave = 0;
     let mut name = [0i8; 128];
@@ -62,10 +67,17 @@ fn commissioning_flow(dxl2: bool) {
         libc::close(slave);
     }
 
-    let dir = std::env::temp_dir().join(format!("microduck-r9-{}-{dxl2}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "microduck-r9-{}-{dxl2}-{qinmo}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let calibration_path = dir.join("calibration.toml");
-    let cal = duck_control::feetech::Calibration::commissioning(JOINT_IDS);
+    let mut cal = duck_control::feetech::Calibration::commissioning(JOINT_IDS);
+    if qinmo {
+        cal.imu_mount_quat = [1.0, 0.0, 0.0, 0.0];
+        cal.imu_mount_verified = true; // A persisted legacy verification is not the new binding.
+    }
     let mut original = toml::to_string(&cal).unwrap();
     std::fs::write(&calibration_path, &original).unwrap();
     let state = Arc::new(RobotState::new(
@@ -117,6 +129,7 @@ fn commissioning_flow(dxl2: bool) {
             pending.extend_from_slice(&bytes[..n]);
             while pending.len() >= 4 {
                 if pending[..4] == [255, 255, 253, 0] {
+                    assert!(!qinmo, "Qinmo must not receive a DXL2 probe");
                     if pending.len() < 7 {
                         break;
                     }
@@ -159,6 +172,12 @@ fn commissioning_flow(dxl2: bool) {
                 let packet = pending.drain(..size).collect::<Vec<_>>();
                 assert_eq!(&packet[..2], &[255, 255]);
                 assert_eq!(packet[2..].iter().fold(0u8, |a, b| a.wrapping_add(*b)), 255);
+                if packet[2] == 200 && packet[4] == 1 {
+                    assert!(qinmo);
+                    wire.write_all(&duck_control::feetech::packet(200, 0, &[]).unwrap())
+                        .unwrap();
+                    continue;
+                }
                 let args = &packet[5..size - 1];
                 let address = args[0];
                 let length = args[1] as usize;
@@ -189,7 +208,7 @@ fn commissioning_flow(dxl2: bool) {
                 } else {
                     vec![packet[2]]
                 };
-                if address == 56 {
+                if address == 56 && packet[4] == 0x82 {
                     if rounds == 0 {
                         let gap = Instant::now().duration_since(
                             initialization_reply.expect("startup torque verification"),
@@ -205,6 +224,8 @@ fn commissioning_flow(dxl2: bool) {
                         ids,
                         if dxl2 {
                             JOINT_IDS.to_vec()
+                        } else if qinmo {
+                            JOINT_IDS.into_iter().chain([200]).collect::<Vec<_>>()
                         } else {
                             std::iter::once(200).chain(JOINT_IDS).collect::<Vec<_>>()
                         }
@@ -221,9 +242,14 @@ fn commissioning_flow(dxl2: bool) {
                     let mut data = vec![0u8; length];
                     if id == 200 {
                         if address == 0 {
+                            assert!(!qinmo, "Qinmo has no documented identity READ");
                             data.copy_from_slice(&duck_control::feetech::IMU_IDENTITY);
                         } else {
-                            data[7] = 0x30;
+                            if qinmo {
+                                data[..2].copy_from_slice(&1640i16.to_le_bytes());
+                            } else {
+                                data[7] = 0x30;
+                            }
                             data[12] = 250u8.wrapping_add(rounds);
                         }
                     } else {
@@ -264,6 +290,7 @@ fn commissioning_flow(dxl2: bool) {
             .block_on(run(
                 &port,
                 "auto",
+                if qinmo { "qinmo" } else { "legacy" },
                 &control_state,
                 Duration::from_millis(20),
                 &path,
@@ -283,17 +310,48 @@ fn commissioning_flow(dxl2: bool) {
         }
     };
     wait(&|| state.ticks.load(Ordering::Relaxed) >= 8);
-    if dxl2 {
+    if dxl2 || qinmo {
         wait(&|| state.imu_ready.load(Ordering::Relaxed));
         let report =
             serde_json::to_value(state.bus_snapshot.load_full().unwrap().as_ref()).unwrap();
-        assert_eq!(report["imu_bus"]["protocol"], "dxl2");
-        assert!(report["last_sample"]["imu"].get("sequence").is_none());
+        assert_eq!(
+            report["imu_bus"]["protocol"],
+            if qinmo { "feetech" } else { "dxl2" }
+        );
+        if qinmo {
+            assert_eq!(report["imu_bus"]["profile"], "qinmo");
+            assert_eq!(
+                report["last_sample"]["imu"]["quaternion_wxyz"],
+                serde_json::json!([1.0, 0.0, 0.0, 0.0])
+            );
+            assert!(
+                (report["last_sample"]["imu"]["gyro_rad_s"][0]
+                    .as_f64()
+                    .unwrap()
+                    .to_degrees()
+                    - 100.0)
+                    .abs()
+                    < 1e-10
+            );
+            let status = state.bus_calibration.load_full().unwrap();
+            assert_eq!(
+                status["imu_mount"]["verified"], false,
+                "legacy mount is effectively invalid"
+            );
+            assert!(
+                status["imu_binding_validation"]
+                    .as_str()
+                    .unwrap()
+                    .contains("profile")
+            );
+        } else {
+            assert!(report["last_sample"]["imu"].get("sequence").is_none());
+        }
         let reply = tokio::runtime::Runtime::new().unwrap().block_on(dispatch(
             &state,
             proto::Id::Number(80),
             serde_json::json!({"action":"verify-imu","confirmed":true,
-                "mount_wxyz":[(1.0_f64-0.125_f64.powi(2)).sqrt(),0.125,0.0,0.0]}),
+                "mount_wxyz":if qinmo {vec![1.0,0.0,0.0,0.0]} else {vec![(1.0_f64-0.125_f64.powi(2)).sqrt(),0.125,0.0,0.0]} }),
         ));
         let reply = serde_json::to_value(reply).unwrap();
         assert!(reply.get("result").is_some(), "{reply}");
@@ -301,7 +359,19 @@ fn commissioning_flow(dxl2: bool) {
         let saved: duck_control::feetech::Calibration = toml::from_str(&original).unwrap();
         assert_eq!(
             saved.imu_bus_protocol,
-            Some(duck_control::feetech::BusImuProtocol::Dxl2)
+            Some(if qinmo {
+                duck_control::feetech::BusImuProtocol::Feetech
+            } else {
+                duck_control::feetech::BusImuProtocol::Dxl2
+            })
+        );
+        assert_eq!(
+            saved.imu_bus_profile,
+            Some(if qinmo {
+                duck_control::feetech::BusImuProfile::Qinmo
+            } else {
+                duck_control::feetech::BusImuProfile::Legacy
+            })
         );
         assert!(saved.imu_mount_verified);
         assert!(!saved.motion_enabled);

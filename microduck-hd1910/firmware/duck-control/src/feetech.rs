@@ -1,5 +1,5 @@
 // Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; optional servo P/D/torque-limit file; BNO08x gyro-integrated attitude; see IMU-MODULE.md at the repository root.
-//! Native Feetech TTL packets. No Dynamixel packets or address translation.
+//! Native Feetech servo packets, with explicit or discovered bus-IMU wire/data contracts.
 //!
 //! HD1910 telemetry uses only the 15-byte feedback block at 56..=70.
 //! FT6 shares that 15-byte block length; all 16 devices use one Sync Read. With the trunk
@@ -33,9 +33,8 @@ pub const IMU_IDENTITY: [u8; 5] = [6, 0, 0, 0, 0xf2];
 /// Model number of microduck-replica's own bus IMU board (imu_to_dxl), little-endian at 3..5.
 pub const IMU_TO_DXL_MODEL: [u8; 2] = [0x44, 0x4d];
 
-/// Which board answers as ID 200, from its five identity bytes at address 0. Both serve the
-/// same 56/15 block (gyro i16 x3 at 17.5 mdps/LSB, SFLP fp16 x/y/z, counter, status, zero).
-/// They differ in where they can sit in the Sync Read:
+/// Legacy boards are identified by their register bytes; Qinmo is an explicit configured
+/// profile. The board/layout also decides its position in a Feetech Sync Read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum BusImuBoard {
     /// kissqy's FT6 board: first in the list, as its firmware expects.
@@ -47,6 +46,8 @@ pub enum BusImuBoard {
     ImuToDxl,
     /// DXL 2.0 SFLP register layout, ID 200, address 124, twelve bytes.
     Dxl2,
+    /// Explicit protocol-1.2 data profile; PING and layout validation are not vendor authentication.
+    Qinmo,
 }
 impl BusImuBoard {
     pub fn from_identity(raw: &[u8]) -> Option<Self> {
@@ -63,6 +64,7 @@ impl BusImuBoard {
             Self::Ft6 => "ft6",
             Self::ImuToDxl => "imu_to_dxl",
             Self::Dxl2 => "sflp_124_12",
+            Self::Qinmo => "qinmo",
         }
     }
 
@@ -93,16 +95,46 @@ impl BusImuProtocol {
     }
 }
 
+/// A configured data contract, independent of the on-wire protocol or vendor identity.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BusImuProfile {
+    #[default]
+    Legacy,
+    Qinmo,
+}
+impl BusImuProfile {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Qinmo => "qinmo",
+        }
+    }
+    pub fn gyro_dps_per_lsb(self) -> f64 {
+        match self {
+            Self::Legacy => 0.0175,
+            Self::Qinmo => 1.0 / 16.4,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct BusImuInfo {
     pub protocol: &'static str,
     pub board: &'static str,
     pub identity: Vec<u8>,
+    pub profile: &'static str,
+    pub gyro_dps_per_lsb: f64,
+    pub identification: &'static str,
 }
 
 #[cfg(all(test, unix))]
 #[path = "feetech_dxl2_tests.rs"]
 mod dxl2_transport_tests;
+
+#[cfg(all(test, unix))]
+#[path = "feetech_qinmo_tests.rs"]
+mod qinmo_transport_tests;
 
 /// The Sync Read list for the 56/15 telemetry: the IMU first or last, by board.
 pub fn telemetry_ids(board: BusImuBoard, servo_ids: &[u8]) -> Vec<u8> {
@@ -111,7 +143,7 @@ pub fn telemetry_ids(board: BusImuBoard, servo_ids: &[u8]) -> Vec<u8> {
         ids.push(IMU_ID);
     }
     ids.extend_from_slice(servo_ids);
-    if board == BusImuBoard::ImuToDxl {
+    if matches!(board, BusImuBoard::ImuToDxl | BusImuBoard::Qinmo) {
         ids.push(IMU_ID);
     }
     ids
@@ -120,7 +152,8 @@ pub fn telemetry_ids(board: BusImuBoard, servo_ids: &[u8]) -> Vec<u8> {
 fn unknown_imu(raw: &[u8]) -> IoError {
     error(format!(
         "ID 200 is neither FT6 (06 00 00 00 f2) nor imu_to_dxl (model 0x4D44, firmware 0.2.0 or later); \
-         it reported {raw:02x?}"
+         it reported {raw:02x?}. If this is a Qinmo board, select Qinmo on the IMU page \
+         while the main program is stopped, then verify its mounting again; the profile is not autodetected"
     ))
 }
 /// FT6 sets status bit1 at TX when quaternion age exceeds this bound.
@@ -264,6 +297,7 @@ pub struct Bus {
     /// The bus IMU board, once `identify_imu` has read it; FT6 until then.
     imu_board: BusImuBoard,
     imu_protocol: BusImuProtocol,
+    imu_profile: BusImuProfile,
     imu_identity: Option<Vec<u8>>,
 }
 
@@ -303,14 +337,24 @@ impl Bus {
             last_sync: SyncTrace::default(),
             imu_board: BusImuBoard::Ft6,
             imu_protocol: BusImuProtocol::Auto,
+            imu_profile: BusImuProfile::Legacy,
             imu_identity: None,
         })
     }
 
-    /// Read ID 200's identity and remember which board it is, which sets where it goes in the
-    /// telemetry Sync Read. Anything else is refused.
+    /// Discover ID 200 under the saved profile and establish its telemetry layout/order.
+    /// Qinmo's configured profile is never presented as authenticated vendor identity.
     pub fn identify_imu(&mut self) -> Result<BusImuBoard> {
         self.imu_identity = None;
+        if self.imu_profile == BusImuProfile::Qinmo {
+            // The first valid frame locks Qinmo's protocol for 20 seconds of idle.
+            // Never probe DXL2 or assume an undocumented identity table on this path.
+            self.ping(IMU_ID)?;
+            ImuSample::decode_qinmo(&self.read(IMU_ID, SYNC_ADDRESS, IMU_LENGTH)?)?;
+            self.imu_board = BusImuBoard::Qinmo;
+            self.imu_identity = Some(Vec::new());
+            return Ok(self.imu_board);
+        }
         let mut feetech_failure = None;
         if self.imu_protocol != BusImuProtocol::Dxl2 {
             match self.read(IMU_ID, 0, 5) {
@@ -342,14 +386,37 @@ impl Bus {
     }
 
     pub fn set_imu_protocol(&mut self, value: &str) -> Result<()> {
-        self.imu_protocol = match value {
+        let protocol = match value {
             "auto" => BusImuProtocol::Auto,
             "feetech" => BusImuProtocol::Feetech,
             "dxl2" => BusImuProtocol::Dxl2,
             _ => return Err(error("IMU protocol must be auto, feetech or dxl2")),
         };
+        if self.imu_profile == BusImuProfile::Qinmo && protocol == BusImuProtocol::Dxl2 {
+            return Err(error("Qinmo profile requires imu_protocol=auto or feetech"));
+        }
+        self.imu_protocol = protocol;
         self.imu_identity = None;
         Ok(())
+    }
+
+    /// Set once before discovery, while the main program is stopped.
+    pub fn set_imu_profile(&mut self, value: &str) -> Result<()> {
+        let profile = match value {
+            "legacy" => BusImuProfile::Legacy,
+            "qinmo" => BusImuProfile::Qinmo,
+            _ => return Err(error("IMU profile must be legacy or qinmo")),
+        };
+        if profile == BusImuProfile::Qinmo && self.imu_protocol == BusImuProtocol::Dxl2 {
+            return Err(error("Qinmo profile requires imu_protocol=auto or feetech"));
+        }
+        self.imu_profile = profile;
+        self.imu_identity = None;
+        Ok(())
+    }
+
+    pub fn imu_profile(&self) -> BusImuProfile {
+        self.imu_profile
     }
 
     pub fn imu_info(&self) -> Option<BusImuInfo> {
@@ -357,6 +424,13 @@ impl Bus {
             protocol: self.imu_board.protocol().label(),
             board: self.imu_board.label(),
             identity: self.imu_identity.clone()?,
+            profile: self.imu_profile.label(),
+            gyro_dps_per_lsb: self.imu_profile.gyro_dps_per_lsb(),
+            identification: match self.imu_board {
+                BusImuBoard::Qinmo => "configured_profile",
+                BusImuBoard::Dxl2 => "compatibility_layout",
+                BusImuBoard::Ft6 | BusImuBoard::ImuToDxl => "legacy_identity",
+            },
         })
     }
 
@@ -643,7 +717,14 @@ impl Bus {
         } else {
             Duration::from_millis(4)
         };
-        let deadline = started + if self.read_only { self.timeout } else { budget };
+        let deadline = started
+            + if self.read_only
+                && !(self.imu_profile == BusImuProfile::Qinmo && address == SYNC_ADDRESS)
+            {
+                self.timeout
+            } else {
+                budget
+            };
         let (started, deadline) = window.unwrap_or((started, deadline));
         let mut pending = ids.iter().copied().collect::<BTreeSet<_>>();
         let mut decoder = Decoder::for_sync_read(length);
@@ -822,7 +903,9 @@ impl Bus {
     }
 
     pub fn decode_imu(&self, raw: &[u8]) -> Result<ImuSample> {
-        if self.imu_board == BusImuBoard::Dxl2 {
+        if self.imu_profile == BusImuProfile::Qinmo {
+            ImuSample::decode_qinmo(raw)
+        } else if self.imu_board == BusImuBoard::Dxl2 {
             ImuSample::decode_dxl2(raw)
         } else {
             ImuSample::decode(raw)
@@ -834,6 +917,9 @@ impl Bus {
     }
 
     pub fn imu(&mut self) -> Result<ImuSample> {
+        if self.imu_profile == BusImuProfile::Qinmo {
+            return ImuSample::decode_qinmo(&self.read(IMU_ID, SYNC_ADDRESS, IMU_LENGTH)?);
+        }
         if self.imu_board == BusImuBoard::Dxl2 {
             let raw = self.dxl2_read(124, 12, Instant::now() + self.timeout)?;
             return ImuSample::decode_dxl2(&raw);
@@ -1025,6 +1111,7 @@ impl ServoSample {
 /// for the fast block: FT6 status provides a conservative age bound instead.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImuSample {
+    reading: SensorReading,
     pub block: [u8; 12],
     pub sequence: Option<u32>,
     pub age_ms: Option<u16>,
@@ -1033,6 +1120,32 @@ pub struct ImuSample {
     pub ready: bool,
 }
 impl ImuSample {
+    pub fn reading(&self) -> SensorReading {
+        self.reading
+    }
+
+    pub fn decode_qinmo(raw: &[u8]) -> Result<Self> {
+        let block: [u8; 12] = raw
+            .get(..12)
+            .and_then(|v| v.try_into().ok())
+            .filter(|_| raw.len() == 15)
+            .ok_or_else(|| error("Qinmo IMU requires 56/15"))?;
+        if raw[13] & !1 != 0 || raw[14] != 0 {
+            return Err(error("unsupported Qinmo IMU status/reserved byte"));
+        }
+        let ready = raw[13] & 1 == 0;
+        let reading = crate::imu::qinmo_reading(&block, ready)
+            .ok_or_else(|| error("Qinmo IMU has an invalid quaternion"))?;
+        Ok(Self {
+            reading,
+            block,
+            sequence: Some(u32::from(raw[12])),
+            age_ms: None,
+            age_upper_bound_ms: None,
+            status: Some(raw[13]),
+            ready,
+        })
+    }
     pub fn decode(raw: &[u8]) -> Result<Self> {
         if raw.len() != usize::from(IMU_LENGTH) {
             return Err(IoError::ShortRead {
@@ -1046,6 +1159,7 @@ impl ImuSample {
         }
         let ready = raw[13] & 0x07 == 0;
         Ok(Self {
+            reading: crate::imu::parse_block(raw[..12].try_into().unwrap()),
             block: raw[..12].try_into().unwrap(),
             sequence: Some(u32::from(raw[12])),
             age_ms: None,
@@ -1063,6 +1177,7 @@ impl ImuSample {
             return Err(error("unsupported Feetech IMU schema/flags"));
         }
         Ok(Self {
+            reading: crate::imu::parse_block(raw[..12].try_into().unwrap()),
             block: raw[..12].try_into().unwrap(),
             sequence: Some(u32::from_le_bytes(raw[12..16].try_into().unwrap())),
             age_ms: Some(u16::from_le_bytes([raw[16], raw[17]])),
@@ -1074,7 +1189,7 @@ impl ImuSample {
 
     pub fn is_fresh(&self, transaction_us: u64) -> bool {
         self.ready
-            && if self.sequence.is_none() {
+            && if self.age_upper_bound_ms.is_none() {
                 transaction_us <= TELEMETRY_DEADLINE_MS * 1000
             } else {
                 self.age_upper_bound_ms.is_some_and(|age| {
@@ -1092,6 +1207,7 @@ impl ImuSample {
             return Err(error("DXL2 IMU200 has an invalid SFLP quaternion"));
         }
         Ok(Self {
+            reading: crate::imu::parse_block(&block),
             block,
             sequence: None,
             age_ms: None,
@@ -1147,6 +1263,9 @@ pub struct Calibration {
     /// files describe Feetech; they cannot silently authorize a DXL2 mount.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub imu_bus_protocol: Option<BusImuProtocol>,
+    /// Missing in older files means the legacy units and quaternion readiness semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imu_bus_profile: Option<BusImuProfile>,
     /// Sensor-to-trunk rotation [w, x, y, z], not a heading reset.
     #[serde(default = "default_imu_mount")]
     pub imu_mount_quat: [f64; 4],
@@ -1250,6 +1369,24 @@ impl JointCalibration {
     }
 }
 impl Calibration {
+    pub fn validate_bus_mount_for(
+        &self,
+        protocol: BusImuProtocol,
+        profile: BusImuProfile,
+    ) -> Result<()> {
+        self.validate_bus_mount(protocol)?;
+        let bound = self.imu_bus_profile.unwrap_or_default();
+        if bound != profile
+            || (profile == BusImuProfile::Qinmo && protocol != BusImuProtocol::Feetech)
+        {
+            return Err(error(format!(
+                "IMU mounting was verified for profile {}, configured {}; redo IMU mounting calibration before motion",
+                bound.label(),
+                profile.label()
+            )));
+        }
+        Ok(())
+    }
     pub fn validate_bus_mount(&self, protocol: BusImuProtocol) -> Result<()> {
         let bound = self.imu_bus_protocol.unwrap_or(BusImuProtocol::Feetech);
         if bound == BusImuProtocol::Auto || protocol != bound {
@@ -1271,6 +1408,7 @@ impl Calibration {
             motion_enabled: false,
             imu_mount_verified: false,
             imu_bus_protocol: None,
+            imu_bus_profile: None,
             imu_mount_quat: default_imu_mount(),
             joints: JOINT_NAMES
                 .iter()
@@ -1566,6 +1704,7 @@ impl TelemetryTotals {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct FeetechDiagnostics {
+    pub configured_imu_profile: &'static str,
     pub backend: &'static str,
     pub read_timing_revision: &'static str,
     pub motion_enabled: bool,
@@ -1648,7 +1787,7 @@ enum TrunkImu {
     /// The FT6 board, ID 200, answering in the servos' own Sync Read. Exactly the state
     /// `FeetechIo` kept before there was any other source.
     Bus {
-        decoder: SflpDecoder,
+        decoder: TrunkFrame,
         freshness: BusImuFreshness,
         latest_age_ms: Option<u16>,
         latest_age_upper_bound_ms: Option<u16>,
@@ -1802,7 +1941,7 @@ impl FeetechIo {
     pub fn for_startup(bus: Bus, calibration: Calibration) -> Result<Self> {
         calibration.validate()?;
         let imu = TrunkImu::Bus {
-            decoder: SflpDecoder::new(calibration.imu_mount_quat),
+            decoder: TrunkFrame::new(calibration.imu_mount_quat),
             freshness: BusImuFreshness::default(),
             latest_age_ms: None,
             latest_age_upper_bound_ms: None,
@@ -1904,7 +2043,7 @@ impl FeetechIo {
             && (self.imu.kind() != TrunkImuKind::Bus
                 || self
                     .calibration
-                    .validate_bus_mount(self.bus.imu_board.protocol())
+                    .validate_bus_mount_for(self.bus.imu_board.protocol(), self.bus.imu_profile)
                     .is_ok())
     }
     fn require_fresh_sample(&self) -> Result<()> {
@@ -1965,7 +2104,7 @@ impl FeetechIo {
                         .ok_or_else(|| error("Feetech Sync Read omitted IMU ID 200"))?,
                 )?;
                 freshness.check(&raw_imu, self.bus.last_sync.elapsed_us)?;
-                (decoder.decode(&raw_imu.block), Some(raw_imu), None)
+                (decoder.push(raw_imu.reading()), Some(raw_imu), None)
             }
             // Taken after the servos' transaction, so it is as fresh as this tick can have.
             TrunkImu::Host {
@@ -2217,7 +2356,7 @@ impl RobotIo for FeetechIo {
         if on {
             if matches!(self.imu, TrunkImu::Bus { .. }) {
                 self.calibration
-                    .validate_bus_mount(self.bus.imu_board.protocol())?;
+                    .validate_bus_mount_for(self.bus.imu_board.protocol(), self.bus.imu_profile)?;
             }
             self.calibration.validate_motion_for(self.imu.kind())?;
             self.require_fresh_sample()?;
@@ -2338,6 +2477,7 @@ impl RobotIo for FeetechIo {
         }
         let (imu_age_ms, imu_age_upper_bound_ms, imu_status) = self.imu.latest();
         Some(FeetechDiagnostics {
+            configured_imu_profile: self.bus.imu_profile.label(),
             backend: "feetech_ft6",
             read_timing_revision: READ_TIMING_REVISION,
             motion_enabled: self.calibration.motion_enabled,
@@ -2382,6 +2522,7 @@ impl RobotIo for FeetechIo {
             .snapshot_metadata
             .get_or_init(|| {
                 std::sync::Arc::new(snapshot::Metadata {
+                    configured_imu_profile: self.bus.imu_profile.label(),
                     backend: "feetech_ft6",
                     read_timing_revision: READ_TIMING_REVISION,
                     motion_enabled: self.calibration.motion_enabled,
@@ -2490,6 +2631,112 @@ impl RobotIo for FeetechIo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qinmo_profile_binding_requires_a_new_verification_even_on_feetech() {
+        let cal = Calibration::commissioning(crate::model::JOINT_IDS);
+        // Top-level keys must precede the joint table array.
+        let text = format!(
+            "imu_bus_profile = 'qinmo'\n{}",
+            toml::to_string(&cal).unwrap()
+        );
+        let parsed = toml::from_str::<Calibration>(&text);
+        assert!(
+            parsed.is_ok(),
+            "explicit calibration profile must deserialize: {parsed:?}"
+        );
+        let bound = parsed.unwrap();
+        assert!(
+            bound
+                .validate_bus_mount_for(BusImuProtocol::Feetech, BusImuProfile::Qinmo)
+                .is_ok()
+        );
+        assert!(
+            bound
+                .validate_bus_mount_for(BusImuProtocol::Feetech, BusImuProfile::Legacy)
+                .is_err()
+        );
+        assert!(
+            cal.validate_bus_mount_for(BusImuProtocol::Feetech, BusImuProfile::Qinmo)
+                .is_err()
+        );
+        assert!(
+            cal.validate_bus_mount_for(BusImuProtocol::Feetech, BusImuProfile::Legacy)
+                .is_ok()
+        );
+        assert!(
+            bound
+                .validate_bus_mount_for(BusImuProtocol::Dxl2, BusImuProfile::Qinmo)
+                .is_err()
+        );
+        let saved = toml::to_string(&bound).unwrap();
+        let restored: Calibration = toml::from_str(&saved).unwrap();
+        assert_eq!(restored.imu_bus_profile, Some(BusImuProfile::Qinmo));
+    }
+
+    #[test]
+    fn qinmo_core_units_ready_identity_and_invalid_frames() {
+        let mut raw = [0u8; 15];
+        raw[..2].copy_from_slice(&1640i16.to_le_bytes());
+        raw[2..4].copy_from_slice(&(-1640i16).to_le_bytes());
+        let sample = ImuSample::decode_qinmo(&raw).unwrap();
+        let reading = sample.reading();
+        assert!((reading.gyro[0].to_degrees() - 100.0).abs() < 1e-10);
+        assert!((reading.gyro[1].to_degrees() + 100.0).abs() < 1e-10);
+        assert_eq!(reading.quat, Some([1.0, 0.0, 0.0, 0.0]));
+        assert_eq!(sample.age_upper_bound_ms, None);
+        let legacy = ImuSample::decode(&raw).unwrap().reading();
+        assert!((legacy.gyro[0].to_degrees() - 28.7).abs() < 1e-10);
+        assert!(legacy.quat.is_none());
+        let mut frame = TrunkFrame::new([1.0, 0.0, 0.0, 0.0]);
+        for _ in 0..24 {
+            frame.push(reading);
+        }
+        assert!(!frame.ready());
+        frame.push(reading);
+        assert!(frame.ready());
+        raw[13] = 1;
+        let initializing = ImuSample::decode_qinmo(&raw).unwrap();
+        assert!(!initializing.ready);
+        assert!(initializing.reading().quat.is_none());
+        assert!(!initializing.is_fresh(0));
+        for status in [2, 4, 8, 0x80] {
+            raw[13] = status;
+            assert!(ImuSample::decode_qinmo(&raw).is_err());
+        }
+        raw[13] = 0;
+        raw[14] = 1;
+        assert!(ImuSample::decode_qinmo(&raw).is_err());
+        raw[14] = 0;
+        for packed in [0x7c00u16, 0x7e00, 0x4000] {
+            raw[6..8].copy_from_slice(&packed.to_le_bytes());
+            assert!(ImuSample::decode_qinmo(&raw).is_err());
+        }
+        assert!(ImuSample::decode_qinmo(&raw[..12]).is_err());
+    }
+
+    #[test]
+    fn qinmo_freshness_uses_counter_wrap_transaction_and_duplicate_guard() {
+        let mut gate = BusImuFreshness::default();
+        let mut raw = [0u8; 15];
+        for seq in [254, 255, 0, 1] {
+            raw[12] = seq;
+            let sample = ImuSample::decode_qinmo(&raw).unwrap();
+            assert!(gate.check(&sample, 10_000).is_ok());
+        }
+        let sample = ImuSample::decode_qinmo(&raw).unwrap();
+        assert!(gate.check(&sample, 10_000).is_ok());
+        assert!(gate.check(&sample, 10_000).is_ok());
+        assert!(gate.check(&sample, 10_000).is_err());
+        raw[12] = 2;
+        let sample = ImuSample::decode_qinmo(&raw).unwrap();
+        assert!(gate.check(&sample, 20_000).is_ok());
+        raw[12] = 3;
+        assert!(
+            gate.check(&ImuSample::decode_qinmo(&raw).unwrap(), 20_001)
+                .is_err()
+        );
+    }
 
     /// ID 200 is kissqy's FT6 board or our own imu_to_dxl (0.2.0 and 1.0.0 report model 0x4D44);
     /// anything else, including a big-endian flag, is refused.
@@ -2737,6 +2984,7 @@ mod tests {
             last_sync: SyncTrace::default(),
             imu_board: BusImuBoard::Ft6,
             imu_protocol: BusImuProtocol::Auto,
+            imu_profile: BusImuProfile::Legacy,
             imu_identity: None,
         };
         let mut io = FeetechIo::from_bus(bus, calibrated()).unwrap();
@@ -2833,6 +3081,7 @@ mod tests {
                 last_sync: SyncTrace::default(),
                 imu_board: BusImuBoard::Ft6,
                 imu_protocol: BusImuProtocol::Auto,
+                imu_profile: BusImuProfile::Legacy,
                 imu_identity: None,
             };
             let result = bus.telemetry(&crate::model::JOINT_IDS);
@@ -2886,6 +3135,7 @@ mod tests {
             last_sync: SyncTrace::default(),
             imu_board: BusImuBoard::Ft6,
             imu_protocol: BusImuProtocol::Auto,
+            imu_profile: BusImuProfile::Legacy,
             imu_identity: None,
         };
         bus.verify_torque(&ids, false).unwrap();
@@ -3538,6 +3788,7 @@ mod hd1910_transport_tests {
                 last_sync: SyncTrace::default(),
                 imu_board: BusImuBoard::Ft6,
                 imu_protocol: BusImuProtocol::Auto,
+                imu_profile: BusImuProfile::Legacy,
                 imu_identity: None,
             },
             Emulator {

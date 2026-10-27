@@ -66,6 +66,7 @@ impl RobotIo for RecoveryIo {
                 .unwrap_or(false),
         );
         Some(FeetechDiagnostics {
+            configured_imu_profile: "legacy",
             backend: "fake_feetech",
             read_timing_revision: "test",
             motion_enabled: true,
@@ -109,6 +110,7 @@ impl RobotIo for RecoveryIo {
         // diagnostic facts through the new read-only hand-off.
         let d = self.feetech_diagnostics().unwrap();
         let metadata = Arc::new(raw::Metadata {
+            configured_imu_profile: "legacy",
             backend: d.backend,
             read_timing_revision: d.read_timing_revision,
             motion_enabled: d.motion_enabled,

@@ -21,6 +21,7 @@ docs give the reasoning and point at it.
 | | |
 |---|---|
 | [`cheatsheet.md`](robot/cheatsheet.md) | Every `robotctl` command. |
+| [`qinmo-imu.md`](robot/qinmo-imu.md) | One-time Qinmo profile selection, mount revalidation and offline verification. |
 | [`pair-a-gamepad.md`](robot/pair-a-gamepad.md) | Once per pad: pairing mode, `pad pair`, and what to do when it will not bond. |
 | [`udp-pad.md`](robot/udp-pad.md) | A pad on a laptop over the LAN: `[netpad]`, `duckctl udp-pad`, and what the robot does when it goes quiet. |
 | [`cheatsheet-dev.md`](robot/cheatsheet-dev.md) | The commands that need a dev board: branch builds, candidates, dev pushes. |

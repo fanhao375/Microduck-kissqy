@@ -488,6 +488,7 @@ pub(crate) mod tests {
 
     pub(crate) fn fixture(cycle: u64) -> Snapshot {
         let metadata = Arc::new(Metadata {
+            configured_imu_profile: "legacy",
             backend: "feetech_ft6",
             read_timing_revision: feetech::READ_TIMING_REVISION,
             motion_enabled: true,

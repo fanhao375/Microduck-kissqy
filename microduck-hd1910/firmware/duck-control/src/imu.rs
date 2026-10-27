@@ -231,6 +231,23 @@ pub fn parse_block(raw: &[u8; IMU_BLOCK_LEN]) -> SensorReading {
     SensorReading { gyro, quat }
 }
 
+/// Qinmo protocol 1.2: the same binary16 XYZ representation, with explicit readiness
+/// and different gyro units. Zero XYZ is identity here, not the legacy SFLP sentinel.
+pub(crate) fn qinmo_reading(raw: &[u8; IMU_BLOCK_LEN], ready: bool) -> Option<SensorReading> {
+    let scale = std::f64::consts::PI / (16.4 * 180.0);
+    let gyro = std::array::from_fn(|axis| {
+        i16::from_le_bytes([raw[axis * 2], raw[axis * 2 + 1]]) as f64 * scale
+    });
+    let packed =
+        std::array::from_fn(|axis| u16::from_le_bytes([raw[6 + axis * 2], raw[7 + axis * 2]]));
+    let q = sflp_quaternion(packed)?;
+    let norm = q.iter().map(|v| v * v).sum::<f64>().sqrt();
+    Some(SensorReading {
+        gyro,
+        quat: ready.then(|| q.map(|v| v / norm)),
+    })
+}
+
 /// The chip's gyro words — `i16` LE x/y/z at ±500 dps — in rad/s.
 ///
 /// Shared with [`crate::lsm6dsv16x`], whose FIFO carries the same chip's same words: one

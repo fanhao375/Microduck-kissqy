@@ -7,7 +7,7 @@ use duck_control::feetech::ImuMount;
 use duck_control::feetech::{
     Bus, BusImuFreshness, BusImuInfo, Calibration, IMU_ID, ServoSample, signed_position_word,
 };
-use duck_control::imu::{ImuData, SensorReading, SflpDecoder, TrunkFrame};
+use duck_control::imu::{ImuData, SensorReading, TrunkFrame};
 use duck_control::model::{JOINT_IDS, NUM_JOINTS};
 use duck_control::trunk_imu::{HostImu, HostImuGate, TrunkImuKind};
 use duck_ipc_proto as proto;
@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::oneshot;
 
-pub const BUILD: &str = "4734cbb-feetech-imu-auto-control.44";
+pub const BUILD: &str = "0791fcd-feetech-qinmo-control.45";
 const MAX_PENDING: usize = 16;
 const POSITION_TOLERANCE: u16 = 8;
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(4);
@@ -372,9 +372,48 @@ pub(crate) fn calibration_status(
         "uncalibrated_joints":missing, "imu_source": source.label(),
         "motion_validation":calibration.validate_motion_for(source).err().map(|e| e.to_string()),
         "note":"Capture uses a manually known joint angle; encoder center is not joint zero."});
-    if source != TrunkImuKind::Bus {
-        let mount = calibration.imu_mount(source);
-        status["imu_mount"] = json!({"quat": mount.quat, "verified": mount.verified});
+    let mount = calibration.imu_mount(source);
+    // A persisted bus verification is not effective until the discovered wire format and
+    // configured data profile have both been checked. I2C has its independent mount slot.
+    let verified = source != TrunkImuKind::Bus && mount.verified;
+    status["imu_mount"] = json!({"quat": mount.quat, "verified": verified});
+    status["imu_mount_verified"] = json!(verified);
+    if source == TrunkImuKind::Bus {
+        let pending = "IMU bus discovery has not established a binding";
+        status["imu_binding_validation"] = json!(pending);
+        status["motion_validation"] = json!(pending);
+    }
+    status
+}
+
+pub(crate) fn calibration_status_for_bus(
+    calibration: &Calibration,
+    path: &Path,
+    source: TrunkImuKind,
+    bus: &Bus,
+) -> Value {
+    let mut status = calibration_status(calibration, path, source);
+    status["configured_imu_profile"] = json!(bus.imu_profile().label());
+    if source == TrunkImuKind::Bus {
+        let binding = if bus.imu_info().is_none() {
+            Some("IMU bus discovery has not established a binding".to_owned())
+        } else {
+            calibration
+                .validate_bus_mount_for(bus.imu_board().protocol(), bus.imu_profile())
+                .err()
+                .map(|e| e.to_string())
+        };
+        let verified = calibration.imu_mount_verified && binding.is_none();
+        status["imu_mount"]["verified"] = json!(verified);
+        status["imu_mount_verified"] = json!(verified);
+        status["imu_bus"] = json!(bus.imu_info());
+        status["imu_binding_validation"] = json!(binding);
+        status["motion_validation"] = json!(binding.or_else(|| {
+            calibration
+                .validate_motion_for(source)
+                .err()
+                .map(|e| e.to_string())
+        }));
     }
     status
 }
@@ -911,9 +950,12 @@ fn process_job(
         return;
     }
     if matches!(job.command, BusCommand::CalibrationStatus) {
-        let _ = job
-            .reply
-            .send(Ok(calibration_status(calibration, path, imu.source)));
+        let _ = job.reply.send(Ok(calibration_status_for_bus(
+            calibration,
+            path,
+            imu.source,
+            bus,
+        )));
         return;
     }
     if verifying.is_some() {
@@ -1048,7 +1090,7 @@ fn process_job(
                 save_calibration(path, &updated)?;
                 *calibration = updated;
                 Ok(json!({"saved":true,"id":id,"position_raw":samples[&id].feedback.position_raw,
-                    "known_angle_deg":angle_deg,"calibration":calibration_status(calibration,path,imu.source)}))
+                    "known_angle_deg":angle_deg,"calibration":calibration_status_for_bus(calibration,path,imu.source,bus)}))
             });
             let _ = job.reply.send(result);
         }
@@ -1073,10 +1115,11 @@ fn process_job(
                 if imu.source == TrunkImuKind::Bus {
                     let mut candidate = calibration.clone();
                     candidate.imu_bus_protocol = Some(bus.imu_board().protocol());
+                    candidate.imu_bus_profile = Some(bus.imu_profile());
                     save_verified(&candidate, path, imu.source, mount, None).map(
-                        |(updated, status)| {
+                        |(updated, _status)| {
                             *calibration = updated;
-                            status
+                            calibration_status_for_bus(calibration, path, imu.source, bus)
                         },
                     )
                 } else {
@@ -1323,6 +1366,7 @@ pub struct MotionStatus {
 /// Plain snapshot published at 10 Hz. JSON is produced only by the IPC thread.
 #[derive(Clone, Serialize)]
 pub struct Status {
+    configured_imu_profile: &'static str,
     build: &'static str,
     port: String,
     mode: &'static str,
@@ -1362,6 +1406,7 @@ pub struct Status {
 pub async fn run(
     port: &str,
     imu_protocol: &str,
+    imu_profile: &str,
     state: &RobotState,
     period: Duration,
     calibration_path: &Path,
@@ -1372,25 +1417,27 @@ pub async fn run(
     let mut calibration = match read_calibration(calibration_path) {
         Ok(c) => c,
         Err(error) => {
-            state.bus_status.store(Some(Arc::new(json!({"build":BUILD,"mode":"commissioning","phase":"configuration_error","error":error}))));
+            state.bus_status.store(Some(Arc::new(json!({"build":BUILD,"mode":"commissioning","phase":"configuration_error","configured_imu_profile":imu_profile,"error":error}))));
             state.startup_bus_failures.store(1, Ordering::Relaxed);
             return;
         }
     };
-    state
-        .bus_calibration
-        .store(Some(Arc::new(calibration_status(
-            &calibration,
-            calibration_path,
-            source,
-        ))));
+    let mut initial_status = calibration_status(&calibration, calibration_path, source);
+    initial_status["configured_imu_profile"] = json!(imu_profile);
+    state.bus_calibration.store(Some(Arc::new(initial_status)));
     let ids = calibration.joints.iter().map(|j| j.id).collect::<Vec<_>>();
-    state.startup_step(2, "starting", "标定模式：读取已有标定，关闭并确认扭矩，初始化 IMU");
+    state.startup_step(
+        2,
+        "starting",
+        "标定模式：读取已有标定，关闭并确认扭矩，初始化 IMU",
+    );
     let mut bus = loop {
         if state.shutdown.load(Ordering::Relaxed) { return; }
         let connect = (|| -> Result<Bus, String> {
             let mut bus = Bus::open(port).map_err(|e| e.to_string())?;
             bus.set_imu_protocol(imu_protocol)
+                .map_err(|e| e.to_string())?;
+            bus.set_imu_profile(imu_profile)
                 .map_err(|e| e.to_string())?;
             torque_off(&mut bus, &ids)?;
             if host_imu.is_none() {
@@ -1403,11 +1450,19 @@ pub async fn run(
             Err(error) => {
                 state.startup_bus_failures.fetch_add(1, Ordering::Relaxed);
                 state.startup_step(2, "waiting", &error);
-                state.bus_status.store(Some(Arc::new(json!({"build":BUILD,"mode":"commissioning","phase":"waiting_for_bus","error":error}))));
+                state.bus_status.store(Some(Arc::new(json!({"build":BUILD,"mode":"commissioning","phase":"waiting_for_bus","configured_imu_profile":imu_profile,"error":error}))));
                 tokio::time::sleep(super::STARTUP_RETRY_INTERVAL).await;
             }
         }
     };
+    state
+        .bus_calibration
+        .store(Some(Arc::new(calibration_status_for_bus(
+            &calibration,
+            calibration_path,
+            source,
+            &bus,
+        ))));
     state.startup_step(3, "success", "标定模式不加载策略模型");
     state.startup_bus_failures.store(0, Ordering::Relaxed);
     let mut ticker = super::control_ticker(period);
@@ -1423,7 +1478,7 @@ pub async fn run(
     let mut motion: Option<Motion> = None;
     let mut hold: Option<Hold> = None;
     let mut off_pending = None;
-    let mut imu_decoder = SflpDecoder::new(calibration.imu_mount_quat);
+    let mut imu_decoder = TrunkFrame::new(calibration.imu_mount_quat);
     let mut imu_frame = TrunkFrame::new(calibration.imu_mount(source).quat);
     let mut imu_gate = HostImuGate::default();
     let mut imu_epoch = None;
@@ -1520,7 +1575,7 @@ pub async fn run(
                 .imu_stale_run
                 .store(bus_freshness.stale.run, Ordering::Relaxed);
             checked.map_err(|e| e.to_string())?;
-            let decoded = imu_decoder.decode(&imu.block);
+            let decoded = imu_decoder.push(imu.reading());
             let valid = imu_decoder.ready();
             state.imu_ready.store(valid, Ordering::Relaxed);
             if publish {
@@ -1535,7 +1590,7 @@ pub async fn run(
                     quaternion_wxyz: decoded.quat,
                     mount_verified: calibration.imu_mount_verified
                         && calibration
-                            .validate_bus_mount(bus.imu_board().protocol())
+                            .validate_bus_mount_for(bus.imu_board().protocol(), bus.imu_profile())
                             .is_ok(),
                     age_ms: None,
                     epoch: None,
@@ -1676,14 +1731,15 @@ pub async fn run(
                 if changes_calibration {
                     state
                         .bus_calibration
-                        .store(Some(Arc::new(calibration_status(
+                        .store(Some(Arc::new(calibration_status_for_bus(
                             &calibration,
                             calibration_path,
                             source,
+                            &bus,
                         ))));
                 }
                 if old_mount != calibration.imu_mount(source).quat {
-                    imu_decoder = SflpDecoder::new(calibration.imu_mount_quat);
+                    imu_decoder = TrunkFrame::new(calibration.imu_mount_quat);
                     imu_frame = TrunkFrame::new(calibration.imu_mount(source).quat);
                 }
             }
@@ -1718,10 +1774,11 @@ pub async fn run(
                     if result.is_ok() {
                         state
                             .bus_calibration
-                            .store(Some(Arc::new(calibration_status(
+                            .store(Some(Arc::new(calibration_status_for_bus(
                                 &calibration,
                                 calibration_path,
                                 source,
+                                &bus,
                             ))));
                         if old_mount != calibration.imu_mount(source).quat {
                             imu_frame = TrunkFrame::new(calibration.imu_mount(source).quat);
@@ -1761,6 +1818,7 @@ pub async fn run(
         if publish || error.is_some() {
             let power = state.bus_commands.power_pending.load(Ordering::Relaxed);
             state.bus_snapshot.store(Some(Arc::new(Status {
+                configured_imu_profile: bus.imu_profile().label(),
                 build: BUILD,
                 port: port.to_owned(),
                 mode: "commissioning",
@@ -1794,7 +1852,7 @@ pub async fn run(
                 imu_mount_verified: calibration.imu_mount(source).verified
                     && (source != TrunkImuKind::Bus
                         || calibration
-                            .validate_bus_mount(bus.imu_board().protocol())
+                            .validate_bus_mount_for(bus.imu_board().protocol(), bus.imu_profile())
                             .is_ok()),
                 imu_bus: bus.imu_info(),
                 imu_verification: verifying
@@ -1880,6 +1938,7 @@ mod tests {
             .bus_status
             .store(Some(Arc::new(json!({"phase":"older-value-cache"}))));
         let report = Status {
+            configured_imu_profile: "legacy",
             imu_bus: None,
             build: BUILD,
             port: "/dev/test-no-uart".into(),
@@ -2496,8 +2555,8 @@ mod tests {
 
     /// The calibration report names the mount in use for a module — its slot, or its default
     /// while uncommissioned — so the console's IMU panel shows and confirms that one, not the
-    /// bus board's top-level keys it used to read on every robot. The bus board's report has no
-    /// such field: its mount is those keys, and its report stays as it was.
+    /// bus board's top-level keys it used to read on every robot. A bus mount remains
+    /// effectively unverified until discovery also checks its protocol/profile binding.
     #[test]
     fn the_calibration_report_names_a_modules_mount_in_use() {
         let path = Path::new("/tmp/unused-calibration.toml");
@@ -2518,7 +2577,7 @@ mod tests {
             json!({"quat": [0.0, 0.0, 0.0, 1.0], "verified": true})
         );
         let bus = calibration_status(&calibration, path, TrunkImuKind::Bus);
-        assert!(bus.get("imu_mount").is_none(), "{bus}");
+        assert_eq!(bus["imu_mount"]["verified"], false, "{bus}");
     }
 
     /// The bus board keeps its old rule: the operator's confirmation, no reading required, the
@@ -2681,6 +2740,7 @@ mod tests {
                 .block_on(run(
                     &port,
                     "auto",
+                    "legacy",
                     &control_state,
                     Duration::from_millis(20),
                     &control_path,

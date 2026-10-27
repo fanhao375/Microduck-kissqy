@@ -16,6 +16,7 @@ pub struct JointMetadata {
 
 #[derive(Debug, Serialize)]
 pub struct Metadata {
+    pub configured_imu_profile: &'static str,
     pub backend: &'static str,
     pub read_timing_revision: &'static str,
     pub motion_enabled: bool,
