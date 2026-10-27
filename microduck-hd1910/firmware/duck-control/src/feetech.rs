@@ -2230,7 +2230,7 @@ impl FeetechIo {
             && !raw_imu.is_fresh(started.elapsed().as_micros() as u64)
         {
             return Err(error(
-                "Feetech telemetry cycle too slow; IMU sample now older than 50 ms",
+                "telemetry cycle exceeded the IMU freshness window",
             ));
         }
         self.hd1910.delay_velocity(started, &mut out, &fresh);
