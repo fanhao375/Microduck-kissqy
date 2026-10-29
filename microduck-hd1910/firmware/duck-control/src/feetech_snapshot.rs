@@ -14,7 +14,7 @@ pub struct JointMetadata {
     pub calibrated: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 pub struct Metadata {
     pub configured_imu_profile: &'static str,
     pub backend: &'static str,
@@ -114,6 +114,7 @@ pub struct HdState {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Dynamic {
+    pub servo_observations: crate::feetech::observations::Snapshot,
     pub torque_enabled: bool,
     pub torque_state_confirmed: Option<bool>,
     pub gain_mode: &'static str,

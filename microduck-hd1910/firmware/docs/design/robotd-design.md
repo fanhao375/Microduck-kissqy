@@ -732,7 +732,7 @@ top-level `imu_mount={quat,verified}` and `imu_mount_verified` report the effect
 `imu_binding_validation` explains a mismatch and also appears as `motion_validation`.
 Before discovery the effective bus mount is unverified. I²C sources keep their existing
 separate calibration slots. The configuration and metadata are additive; IPC API_VERSION
-remains 40, and version skew itself is never a blanket refusal. A Qinmo selection requires
+is 41 with the independent startup observations below; version skew itself is never a blanket refusal. A Qinmo selection requires
 a matching runtime binary. [Selection and verification guide](../robot/qinmo-imu.md).
 
 **A module is read by a thread, not by the tick.** `robotd/src/trunk_imu_i2c.rs` owns the
@@ -752,6 +752,26 @@ device fault is five failed transfers in a row, or nothing new published for the
 between NACKs, is reopened rather than read forever. One failed transfer or garbled packet is
 only dropped and counted (`dropped` in the health), and read again at the poll interval. The
 control thread never waits on the reader: a slow, wedged or absent module is an old sample.
+
+**Startup servo replies are independent diagnostics (control.46, API 41).** The sole native
+UART owner retains checksum-valid replies from requested servo IDs, including the valid
+subset of a transaction that later fails. `robot.busStatus.native.servo_observations` has
+`attempted`, `age_ms` and `rows` in configured joint order. Each row contains `id`, `name`,
+nullable `responding`, `check_age_ms`, `reply_age_ms`, `feedback_age_ms`, `position_raw`,
+`speed_raw`, `load_raw`, `current_raw`, `volts` and `temperature_c`. A sent READ/Sync Read
+checks only its requested IDs; the latest check answers true/false and an unchecked ID
+remains null. A later miss preserves reply/feedback history with its original timestamps.
+Only successful decoded address-56/length-15 feedback supplies telemetry; a torque reply
+proves presence with null telemetry. An IMU reply never becomes a servo row.
+
+Row ages are measured at capture. Snapshot `age_ms` is measured again on each busStatus
+response, even when the cached startup report or sampler stops changing. Consumers add
+snapshot age to the row ages; checked state, successful replies and telemetry each have
+their own freshness. Startup initialization failures after opening the UART, failed pose
+reads and pending IMU/joint readiness all publish this evidence without additional probes.
+These observations never update control samples, satisfy motion or IMU readiness, authorize
+goals/torque, or confirm emergency torque-off. Atomic sample validation, torque readback,
+startup retry cadence and the existing control-status gates are unchanged.
 
 **Same post-processing, same meaning.** Every source goes through `imu::TrunkFrame` — the mount,
 holding the last quaternion, the 25-sample ready gate, the three-point median — so `ImuData`

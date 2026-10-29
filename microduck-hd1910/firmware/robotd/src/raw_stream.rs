@@ -547,6 +547,7 @@ pub(crate) mod tests {
             hd1910,
             imu_fusion: None,
             dynamic: Native {
+                servo_observations: feetech::observations::Snapshot::empty(metadata.clone()),
                 torque_enabled: true,
                 torque_state_confirmed: Some(true),
                 gain_mode: "hd1910_model_contract_p_restore_on_relax_native_d_torque_limit_preserved",
@@ -746,6 +747,31 @@ pub(crate) mod tests {
         assert_eq!(report["native"]["joints"][0]["name"], proto::JOINT_NAMES[0]);
         assert_eq!(report["native"]["joints"][0]["missing_total"], u64::MAX);
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn startup_servo_observations_age_at_each_rpc_with_a_frozen_cached_report() {
+        for startup_only in [false, true] {
+        let state = Arc::new(RobotState::new(
+            &crate::Params::default(), std::path::Path::new("/test/robotd.toml"), false, false,
+        ));
+        let frozen = fixture(42);
+        let mut report = frozen.bus.as_ref().unwrap().report();
+        report["phase"] = json!("waiting_for_bus");
+        if startup_only {
+            state.publish_startup_native(report, Some(frozen.bus.unwrap().native));
+        } else {
+            state.raw.publish(frozen);
+            state.bus_status.store(Some(Arc::new(report)));
+        }
+        let query = || json!({"jsonrpc":"2.0","id":1,"method":"robot.busStatus"});
+        let first: Value = serde_json::from_str(&crate::tests::ipc_response(state.clone(), query()).await).unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let second: Value = serde_json::from_str(&crate::tests::ipc_response(state.clone(), query()).await).unwrap();
+        let first_age = first["result"]["native"]["servo_observations"]["age_ms"].as_u64().unwrap();
+        let second_age = second["result"]["native"]["servo_observations"]["age_ms"].as_u64().unwrap();
+        assert!(second_age >= first_age + 30, "frozen cached evidence must age: {first_age} -> {second_age}");
+        }
     }
 
     #[tokio::test]

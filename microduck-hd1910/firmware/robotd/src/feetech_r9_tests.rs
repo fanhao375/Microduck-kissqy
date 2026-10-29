@@ -42,6 +42,65 @@ fn qinmo_commissioning_uses_explicit_profile_and_persists_both_mount_bindings() 
     commissioning_flow(false, true);
 }
 
+#[test]
+fn startup_open_failure_publishes_servo_presence_without_imu_or_goal_writes() {
+    let (mut master, mut slave) = (0, 0);
+    let mut name = [0i8; 128];
+    assert_eq!(unsafe { libc::openpty(&mut master, &mut slave, name.as_mut_ptr(), std::ptr::null(), std::ptr::null()) }, 0);
+    let port = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }.to_str().unwrap().to_owned();
+    let mut wire = unsafe { std::fs::File::from_raw_fd(master) };
+    unsafe { libc::close(slave); }
+    let done = Arc::new(AtomicBool::new(false));
+    let stopped = done.clone();
+    let writes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = writes.clone();
+    let device = std::thread::spawn(move || {
+        use std::os::fd::AsRawFd;
+        while !stopped.load(Ordering::Relaxed) {
+            let mut fd = libc::pollfd { fd: wire.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            if unsafe { libc::poll(&mut fd, 1, 10) } <= 0 { continue; }
+            let mut header = [0; 4];
+            if wire.read_exact(&mut header).is_err() { continue; }
+            let mut body = vec![0; header[3] as usize];
+            wire.read_exact(&mut body).unwrap();
+            if body[0] == duck_control::feetech::SYNC_WRITE {
+                log.lock().unwrap().push(body.clone());
+            } else if body[0] == duck_control::feetech::SYNC_READ {
+                assert_eq!(&body[1..3], &[40, 1]);
+                for id in &body[3..body.len()-1] {
+                    wire.write_all(&duck_control::feetech::packet(*id, 0, &[0]).unwrap()).unwrap();
+                }
+            } else {
+                assert_eq!(header[2], 200); // The absent IMU never answers.
+            }
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let calibration = dir.path().join("calibration.toml");
+    std::fs::write(&calibration, include_str!("../../packaging/hd1910-calibration.robot.toml")).unwrap();
+    let bus = params::Bus {
+        protocol: params::BusProtocol::Feetech,
+        imu_protocol: params::ImuBusProtocol::Feetech,
+        feetech_calibration: Some(calibration), port, ..Default::default()
+    };
+    let state = RobotState::new(&Params::default(), Path::new("/test/robotd.toml"), false, false);
+    assert!(open_bus(&bus, None, 0, Some(&state)).is_none());
+    done.store(true, Ordering::Relaxed);
+    device.join().unwrap();
+    let report = state.bus_status.load_full().unwrap();
+    assert_eq!(report["phase"], "waiting_for_bus");
+    assert_eq!(report["native"]["torque_state_confirmed"], false);
+    assert_eq!(report["native"]["all_joints_fresh"], false);
+    let rows = report["native"]["servo_observations"]["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), NUM_JOINTS);
+    assert!(rows.iter().all(|row| row["responding"] == true && row["position_raw"].is_null()));
+    let writes = writes.lock().unwrap();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(&writes[0][1..3], &[40, 1]);
+    assert!(writes[0][3..writes[0].len()-1].chunks_exact(2).all(|row| row[1] == 0));
+    assert_eq!(state.ticks.load(Ordering::Relaxed), 0);
+}
+
 fn commissioning_flow(dxl2: bool, qinmo: bool) {
     let mut master = 0;
     let mut slave = 0;

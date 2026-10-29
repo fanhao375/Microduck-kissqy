@@ -21,6 +21,9 @@ use crate::io::{ImuStale, IoError, JointTargets, Result, RobotIo, Sensors, SlowS
 use crate::model::{JOINT_NAMES, NUM_JOINTS};
 use crate::trunk_imu::{HostImu, HostImuGate, HostImuHealth, TrunkImuKind};
 
+#[path = "feetech_observations.rs"]
+pub mod observations;
+
 pub const BAUD: u32 = 1_000_000;
 pub const IMU_ID: u8 = 200;
 pub const SYNC_ADDRESS: u8 = 56;
@@ -299,6 +302,7 @@ pub struct Bus {
     imu_protocol: BusImuProtocol,
     imu_profile: BusImuProfile,
     imu_identity: Option<Vec<u8>>,
+    observations: observations::Observations,
 }
 
 /// Minimal acquisition result. No recovery, raw-packet history or UART polling.
@@ -339,6 +343,7 @@ impl Bus {
             imu_protocol: BusImuProtocol::Auto,
             imu_profile: BusImuProfile::Legacy,
             imu_identity: None,
+            observations: observations::Observations::default(),
         })
     }
 
@@ -594,6 +599,9 @@ impl Bus {
         let tx = packet(id, inst, params)?;
         let deadline = Instant::now() + budget;
         self.send(&tx, deadline)?;
+        if inst == READ {
+            self.observations.requested(&[id], Instant::now());
+        }
         let mut decoder = Decoder::default();
         let mut one = [0u8; 1];
         while Instant::now() < deadline {
@@ -609,6 +617,9 @@ impl Bus {
                         // successful status. Do not interpret the echoed READ as error 2.
                         if status.error == inst && status.data == params {
                             continue;
+                        }
+                        if inst == READ {
+                            self.observations.replied(&status, params[0], params[1], Instant::now());
                         }
                         if status.error != 0 {
                             return Err(error(format!(
@@ -735,6 +746,7 @@ impl Bus {
         let result = (|| {
             self.send(&sync_read_packet(address, length, ids)?, deadline)?;
             request_sent = true;
+            self.observations.requested(ids, Instant::now());
             let mut replies = BTreeMap::new();
             let mut failure = None;
             let mut bytes = [0u8; 256];
@@ -748,6 +760,9 @@ impl Bus {
                         rx_bytes += count;
                         for byte in &bytes[..count] {
                             if let Some(status) = decoder.push(*byte) {
+                                if pending.contains(&status.id) {
+                                    self.observations.replied(&status, address, length, Instant::now());
+                                }
                                 if let Err(error) =
                                     accept_sync_status(&mut pending, &mut replies, status, length)
                                 {
@@ -1704,6 +1719,7 @@ impl TelemetryTotals {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct FeetechDiagnostics {
+    pub servo_observations: observations::Snapshot,
     pub configured_imu_profile: &'static str,
     pub backend: &'static str,
     pub read_timing_revision: &'static str,
@@ -2036,6 +2052,32 @@ impl FeetechIo {
             .iter()
             .map(|joint| joint.id)
             .collect()
+    }
+
+    fn diagnostic_metadata(&self) -> crate::feetech_snapshot::Metadata {
+        crate::feetech_snapshot::Metadata {
+            configured_imu_profile: self.bus.imu_profile.label(),
+            backend: "feetech_ft6",
+            read_timing_revision: READ_TIMING_REVISION,
+            motion_enabled: self.calibration.motion_enabled,
+            calibration_complete: self.calibration.joints.iter().all(|j| j.calibrated),
+            imu_mount_verified: self.imu_mount_verified(),
+            imu_source: self.imu.kind().label(),
+            imu_bus: self.bus.imu_info(),
+            velocity_source: crate::hd1910::VELOCITY_SOURCE,
+            velocity_rad_s_per_count: self.calibration.feedback_speed_scale(),
+            current_available: self.calibration.units_verified,
+            joints: self.calibration.joints.iter()
+                .map(|j| crate::feetech_snapshot::JointMetadata {
+                    name: j.name.clone(), id: j.id, calibrated: j.calibrated,
+                }).collect(),
+        }
+    }
+
+    fn snapshot_metadata(&self) -> std::sync::Arc<crate::feetech_snapshot::Metadata> {
+        self.snapshot_metadata
+            .get_or_init(|| std::sync::Arc::new(self.diagnostic_metadata()))
+            .clone()
     }
 
     fn imu_mount_verified(&self) -> bool {
@@ -2477,6 +2519,7 @@ impl RobotIo for FeetechIo {
         }
         let (imu_age_ms, imu_age_upper_bound_ms, imu_status) = self.imu.latest();
         Some(FeetechDiagnostics {
+            servo_observations: self.bus.observations.snapshot(std::sync::Arc::new(self.diagnostic_metadata()), now),
             configured_imu_profile: self.bus.imu_profile.label(),
             backend: "feetech_ft6",
             read_timing_revision: READ_TIMING_REVISION,
@@ -2518,34 +2561,7 @@ impl RobotIo for FeetechIo {
 
     fn feetech_snapshot(&self) -> Option<crate::feetech_snapshot::Snapshot> {
         use crate::feetech_snapshot as snapshot;
-        let metadata = self
-            .snapshot_metadata
-            .get_or_init(|| {
-                std::sync::Arc::new(snapshot::Metadata {
-                    configured_imu_profile: self.bus.imu_profile.label(),
-                    backend: "feetech_ft6",
-                    read_timing_revision: READ_TIMING_REVISION,
-                    motion_enabled: self.calibration.motion_enabled,
-                    calibration_complete: self.calibration.joints.iter().all(|j| j.calibrated),
-                    imu_mount_verified: self.imu_mount_verified(),
-                    imu_source: self.imu.kind().label(),
-                    imu_bus: self.bus.imu_info(),
-                    velocity_source: crate::hd1910::VELOCITY_SOURCE,
-                    velocity_rad_s_per_count: self.calibration.feedback_speed_scale(),
-                    current_available: self.calibration.units_verified,
-                    joints: self
-                        .calibration
-                        .joints
-                        .iter()
-                        .map(|j| snapshot::JointMetadata {
-                            name: j.name.clone(),
-                            id: j.id,
-                            calibrated: j.calibrated,
-                        })
-                        .collect(),
-                })
-            })
-            .clone();
+        let metadata = self.snapshot_metadata();
         let now = Instant::now();
         let mut joints = snapshot::Samples::default();
         let mut stale_joint_ids = snapshot::Samples::default();
@@ -2594,6 +2610,7 @@ impl RobotIo for FeetechIo {
         Some(snapshot::Snapshot {
             metadata: metadata.clone(),
             dynamic: snapshot::Dynamic {
+                servo_observations: self.bus.observations.snapshot(metadata.clone(), now),
                 torque_enabled: self.torque_enabled,
                 torque_state_confirmed: self.torque_state_confirmed,
                 gain_mode: self.gain_mode(),
@@ -2986,6 +3003,7 @@ mod tests {
             imu_protocol: BusImuProtocol::Auto,
             imu_profile: BusImuProfile::Legacy,
             imu_identity: None,
+            observations: observations::Observations::default(),
         };
         let mut io = FeetechIo::from_bus(bus, calibrated()).unwrap();
         for _ in 0..30 {
@@ -3083,6 +3101,7 @@ mod tests {
                 imu_protocol: BusImuProtocol::Auto,
                 imu_profile: BusImuProfile::Legacy,
                 imu_identity: None,
+                observations: observations::Observations::default(),
             };
             let result = bus.telemetry(&crate::model::JOINT_IDS);
             finish.send(()).unwrap();
@@ -3137,6 +3156,7 @@ mod tests {
             imu_protocol: BusImuProtocol::Auto,
             imu_profile: BusImuProfile::Legacy,
             imu_identity: None,
+            observations: observations::Observations::default(),
         };
         bus.verify_torque(&ids, false).unwrap();
         assert!(bus.last_sync.missing_ids.is_empty());
@@ -3790,6 +3810,7 @@ mod hd1910_transport_tests {
                 imu_protocol: BusImuProtocol::Auto,
                 imu_profile: BusImuProfile::Legacy,
                 imu_identity: None,
+                observations: observations::Observations::default(),
             },
             Emulator {
                 faults,
@@ -3888,6 +3909,137 @@ mod hd1910_transport_tests {
             },
         );
         c
+    }
+
+    #[test]
+    fn startup_servo_observations_survive_missing_host_imu_without_control_data() {
+        struct AbsentHost;
+        impl HostImu for AbsentHost {
+            fn kind(&self) -> TrunkImuKind { TrunkImuKind::Lsm6dsv16x }
+            fn latest(&self) -> Option<crate::trunk_imu::HostImuSample> { None }
+            fn health(&self) -> HostImuHealth { HostImuHealth::default() }
+        }
+        let (bus, device) = emulator(false);
+        let mut io = FeetechIo::for_startup_with_imu(
+            bus, calibration_for(TrunkImuKind::Lsm6dsv16x), Box::new(AbsentHost),
+        ).unwrap();
+        assert!(io.read().unwrap_err().to_string().contains("IMU"));
+        let diagnostic = io.feetech_diagnostics().unwrap();
+        let wire = serde_json::to_value(&diagnostic).unwrap();
+        let observations = &wire["servo_observations"];
+        assert_eq!(observations["attempted"], true);
+        let rows = observations["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), NUM_JOINTS);
+        for (row, joint) in rows.iter().zip(&io.calibration.joints) {
+            assert_eq!(row["id"], joint.id);
+            assert_eq!(row["name"], joint.name);
+            assert_eq!(row["responding"], true);
+            assert!(row["check_age_ms"].is_u64());
+            assert!(row["reply_age_ms"].is_u64());
+            assert!(row["feedback_age_ms"].is_u64());
+            assert_eq!(row["position_raw"], 2048);
+            assert_eq!(row["volts"], 7.4);
+        }
+        let fixture: serde_json::Value = serde_json::from_str(include_str!("../tests/fixtures/startup-servo-observations.json")).unwrap();
+        let mut normalized = observations.clone();
+        normalized["age_ms"] = 0.into();
+        for row in normalized["rows"].as_array_mut().unwrap() {
+            for key in ["check_age_ms", "reply_age_ms", "feedback_age_ms"] { row[key] = 0.into(); }
+        }
+        assert_eq!(normalized, fixture["native"]["servo_observations"]);
+        assert!(!diagnostic.all_joints_fresh);
+        assert!(diagnostic.joints.is_empty());
+        assert!(io.latest_sample_at.is_none());
+        assert!(io.joint_feedback.iter().all(Option::is_none));
+        assert!(io.set_torque(true).is_err());
+        assert!(device.writes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn startup_servo_observations_preserve_partial_replies_and_reject_bad_checksums() {
+        let (bus, device) = emulator(false);
+        let mut io = FeetechIo::for_startup(bus, calibration()).unwrap();
+        device.faults.lock().unwrap().missing = vec![IMU_ID, 22];
+        device.faults.lock().unwrap().checksum_id = Some(32);
+        assert!(io.read().is_err());
+        let wire = serde_json::to_value(io.feetech_diagnostics().unwrap()).unwrap();
+        assert_eq!(wire["servo_observations"]["attempted"], true);
+        let rows = wire["servo_observations"]["rows"].as_array().unwrap();
+        for row in rows {
+            let missing = [22, 32].contains(&(row["id"].as_u64().unwrap() as u8));
+            assert_eq!(row["responding"], !missing);
+            assert_eq!(row["reply_age_ms"].is_null(), missing);
+            assert_eq!(row["position_raw"].is_null(), missing);
+        }
+        assert!(io.latest_sample_at.is_none());
+        assert!(io.joint_feedback.iter().all(Option::is_none));
+        assert!(device.writes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn startup_servo_observations_torque_reply_proves_presence_without_feedback() {
+        let (bus, _device) = emulator(false);
+        let mut io = FeetechIo::for_startup(bus, calibration()).unwrap();
+        let before = serde_json::to_value(io.feetech_diagnostics().unwrap()).unwrap();
+        assert_eq!(before["servo_observations"]["attempted"], false);
+        assert!(before["servo_observations"]["rows"][0]["responding"].is_null());
+        io.bus.sync_read(40, 1, &io.ids()).unwrap();
+        let wire = serde_json::to_value(io.feetech_diagnostics().unwrap()).unwrap();
+        for row in wire["servo_observations"]["rows"].as_array().unwrap() {
+            assert_eq!(row["responding"], true);
+            assert!(row["reply_age_ms"].is_u64());
+            for key in ["feedback_age_ms", "position_raw", "speed_raw", "load_raw", "current_raw", "volts", "temperature_c"] {
+                assert!(row[key].is_null(), "{key} must not be fabricated from torque");
+            }
+        }
+        assert_eq!(io.torque_state_confirmed, None);
+        assert!(!io.feetech_control_status().unwrap().all_joints_fresh);
+    }
+
+    #[test]
+    fn startup_servo_observations_latest_miss_keeps_history_and_unrelated_reads_do_not_refresh_it() {
+        let (bus, device) = emulator(false);
+        let mut io = FeetechIo::for_startup(bus, calibration()).unwrap();
+        io.read().unwrap();
+        let control_at = io.latest_sample_at;
+        device.faults.lock().unwrap().missing = vec![IMU_ID, 22];
+        assert!(io.read().is_err());
+        let snapshot = io.feetech_snapshot().unwrap();
+        let observations = &snapshot.dynamic.servo_observations;
+        let before = serde_json::to_value(observations).unwrap();
+        let row = &before["rows"][index(22)];
+        assert_eq!(row["responding"], false);
+        assert!(row["check_age_ms"].is_u64());
+        assert!(row["reply_age_ms"].is_u64());
+        assert_eq!(row["position_raw"], 2048);
+        assert_eq!(io.latest_sample_at, control_at);
+        // A later read of another servo cannot make ID 22's checked/reply/feedback times new.
+        std::thread::sleep(Duration::from_millis(30));
+        io.bus.read(10, 40, 1).unwrap();
+        let after = serde_json::to_value(io.feetech_snapshot().unwrap().dynamic.servo_observations).unwrap();
+        let later = &after["rows"][index(22)];
+        for key in ["check_age_ms", "reply_age_ms", "feedback_age_ms"] {
+            assert!(later[key].as_u64().unwrap() >= row[key].as_u64().unwrap() + 20, "{key}");
+        }
+        assert_eq!(later["responding"], false);
+        let aged = serde_json::to_value(observations).unwrap();
+        assert!(aged["age_ms"].as_u64().unwrap() >= before["age_ms"].as_u64().unwrap() + 20);
+        assert_eq!(aged["rows"], before["rows"]);
+    }
+
+    #[test]
+    fn startup_servo_observations_survive_invalid_bus_imu_without_advancing_atomic_samples() {
+        let (bus, device) = emulator(false);
+        let mut io = FeetechIo::for_startup(bus, calibration()).unwrap();
+        device.faults.lock().unwrap().imu_stale = true;
+        assert!(io.read().is_err());
+        let wire = serde_json::to_value(io.feetech_diagnostics().unwrap()).unwrap();
+        assert!(wire["servo_observations"]["rows"].as_array().unwrap().iter().all(|row| row["responding"] == true && row["position_raw"] == 2048));
+        assert!(io.latest_sample_at.is_none());
+        assert!(io.joint_feedback.iter().all(Option::is_none));
+        assert!(!io.feetech_control_status().unwrap().all_joints_fresh);
+        assert!(!io.imu_ready());
+        assert!(device.writes.lock().unwrap().is_empty());
     }
 
     /// A module source puts nothing on the bus but the servos. Every request is a Sync Read of

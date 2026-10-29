@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::oneshot;
 
-pub const BUILD: &str = "0791fcd-feetech-qinmo-control.45";
+pub const BUILD: &str = "0791fcd-feetech-qinmo-control.46";
 const MAX_PENDING: usize = 16;
 const POSITION_TOLERANCE: u16 = 8;
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(4);

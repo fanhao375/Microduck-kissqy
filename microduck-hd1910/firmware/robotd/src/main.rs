@@ -594,6 +594,7 @@ struct RobotState {
     feetech: bool,
     bus_commands: feetech_commissioning::Commands,
     bus_status: ArcSwapOption<serde_json::Value>,
+    startup_servo_observations: ArcSwapOption<duck_control::feetech::observations::Snapshot>,
     bus_snapshot: ArcSwapOption<feetech_commissioning::Status>,
     bus_calibration: ArcSwapOption<serde_json::Value>,
     raw: raw_stream::Hub,
@@ -778,6 +779,7 @@ impl RobotState {
             feetech: params.bus.protocol == params::BusProtocol::Feetech,
             bus_commands: feetech_commissioning::Commands::default(),
             bus_status: ArcSwapOption::empty(),
+            startup_servo_observations: ArcSwapOption::empty(),
             bus_snapshot: ArcSwapOption::empty(),
             bus_calibration: ArcSwapOption::empty(),
             raw: raw_stream::Hub::default(),
@@ -1446,6 +1448,31 @@ impl Drop for ControlThreadExit {
 }
 
 impl RobotState {
+    fn publish_startup_native(
+        &self,
+        mut report: serde_json::Value,
+        native: Option<duck_control::feetech_snapshot::Snapshot>,
+    ) {
+        if let Some(native) = native {
+            // Keep the native capture clock outside the JSON cache so repeated RPC replies age.
+            self.startup_servo_observations.store(Some(Arc::new(
+                native.dynamic.servo_observations.clone(),
+            )));
+            let mut value = serde_json::to_value(native.metadata.as_ref()).expect("native metadata");
+            value.as_object_mut().unwrap().extend(
+                serde_json::to_value(&native.dynamic)
+                    .expect("native diagnostics")
+                    .as_object().unwrap().clone(),
+            );
+            value["hd1910"] = serde_json::to_value(&native.hd1910).expect("native registers");
+            report["configured_imu_profile"] = serde_json::json!(native.metadata.configured_imu_profile);
+            report["native"] = value;
+        } else {
+            self.startup_servo_observations.store(None);
+        }
+        self.bus_status.store(Some(Arc::new(report)));
+    }
+
     fn startup_step(&self, step: u8, status: &str, detail: &str) {
         let detail = if status == "waiting" { detail.split("; request_sent=").next().unwrap_or(detail) } else { detail };
         let row = serde_json::json!({"status":status,"detail":detail});
@@ -1512,7 +1539,8 @@ fn open_bus(
     let port = bus.port.as_str();
 
     if bus.protocol == params::BusProtocol::Feetech {
-        let open = || -> Result<_, Box<dyn std::error::Error>> {
+        let mut diagnostic_native = None;
+        let mut open = || -> Result<_, Box<dyn std::error::Error>> {
             let path = bus.feetech_calibration.as_ref().ok_or(
                 "Feetech motion requires a calibration file; start --commissioning to capture it through robotd"
             )?;
@@ -1541,20 +1569,23 @@ fn open_bus(
                 None => duck_control::feetech::FeetechIo::for_startup(raw, calibration.clone())?,
             };
             io.set_servo_test(servo_test);
-            io.confirm_startup_limp()?;
-            if let Some(state) = state {
-                let report = feetech_commissioning::calibration_status_for_bus(
-                    &calibration,
-                    path,
-                    kind,
-                    &io.bus,
-                );
-                state.bus_calibration.store(Some(Arc::new(report)));
-            }
-            if kind == TrunkImuKind::Bus {
-                calibration
-                    .validate_bus_mount_for(io.bus.imu_board().protocol(), io.bus.imu_profile())?;
-            }
+            let initialized = (|| -> Result<(), Box<dyn std::error::Error>> {
+                io.confirm_startup_limp()?;
+                if let Some(state) = state {
+                    let report = feetech_commissioning::calibration_status_for_bus(
+                        &calibration, path, kind, &io.bus,
+                    );
+                    state.bus_calibration.store(Some(Arc::new(report)));
+                }
+                if kind == TrunkImuKind::Bus {
+                    calibration.validate_bus_mount_for(
+                        io.bus.imu_board().protocol(), io.bus.imu_profile(),
+                    )?;
+                }
+                Ok(())
+            })();
+            diagnostic_native = io.feetech_snapshot();
+            initialized?;
             Ok(io)
         };
         return match open() {
@@ -1567,10 +1598,10 @@ fn open_bus(
             Err(e) => {
                 if let Some(state) = state {
                     state.startup_step(2, "waiting", &e.to_string());
-                    state.bus_status.store(Some(Arc::new(serde_json::json!({
+                    state.publish_startup_native(serde_json::json!({
                         "build":feetech_commissioning::BUILD,"mode":"motion",
                         "phase":"waiting_for_bus","port":port,"configured_imu_profile":bus.imu_profile.label(),"error":e.to_string()
-                    }))));
+                    }), diagnostic_native);
                 }
                 if loud { tracing::warn!(error = %e, port, attempt, "hardware initialization waiting"); }
                 None
@@ -1792,10 +1823,12 @@ async fn adopt_startup_pose<T: RobotIo>(
                 if let Some(status) = safety.feetech_control_status() {
                     if !status.all_joints_fresh || status.joints_held {
                         state.startup_step(2, "waiting", "等待全部关节的新鲜反馈；未发送目标");
+                        publish_startup_bus_wait(safety, state, "等待全部关节的新鲜反馈；未发送目标");
                         tokio::time::sleep(STARTUP_RETRY_INTERVAL).await;
                         continue;
                     }
                     if !status.imu_ready {
+                        publish_startup_bus_wait(safety, state, "等待 IMU 数据；确认融合就绪；未发送目标");
                         let delay = if imu_confirmation_reads > 0 {
                             imu_confirmation_reads -= 1;
                             state.startup_step(2, "waiting", "关节反馈已有效；确认 IMU 融合就绪；未发送目标");
@@ -1827,13 +1860,7 @@ async fn adopt_startup_pose<T: RobotIo>(
                 // very first failure rather than after the first log line.
                 state.startup_bus_failures.store(attempt, Ordering::Relaxed);
                 state.startup_step(2, "waiting", &e.to_string());
-                let configured_imu_profile = safety
-                    .feetech_diagnostics()
-                    .map(|d| d.configured_imu_profile);
-                state.bus_status.store(Some(Arc::new(serde_json::json!({
-                    "build":feetech_commissioning::BUILD,"mode":"motion",
-                    "phase":"waiting_for_bus","configured_imu_profile":configured_imu_profile,"error":e.to_string()
-                }))));
+                publish_startup_bus_wait(safety, state, &e.to_string());
                 if attempt == 1 || attempt.is_multiple_of(STARTUP_READ_LOG_EVERY) {
                     tracing::warn!(
                         error = %e,
@@ -1847,6 +1874,13 @@ async fn adopt_startup_pose<T: RobotIo>(
     }
 
     None
+}
+
+fn publish_startup_bus_wait<T: RobotIo>(safety: &Safety<T>, state: &RobotState, error: &str) {
+    state.publish_startup_native(serde_json::json!({
+        "build":feetech_commissioning::BUILD,"mode":"motion",
+        "phase":"waiting_for_bus","error":error,
+    }), safety.feetech_snapshot());
 }
 
 fn wants_walking_scale(twist: [f64; 3], body_active: bool) -> bool {
@@ -4718,7 +4752,7 @@ async fn handle(
                     let response = BorrowedBusStatus {
                         jsonrpc: proto::JSONRPC_VERSION,
                         id: &id,
-                        result: report.as_ref(),
+                        result: aged_bus_report(&state, report.as_ref()),
                     };
                     write_line(&mut write_half, &response).await?;
                 } else if let Some(report) = state.bus_snapshot.load_full() {
@@ -4731,14 +4765,14 @@ async fn handle(
                     let response = BorrowedBusStatus {
                         jsonrpc: proto::JSONRPC_VERSION,
                         id: &id,
-                        result: &report,
+                        result: std::borrow::Cow::Borrowed(&report),
                     };
                     write_line(&mut write_half, &response).await?;
                 } else if let Some(report) = state.bus_status.load_full() {
                     let response = BorrowedBusStatus {
                         jsonrpc: proto::JSONRPC_VERSION,
                         id: &id,
-                        result: report.as_ref(),
+                        result: aged_bus_report(&state, report.as_ref()),
                     };
                     write_line(&mut write_half, &response).await?;
                 } else {
@@ -5984,7 +6018,30 @@ fn dispatch(
 struct BorrowedBusStatus<'a> {
     jsonrpc: &'static str,
     id: &'a proto::Id,
-    result: &'a serde_json::Value,
+    result: std::borrow::Cow<'a, serde_json::Value>,
+}
+
+fn aged_bus_report<'a>(
+    state: &RobotState,
+    report: &'a serde_json::Value,
+) -> std::borrow::Cow<'a, serde_json::Value> {
+    if !report["native"]["servo_observations"].is_object() {
+        return std::borrow::Cow::Borrowed(report);
+    }
+    let raw = state.raw.latest.load_full();
+    let startup = state.startup_servo_observations.load_full();
+    let observation = raw.as_ref()
+        .and_then(|raw| raw.bus.as_ref())
+        .map(|bus| &bus.native.dynamic.servo_observations)
+        .or(startup.as_deref());
+    if let Some(observation) = observation {
+        let mut value = report.clone();
+        value["native"]["servo_observations"] =
+            serde_json::to_value(observation).expect("servo observations");
+        std::borrow::Cow::Owned(value)
+    } else {
+        std::borrow::Cow::Borrowed(report)
+    }
 }
 
 async fn write_line<T: serde::Serialize>(
@@ -6305,6 +6362,7 @@ mod tests {
         assert!(result.is_err(), "zero quaternion must never satisfy startup");
         assert_eq!(reads.load(Ordering::Relaxed), 26, "only one bounded warmup burst");
         assert_eq!(state.startup.borrow()["steps"]["2"]["status"], "waiting");
+        assert_eq!(state.bus_status.load().as_ref().unwrap()["phase"], "waiting_for_bus");
     }
 
     #[test]
@@ -7066,6 +7124,7 @@ mod tests {
                 Some(snapshot::Snapshot {
                     metadata: metadata.clone(),
                     dynamic: snapshot::Dynamic {
+                        servo_observations: duck_control::feetech::observations::Snapshot::empty(metadata.clone()),
                         torque_enabled: false,
                         torque_state_confirmed: Some(false),
                         gain_mode: "test",

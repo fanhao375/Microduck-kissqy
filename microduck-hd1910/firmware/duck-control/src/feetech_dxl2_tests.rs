@@ -187,6 +187,7 @@ fn peer_fault(
         imu_protocol: BusImuProtocol::Auto,
         imu_profile: BusImuProfile::Legacy,
         imu_identity: None,
+            observations: observations::Observations::default(),
     };
     (
         bus,
