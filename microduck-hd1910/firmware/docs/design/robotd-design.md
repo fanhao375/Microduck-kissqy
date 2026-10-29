@@ -772,6 +772,10 @@ reads and pending IMU/joint readiness all publish this evidence without addition
 These observations never update control samples, satisfy motion or IMU readiness, authorize
 goals/torque, or confirm emergency torque-off. Atomic sample validation, torque readback,
 startup retry cadence and the existing control-status gates are unchanged.
+This includes factory-default commissioning: if torque-OFF readback succeeds but IMU
+identification fails, the waiting report retains servo presence before dropping the UART.
+That diagnostic report includes the configured IMU source/profile and shares the same
+RPC-time age calculation; commissioning still waits for the required IMU identification.
 
 **Same post-processing, same meaning.** Every source goes through `imu::TrunkFrame` — the mount,
 holding the last quaternion, the 25-sample ready gate, the three-point median — so `ImuData`

@@ -91,3 +91,29 @@ tests::setting_the_mode_accepts_refuses_and_says_which
 
 Existing startup/control gates were not weakened to satisfy those tests. Final ARM64
 build, ABI inspection, independent reviews and board deployment belong to the coordinator.
+
+## Review follow-up: commissioning initialization failure
+
+The initial commissioning `connect` closure also dropped its local UART owner after
+torque readback succeeded and IMU identification failed. The new real-PTY regression
+`commissioning_startup_missing_imu_preserves_servo_presence_and_frozen_rpc_age` was
+run before the fix and failed with `native.imu_source: Null` versus `"bus"`.
+
+After the fix, the same test passes with an absent calibration file (factory defaults).
+It checks fifteen ordered responding rows, null telemetry, configured source/profile,
+no ready commissioning snapshot, no control ticks and exactly one torque-OFF broadcast.
+After the commissioning task stops publishing, actual busStatus RPC age grows by at
+least 30 ms across a 40 ms wait, while captured row ages remain unchanged.
+
+This follow-up only retains diagnostics on the initialization-error path. The
+torque-OFF/verification/IMU-identification order, retry interval and existing typed
+commissioning `ready`/`read_error` publications are unchanged. `Bus::servo_observations`
+copies existing evidence; it performs no UART traffic and creates no control sample.
+
+Focused revalidation after this follow-up:
+
+- `cargo +1.99.0 test -p robotd commissioning_startup_missing_imu -- --test-threads=1`: one passed.
+- `cargo +1.99.0 test -p robotd startup_ -- --test-threads=1`: 12 unit + one integration passed.
+- `cargo +1.99.0 test -p robotd feetech_commissioning:: -- --test-threads=1`: 18 passed.
+- `cargo +1.99.0 test -p robotd feetech_r9_tests:: -- --test-threads=1`: five passed.
+- `cargo +1.99.0 test -p duck-control feetech -- --test-threads=1`: 86 passed.

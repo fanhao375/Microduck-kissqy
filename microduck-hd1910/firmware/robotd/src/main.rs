@@ -1454,10 +1454,6 @@ impl RobotState {
         native: Option<duck_control::feetech_snapshot::Snapshot>,
     ) {
         if let Some(native) = native {
-            // Keep the native capture clock outside the JSON cache so repeated RPC replies age.
-            self.startup_servo_observations.store(Some(Arc::new(
-                native.dynamic.servo_observations.clone(),
-            )));
             let mut value = serde_json::to_value(native.metadata.as_ref()).expect("native metadata");
             value.as_object_mut().unwrap().extend(
                 serde_json::to_value(&native.dynamic)
@@ -1466,10 +1462,22 @@ impl RobotState {
             );
             value["hd1910"] = serde_json::to_value(&native.hd1910).expect("native registers");
             report["configured_imu_profile"] = serde_json::json!(native.metadata.configured_imu_profile);
-            report["native"] = value;
+            self.publish_startup_native_report(report, value, native.dynamic.servo_observations);
         } else {
             self.startup_servo_observations.store(None);
+            self.bus_status.store(Some(Arc::new(report)));
         }
+    }
+
+    fn publish_startup_native_report(
+        &self,
+        mut report: serde_json::Value,
+        native: serde_json::Value,
+        observations: duck_control::feetech::observations::Snapshot,
+    ) {
+        // Keep the native capture clock outside the JSON cache so repeated RPC replies age.
+        self.startup_servo_observations.store(Some(Arc::new(observations)));
+        report["native"] = native;
         self.bus_status.store(Some(Arc::new(report)));
     }
 

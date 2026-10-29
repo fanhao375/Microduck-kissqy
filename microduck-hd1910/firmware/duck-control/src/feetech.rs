@@ -527,6 +527,20 @@ impl Bus {
         self.imu_board
     }
 
+    /// Retain replies before an initialization error drops this UART owner.
+    /// This does not read registers or construct a usable control sample.
+    pub fn servo_observations(&self, calibration: &Calibration) -> observations::Snapshot {
+        let metadata = crate::feetech_snapshot::Metadata {
+            joints: calibration.joints.iter().map(|joint| crate::feetech_snapshot::JointMetadata {
+                id: joint.id,
+                name: joint.name.clone(),
+                calibrated: joint.calibrated,
+            }).collect(),
+            ..Default::default()
+        };
+        self.observations.snapshot(std::sync::Arc::new(metadata), Instant::now())
+    }
+
     /// Enforced at the packet boundary, including every existing write API.
     pub fn open_read_only(path: &str) -> Result<Self> {
         let mut bus = Self::open(path)?;

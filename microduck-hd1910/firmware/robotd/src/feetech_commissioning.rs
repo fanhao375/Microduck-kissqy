@@ -1433,16 +1433,24 @@ pub async fn run(
     );
     let mut bus = loop {
         if state.shutdown.load(Ordering::Relaxed) { return; }
+        let mut startup_observations = None;
         let connect = (|| -> Result<Bus, String> {
             let mut bus = Bus::open(port).map_err(|e| e.to_string())?;
             bus.set_imu_protocol(imu_protocol)
                 .map_err(|e| e.to_string())?;
             bus.set_imu_profile(imu_profile)
                 .map_err(|e| e.to_string())?;
-            torque_off(&mut bus, &ids)?;
-            if host_imu.is_none() {
-                bus.identify_imu().map_err(|e| format!("IMU200: {e}"))?;
+            let initialized = (|| -> Result<(), String> {
+                torque_off(&mut bus, &ids)?;
+                if host_imu.is_none() {
+                    bus.identify_imu().map_err(|e| format!("IMU200: {e}"))?;
+                }
+                Ok(())
+            })();
+            if initialized.is_err() {
+                startup_observations = Some(bus.servo_observations(&calibration));
             }
+            initialized?;
             Ok(bus)
         })();
         match connect {
@@ -1450,7 +1458,16 @@ pub async fn run(
             Err(error) => {
                 state.startup_bus_failures.fetch_add(1, Ordering::Relaxed);
                 state.startup_step(2, "waiting", &error);
-                state.bus_status.store(Some(Arc::new(json!({"build":BUILD,"mode":"commissioning","phase":"waiting_for_bus","configured_imu_profile":imu_profile,"error":error}))));
+                let report = json!({"build":BUILD,"mode":"commissioning","phase":"waiting_for_bus","configured_imu_profile":imu_profile,"error":error});
+                if let Some(observations) = startup_observations {
+                    let native = json!({
+                        "backend":"feetech_ft6", "configured_imu_profile":imu_profile,
+                        "imu_source":source.label(), "servo_observations":&observations,
+                    });
+                    state.publish_startup_native_report(report, native, observations);
+                } else {
+                    state.publish_startup_native(report, None);
+                }
                 tokio::time::sleep(super::STARTUP_RETRY_INTERVAL).await;
             }
         }

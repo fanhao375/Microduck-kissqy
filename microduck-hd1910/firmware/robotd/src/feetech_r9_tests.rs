@@ -101,6 +101,92 @@ fn startup_open_failure_publishes_servo_presence_without_imu_or_goal_writes() {
     assert_eq!(state.ticks.load(Ordering::Relaxed), 0);
 }
 
+#[tokio::test]
+async fn commissioning_startup_missing_imu_preserves_servo_presence_and_frozen_rpc_age() {
+    // Factory-default commissioning must retain torque replies even when IMU discovery fails.
+    let (mut master, mut slave) = (0, 0);
+    let mut name = [0i8; 128];
+    assert_eq!(unsafe {
+        libc::openpty(&mut master, &mut slave, name.as_mut_ptr(), std::ptr::null(), std::ptr::null())
+    }, 0);
+    let port = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }.to_str().unwrap().to_owned();
+    let mut wire = unsafe { std::fs::File::from_raw_fd(master) };
+    unsafe { libc::close(slave); }
+    let done = Arc::new(AtomicBool::new(false));
+    let stopped = done.clone();
+    let writes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = writes.clone();
+    let device = std::thread::spawn(move || {
+        use std::os::fd::AsRawFd;
+        while !stopped.load(Ordering::Relaxed) {
+            let mut fd = libc::pollfd { fd: wire.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            if unsafe { libc::poll(&mut fd, 1, 10) } <= 0 { continue; }
+            let mut header = [0; 4];
+            if wire.read_exact(&mut header).is_err() { continue; }
+            let mut body = vec![0; header[3] as usize];
+            wire.read_exact(&mut body).unwrap();
+            if body[0] == duck_control::feetech::SYNC_WRITE {
+                log.lock().unwrap().push(body.clone());
+            } else if body[0] == duck_control::feetech::SYNC_READ {
+                assert_eq!(&body[1..3], &[40, 1]);
+                for id in &body[3..body.len()-1] {
+                    wire.write_all(&duck_control::feetech::packet(*id, 0, &[0]).unwrap()).unwrap();
+                }
+            } else {
+                assert_eq!(header[2], 200);
+                assert_eq!(body[0], duck_control::feetech::READ);
+            }
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let calibration_path = dir.path().join("missing-calibration.toml");
+    let state = Arc::new(RobotState::new(&Params::default(), Path::new("/test/robotd.toml"), false, false));
+    state.commissioning.store(true, Ordering::Relaxed);
+    let worker_state = state.clone();
+    let worker = tokio::spawn(async move {
+        run(&port, "feetech", "legacy", &worker_state, Duration::from_millis(20), &calibration_path, None).await;
+    });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while state.startup_bus_failures.load(Ordering::Relaxed) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }).await.unwrap();
+    state.shutdown.store(true, Ordering::Relaxed);
+    tokio::time::timeout(Duration::from_secs(2), worker).await.unwrap().unwrap();
+    done.store(true, Ordering::Relaxed);
+    device.join().unwrap();
+    assert!(state.bus_snapshot.load().is_none(), "missing IMU must not enter commissioning ready");
+    let query = || serde_json::json!({"jsonrpc":"2.0","id":1,"method":"robot.busStatus"});
+    let first: serde_json::Value = serde_json::from_str(&tests::ipc_response(state.clone(), query()).await).unwrap();
+    let report = &first["result"];
+    assert_eq!(report["mode"], "commissioning");
+    assert_eq!(report["phase"], "waiting_for_bus");
+    assert_eq!(report["native"]["imu_source"], "bus");
+    assert_eq!(report["native"]["configured_imu_profile"], "legacy");
+    let observation = &report["native"]["servo_observations"];
+    assert_eq!(observation["attempted"], true);
+    let rows = observation["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), NUM_JOINTS);
+    for (row, id) in rows.iter().zip(JOINT_IDS) {
+        assert_eq!(row["id"], id);
+        assert_eq!(row["responding"], true);
+        assert!(row["check_age_ms"].is_u64() && row["reply_age_ms"].is_u64());
+        for key in ["feedback_age_ms", "position_raw", "speed_raw", "load_raw", "current_raw", "volts", "temperature_c"] {
+            assert!(row[key].is_null(), "torque presence cannot supply {key}");
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    let second: serde_json::Value = serde_json::from_str(&tests::ipc_response(state.clone(), query()).await).unwrap();
+    assert!(second["result"]["native"]["servo_observations"]["age_ms"].as_u64().unwrap()
+        >= observation["age_ms"].as_u64().unwrap() + 30);
+    assert_eq!(second["result"]["native"]["servo_observations"]["rows"], observation["rows"]);
+    let writes = writes.lock().unwrap();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(&writes[0][1..3], &[40, 1]);
+    assert!(writes[0][3..writes[0].len()-1].chunks_exact(2).all(|row| row[1] == 0));
+    assert_eq!(state.ticks.load(Ordering::Relaxed), 0);
+}
+
 fn commissioning_flow(dxl2: bool, qinmo: bool) {
     let mut master = 0;
     let mut slave = 0;
