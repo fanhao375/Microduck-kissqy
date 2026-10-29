@@ -777,6 +777,33 @@ identification fails, the waiting report retains servo presence before dropping 
 That diagnostic report includes the configured IMU source/profile and shares the same
 RPC-time age calculation; commissioning still waits for the required IMU identification.
 
+**Startup bus-IMU evidence is independent too (control.47, API 42).** When motion or
+commissioning initialization refuses, that same UART owner may capture ID 200 with
+read-only requests under a shared 60 ms maximum budget. The original torque-off/readback,
+identity and motion-calibration refusals remain authoritative. A structurally valid but
+uncommissioned motion configuration can capture this evidence before returning its
+original calibration refusal; this path writes nothing. Missing/malformed configuration,
+an invalid calibration structure or an unavailable UART leaves the observation unknown.
+An I2C-selected source never probes the bus IMU. Legacy uses only its configured transport
+(auto may try Feetech then DXL2); explicit Qinmo uses PING and 56/15 and never probes DXL2.
+
+`robot.busStatus.native.imu_observation` contains `source: "bus"`, `attempted`, `responding`,
+`age_ms`, nullable `info` (the complete `BusImuInfo`), `sample_valid`, `sensor_ready`,
+`sample_fresh`, `sequence` and `error`. A checksum-valid ID 200 response proves response,
+including an unsupported identity/status, but does not authenticate a board or its data.
+Unknown identity stays `info: null`; a recognized legacy identity survives a missing or
+invalid sample. Qinmo and DXL2 keep their configured/compatibility identification meanings.
+An isolated valid sample cannot prove progression: freshness stays null unless known
+stale/not-ready status disproves it. DXL2 has no independent board-ready status, so that
+field stays null. Snapshot age advances at every RPC even after acquisition stops; a new
+report without this field cannot inherit a previous startup capture.
+
+This capture never mutates the control board/identity cache, accepted IMU sample, ready
+gate, mounting verification, goals, gains or torque authority. It adds no UART owner,
+thread, steady-state control polling or startup retry timer. Install the matching
+control.47 runtime and Studio to display it; older runtimes leave it unknown. Existing
+complete-robot startup and the independent servo observations remain unchanged.
+
 **Same post-processing, same meaning.** Every source goes through `imu::TrunkFrame` — the mount,
 holding the last quaternion, the 25-sample ready gate, the three-point median — so `ImuData`
 means the same thing whichever chip produced it. The LSM6DSV16X's FIFO words go through the

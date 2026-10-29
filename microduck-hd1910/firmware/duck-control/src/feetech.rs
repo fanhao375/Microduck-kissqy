@@ -23,6 +23,8 @@ use crate::trunk_imu::{HostImu, HostImuGate, HostImuHealth, TrunkImuKind};
 
 #[path = "feetech_observations.rs"]
 pub mod observations;
+#[path = "feetech_imu_observation.rs"]
+pub mod imu_observation;
 
 pub const BAUD: u32 = 1_000_000;
 pub const IMU_ID: u8 = 200;
@@ -303,6 +305,7 @@ pub struct Bus {
     imu_profile: BusImuProfile,
     imu_identity: Option<Vec<u8>>,
     observations: observations::Observations,
+    last_imu_response_at: Option<Instant>,
 }
 
 /// Minimal acquisition result. No recovery, raw-packet history or UART polling.
@@ -344,6 +347,7 @@ impl Bus {
             imu_profile: BusImuProfile::Legacy,
             imu_identity: None,
             observations: observations::Observations::default(),
+            last_imu_response_at: None,
         })
     }
 
@@ -464,6 +468,7 @@ impl Bus {
                                 if status.id != IMU_ID {
                                     continue;
                                 }
+                                self.last_imu_response_at = Some(Instant::now());
                                 if status.error != 0 {
                                     return Err(error(format!(
                                         "DXL2 IMU200 status error 0x{:02x}",
@@ -631,6 +636,9 @@ impl Bus {
                         // successful status. Do not interpret the echoed READ as error 2.
                         if status.error == inst && status.data == params {
                             continue;
+                        }
+                        if id == IMU_ID {
+                            self.last_imu_response_at = Some(Instant::now());
                         }
                         if inst == READ {
                             self.observations.replied(&status, params[0], params[1], Instant::now());
@@ -1734,6 +1742,8 @@ impl TelemetryTotals {
 #[derive(Debug, Clone, Serialize)]
 pub struct FeetechDiagnostics {
     pub servo_observations: observations::Snapshot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub imu_observation: Option<imu_observation::Snapshot>,
     pub configured_imu_profile: &'static str,
     pub backend: &'static str,
     pub read_timing_revision: &'static str,
@@ -1897,6 +1907,7 @@ impl TrunkImu {
 /// is fixed when it opens.
 pub struct FeetechIo {
     pub bus: Bus,
+    imu_observation: Option<imu_observation::Snapshot>,
     calibration: Calibration,
     imu: TrunkImu,
     latest_ready: bool,
@@ -2005,6 +2016,7 @@ impl FeetechIo {
     fn with_trunk_imu(bus: Bus, calibration: Calibration, imu: TrunkImu) -> Self {
         Self {
             bus,
+            imu_observation: None,
             calibration,
             imu,
             latest_ready: false,
@@ -2059,6 +2071,11 @@ impl FeetechIo {
             self.bus.identify_imu()?;
         }
         Ok(())
+    }
+    pub fn observe_startup_imu(&mut self) {
+        if matches!(self.imu, TrunkImu::Bus { .. }) {
+            self.imu_observation = Some(self.bus.observe_startup_imu());
+        }
     }
     fn ids(&self) -> Vec<u8> {
         self.calibration
@@ -2533,6 +2550,7 @@ impl RobotIo for FeetechIo {
         }
         let (imu_age_ms, imu_age_upper_bound_ms, imu_status) = self.imu.latest();
         Some(FeetechDiagnostics {
+            imu_observation: self.imu_observation.clone(),
             servo_observations: self.bus.observations.snapshot(std::sync::Arc::new(self.diagnostic_metadata()), now),
             configured_imu_profile: self.bus.imu_profile.label(),
             backend: "feetech_ft6",
@@ -2624,6 +2642,7 @@ impl RobotIo for FeetechIo {
         Some(snapshot::Snapshot {
             metadata: metadata.clone(),
             dynamic: snapshot::Dynamic {
+                imu_observation: self.imu_observation.clone(),
                 servo_observations: self.bus.observations.snapshot(metadata.clone(), now),
                 torque_enabled: self.torque_enabled,
                 torque_state_confirmed: self.torque_state_confirmed,
@@ -3018,6 +3037,7 @@ mod tests {
             imu_profile: BusImuProfile::Legacy,
             imu_identity: None,
             observations: observations::Observations::default(),
+            last_imu_response_at: None,
         };
         let mut io = FeetechIo::from_bus(bus, calibrated()).unwrap();
         for _ in 0..30 {
@@ -3116,6 +3136,7 @@ mod tests {
                 imu_profile: BusImuProfile::Legacy,
                 imu_identity: None,
                 observations: observations::Observations::default(),
+                last_imu_response_at: None,
             };
             let result = bus.telemetry(&crate::model::JOINT_IDS);
             finish.send(()).unwrap();
@@ -3171,6 +3192,7 @@ mod tests {
             imu_profile: BusImuProfile::Legacy,
             imu_identity: None,
             observations: observations::Observations::default(),
+            last_imu_response_at: None,
         };
         bus.verify_torque(&ids, false).unwrap();
         assert!(bus.last_sync.missing_ids.is_empty());
@@ -3666,6 +3688,8 @@ mod hd1910_transport_tests {
         checksum_id: Option<u8>,
         status_id: Option<u8>,
         imu_stale: bool,
+        imu_bad_quat: bool,
+        imu_reserved: u8,
         identity_missing_reads: usize,
         reject_torque_off_id: Option<u8>,
     }
@@ -3795,6 +3819,10 @@ mod hd1910_transport_tests {
                     }
                     if id == IMU_ID && addr == 56 {
                         data[7] = 0x30;
+                        if fault.imu_bad_quat {
+                            data[6..12].fill(0xff);
+                        }
+                        data[14] = fault.imu_reserved;
                         data[12] = seq;
                         if fault.imu_stale {
                             data[13] = 1;
@@ -3825,6 +3853,7 @@ mod hd1910_transport_tests {
                 imu_profile: BusImuProfile::Legacy,
                 imu_identity: None,
                 observations: observations::Observations::default(),
+                last_imu_response_at: None,
             },
             Emulator {
                 faults,
@@ -3848,6 +3877,91 @@ mod hd1910_transport_tests {
         c.motion_enabled = true;
         c.imu_mount_verified = true;
         c
+    }
+
+    #[test]
+    fn independent_imu_observation_keeps_identity_when_sample_does_not_reply() {
+        let (mut bus, device) = emulator(false);
+        device.faults.lock().unwrap().missing = vec![IMU_ID];
+        let observation = bus.observe_startup_imu();
+        assert!(observation.responding);
+        assert_eq!(observation.info.as_ref().unwrap().board, "ft6");
+        assert_eq!(observation.sample_valid, None);
+        assert!(observation.error.is_some());
+        assert!(bus.imu_info().is_none());
+        assert!(device.writes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn independent_imu_observation_flags_and_age_never_become_control_samples() {
+        for (bad_quat, stale, reserved, valid) in [
+            (false, false, 0, true),
+            (true, false, 0, false),
+            (false, true, 0, true),
+            (false, false, 1, false),
+        ] {
+            let (bus, device) = emulator(false);
+            {
+                let mut faults = device.faults.lock().unwrap();
+                faults.imu_bad_quat = bad_quat;
+                faults.imu_stale = stale;
+                faults.imu_reserved = reserved;
+            }
+            let mut io = FeetechIo::for_startup(bus, calibration()).unwrap();
+            io.observe_startup_imu();
+            let snapshot = io.feetech_snapshot().unwrap();
+            let first = serde_json::to_value(&snapshot.dynamic).unwrap();
+            let observation = &first["imu_observation"];
+            assert_eq!(observation["responding"], true);
+            assert_eq!(observation["info"]["board"], "ft6");
+            assert_eq!(observation["sample_valid"], valid);
+            assert_ne!(
+                observation["sample_fresh"], true,
+                "one sample cannot prove progression"
+            );
+            if reserved == 0 {
+                assert_eq!(observation["sensor_ready"], !stale);
+            }
+            assert!(first["sample_age_ms"].is_null());
+            assert_eq!(first["imu_ready"], false);
+            assert_eq!(first["imu_sequence"], serde_json::Value::Null);
+            assert!(snapshot.metadata.imu_bus.is_none());
+            assert!(!io.command_enabled);
+            assert!(io.torque_state_confirmed.is_none());
+            std::thread::sleep(Duration::from_millis(15));
+            let aged = serde_json::to_value(&snapshot.dynamic).unwrap();
+            assert!(aged["imu_observation"]["age_ms"].as_u64().unwrap() >= 10);
+            assert!(device.writes.lock().unwrap().is_empty());
+            assert!(
+                device
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|(inst, _, ids)| *inst == READ && ids == &[IMU_ID])
+            );
+        }
+    }
+
+    #[test]
+    fn independent_imu_observation_does_not_probe_bus_for_a_host_source() {
+        let (bus, device) = emulator(false);
+        let mut io = FeetechIo::for_startup_with_imu(
+            bus,
+            calibration(),
+            Box::new(FreshHost::new(TrunkImuKind::Lsm6dsv16x)),
+        )
+        .unwrap();
+        io.observe_startup_imu();
+        assert!(
+            io.feetech_snapshot()
+                .unwrap()
+                .dynamic
+                .imu_observation
+                .is_none()
+        );
+        assert!(device.requests.lock().unwrap().is_empty());
+        assert!(device.writes.lock().unwrap().is_empty());
     }
 
     /// A module read by the host that always has a fresh, settled sample: a new sequence on

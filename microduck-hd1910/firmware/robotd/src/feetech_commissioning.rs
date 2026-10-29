@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::oneshot;
 
-pub const BUILD: &str = "0791fcd-feetech-qinmo-control.46";
+pub const BUILD: &str = "0791fcd-feetech-qinmo-control.47";
 const MAX_PENDING: usize = 16;
 const POSITION_TOLERANCE: u16 = 8;
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(4);
@@ -1434,6 +1434,7 @@ pub async fn run(
     let mut bus = loop {
         if state.shutdown.load(Ordering::Relaxed) { return; }
         let mut startup_observations = None;
+        let mut startup_imu_observation = None;
         let connect = (|| -> Result<Bus, String> {
             let mut bus = Bus::open(port).map_err(|e| e.to_string())?;
             bus.set_imu_protocol(imu_protocol)
@@ -1448,6 +1449,9 @@ pub async fn run(
                 Ok(())
             })();
             if initialized.is_err() {
+                if host_imu.is_none() {
+                    startup_imu_observation = Some(bus.observe_startup_imu());
+                }
                 startup_observations = Some(bus.servo_observations(&calibration));
             }
             initialized?;
@@ -1463,8 +1467,9 @@ pub async fn run(
                     let native = json!({
                         "backend":"feetech_ft6", "configured_imu_profile":imu_profile,
                         "imu_source":source.label(), "servo_observations":&observations,
+                        "imu_observation":&startup_imu_observation,
                     });
-                    state.publish_startup_native_report(report, native, observations);
+                    state.publish_startup_native_report(report, native, observations, startup_imu_observation);
                 } else {
                     state.publish_startup_native(report, None);
                 }

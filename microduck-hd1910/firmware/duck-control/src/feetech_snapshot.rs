@@ -115,6 +115,8 @@ pub struct HdState {
 #[derive(Debug, Clone, Serialize)]
 pub struct Dynamic {
     pub servo_observations: crate::feetech::observations::Snapshot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub imu_observation: Option<crate::feetech::imu_observation::Snapshot>,
     pub torque_enabled: bool,
     pub torque_state_confirmed: Option<bool>,
     pub gain_mode: &'static str,

@@ -1,0 +1,25 @@
+{
+  "native": {
+    "configured_imu_profile": "legacy",
+    "imu_source": "bus",
+    "imu_observation": {
+      "source": "bus",
+      "attempted": true,
+      "responding": true,
+      "age_ms": 0,
+      "info": {
+        "protocol": "feetech",
+        "board": "ft6",
+        "identity": [6, 0, 0, 0, 242],
+        "profile": "legacy",
+        "gyro_dps_per_lsb": 0.0175,
+        "identification": "legacy_identity"
+      },
+      "sample_valid": true,
+      "sensor_ready": true,
+      "sample_fresh": null,
+      "sequence": 7,
+      "error": null
+    }
+  }
+}

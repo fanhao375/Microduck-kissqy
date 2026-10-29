@@ -43,6 +43,252 @@ fn qinmo_commissioning_uses_explicit_profile_and_persists_both_mount_bindings() 
 }
 
 #[test]
+fn independent_imu_startup_diagnostics_survive_missing_and_partial_servos() {
+    for commissioning in [false, true] {
+        for present in [0, 3] {
+            independent_imu_startup_case(commissioning, present, true, false, false);
+        }
+        for present in [0, 15] {
+            independent_imu_startup_case(commissioning, present, false, false, false);
+            independent_imu_startup_case(commissioning, present, true, true, false);
+        }
+    }
+}
+
+#[test]
+fn independent_imu_diagnostics_survive_motion_calibration_refusal_without_writes() {
+    independent_imu_startup_case(false, 0, true, false, true);
+}
+
+fn independent_imu_startup_case(
+    commissioning: bool,
+    present: usize,
+    imu: bool,
+    invalid_identity: bool,
+    unverified: bool,
+) {
+    let (mut master, mut slave) = (0, 0);
+    let mut name = [0i8; 128];
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                name.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        },
+        0
+    );
+    let port = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let mut wire = unsafe { std::fs::File::from_raw_fd(master) };
+    unsafe {
+        libc::close(slave);
+    }
+    let done = Arc::new(AtomicBool::new(false));
+    let stopped = done.clone();
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = requests.clone();
+    let device = std::thread::spawn(move || {
+        use std::os::fd::AsRawFd;
+        while !stopped.load(Ordering::Relaxed) {
+            let mut fd = libc::pollfd {
+                fd: wire.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            if unsafe { libc::poll(&mut fd, 1, 10) } <= 0 {
+                continue;
+            }
+            let mut header = [0; 4];
+            if wire.read_exact(&mut header).is_err() {
+                continue;
+            }
+            let mut body = vec![0; header[3] as usize];
+            wire.read_exact(&mut body).unwrap();
+            log.lock().unwrap().push((header[2], body.clone()));
+            match body[0] {
+                duck_control::feetech::SYNC_WRITE => {
+                    assert_eq!(&body[1..3], &[40, 1]);
+                    assert!(
+                        body[3..body.len() - 1]
+                            .chunks_exact(2)
+                            .all(|row| row[1] == 0)
+                    );
+                }
+                duck_control::feetech::SYNC_READ => {
+                    assert_eq!(&body[1..3], &[40, 1]);
+                    for id in &JOINT_IDS[..present] {
+                        wire.write_all(&duck_control::feetech::packet(*id, 0, &[0]).unwrap())
+                            .unwrap();
+                    }
+                }
+                duck_control::feetech::READ => {
+                    assert_eq!(header[2], 200);
+                    if !imu {
+                        continue;
+                    }
+                    let mut data = vec![0; usize::from(body[2])];
+                    if body[1] == 0 {
+                        data.copy_from_slice(&if invalid_identity {
+                            [1, 2, 3, 4, 5]
+                        } else {
+                            duck_control::feetech::IMU_IDENTITY
+                        });
+                    } else {
+                        assert_eq!(&body[1..3], &[56, 15]);
+                        data[7] = 0x30;
+                        data[12] = 7;
+                    }
+                    wire.write_all(&duck_control::feetech::packet(200, 0, &data).unwrap())
+                        .unwrap();
+                }
+                _ => panic!("unexpected startup instruction {}", body[0]),
+            }
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("calibration.toml");
+    let mut calibration: duck_control::feetech::Calibration = if commissioning {
+        duck_control::feetech::Calibration::commissioning(JOINT_IDS)
+    } else {
+        toml::from_str(include_str!(
+            "../../packaging/hd1910-calibration.robot.toml"
+        ))
+        .unwrap()
+    };
+    if unverified {
+        calibration.imu_mount_verified = false;
+        calibration.motion_enabled = false;
+        calibration.joints[0].calibrated = false;
+    }
+    std::fs::write(&path, toml::to_string(&calibration).unwrap()).unwrap();
+    let state = Arc::new(RobotState::new(
+        &Params::default(),
+        Path::new("/test/robotd.toml"),
+        false,
+        false,
+    ));
+    if commissioning {
+        let control = state.clone();
+        let shutdown = std::thread::spawn(move || {
+            let until = Instant::now() + Duration::from_secs(2);
+            while control.startup_bus_failures.load(Ordering::Relaxed) == 0
+                && Instant::now() < until
+            {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            control.shutdown.store(true, Ordering::Relaxed);
+        });
+        tokio::runtime::Runtime::new().unwrap().block_on(run(
+            &port,
+            "feetech",
+            "legacy",
+            &state,
+            Duration::from_millis(20),
+            &path,
+            None,
+        ));
+        shutdown.join().unwrap();
+    } else {
+        let bus = params::Bus {
+            protocol: params::BusProtocol::Feetech,
+            imu_protocol: params::ImuBusProtocol::Feetech,
+            feetech_calibration: Some(path),
+            port,
+            ..Default::default()
+        };
+        let opened = open_bus(&bus, None, 0, Some(&state));
+        if present == 15 && imu && !invalid_identity {
+            assert!(opened.is_some());
+        } else {
+            assert!(opened.is_none());
+        }
+    }
+    done.store(true, Ordering::Relaxed);
+    device.join().unwrap();
+    if present == 15 && imu && !invalid_identity {
+        return;
+    }
+    let report = state.bus_status.load_full().unwrap();
+    let observation = &report["native"]["imu_observation"];
+    assert_eq!(observation["attempted"], true, "{report}");
+    assert_eq!(observation["responding"], imu, "{report}");
+    assert_eq!(observation["source"], "bus");
+    if imu && !invalid_identity {
+        assert_eq!(observation["info"]["board"], "ft6");
+        assert_eq!(observation["sample_valid"], true);
+        assert_eq!(observation["sensor_ready"], true);
+        assert_eq!(observation["sequence"], 7);
+    } else {
+        assert!(observation["info"].is_null());
+        assert!(observation["error"].is_string());
+    }
+    assert!(report["native"]["imu_bus"].is_null());
+    assert_ne!(report["native"]["imu_ready"], true);
+    assert_eq!(state.ticks.load(Ordering::Relaxed), 0);
+    assert!(!state.imu_ready.load(Ordering::Relaxed));
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let query = || serde_json::json!({"jsonrpc":"2.0", "id":1, "method":"robot.busStatus"});
+    let first: serde_json::Value =
+        serde_json::from_str(&runtime.block_on(crate::tests::ipc_response(state.clone(), query())))
+            .unwrap();
+    std::thread::sleep(Duration::from_millis(35));
+    let second: serde_json::Value =
+        serde_json::from_str(&runtime.block_on(crate::tests::ipc_response(state.clone(), query())))
+            .unwrap();
+    let first_age = first["result"]["native"]["imu_observation"]["age_ms"]
+        .as_u64()
+        .unwrap();
+    let second_age = second["result"]["native"]["imu_observation"]["age_ms"]
+        .as_u64()
+        .unwrap();
+    assert!(
+        second_age >= first_age + 25,
+        "frozen IMU evidence must age at RPC time"
+    );
+    assert_eq!(second["result"]["error"], report["error"]);
+    let mut current = (*report).clone();
+    current["native"]
+        .as_object_mut()
+        .unwrap()
+        .remove("imu_observation");
+    state.bus_status.store(Some(Arc::new(current)));
+    let current: serde_json::Value =
+        serde_json::from_str(&runtime.block_on(crate::tests::ipc_response(state.clone(), query())))
+            .unwrap();
+    assert!(
+        current["result"]["native"]["imu_observation"].is_null(),
+        "a new report cannot inherit old startup IMU evidence"
+    );
+    if imu && !invalid_identity {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../duck-control/tests/fixtures/startup-imu-observation.json"
+        ))
+        .unwrap();
+        let mut actual = observation.clone();
+        actual["age_ms"] = serde_json::json!(0);
+        assert_eq!(actual, fixture["native"]["imu_observation"]);
+    }
+    let log = requests.lock().unwrap();
+    assert!(
+        log.iter()
+            .any(|(id, body)| *id == 200 && body[0] == duck_control::feetech::READ)
+    );
+    if unverified {
+        assert!(report["error"].as_str().unwrap().contains("motion_enabled"));
+        assert!(
+            log.iter()
+                .all(|(id, body)| *id == 200 && body[0] == duck_control::feetech::READ)
+        );
+    }
+}
+
+#[test]
 fn startup_open_failure_publishes_servo_presence_without_imu_or_goal_writes() {
     let (mut master, mut slave) = (0, 0);
     let mut name = [0i8; 128];

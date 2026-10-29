@@ -595,6 +595,7 @@ struct RobotState {
     bus_commands: feetech_commissioning::Commands,
     bus_status: ArcSwapOption<serde_json::Value>,
     startup_servo_observations: ArcSwapOption<duck_control::feetech::observations::Snapshot>,
+    startup_imu_observation: ArcSwapOption<duck_control::feetech::imu_observation::Snapshot>,
     bus_snapshot: ArcSwapOption<feetech_commissioning::Status>,
     bus_calibration: ArcSwapOption<serde_json::Value>,
     raw: raw_stream::Hub,
@@ -780,6 +781,7 @@ impl RobotState {
             bus_commands: feetech_commissioning::Commands::default(),
             bus_status: ArcSwapOption::empty(),
             startup_servo_observations: ArcSwapOption::empty(),
+            startup_imu_observation: ArcSwapOption::empty(),
             bus_snapshot: ArcSwapOption::empty(),
             bus_calibration: ArcSwapOption::empty(),
             raw: raw_stream::Hub::default(),
@@ -1462,9 +1464,15 @@ impl RobotState {
             );
             value["hd1910"] = serde_json::to_value(&native.hd1910).expect("native registers");
             report["configured_imu_profile"] = serde_json::json!(native.metadata.configured_imu_profile);
-            self.publish_startup_native_report(report, value, native.dynamic.servo_observations);
+            self.publish_startup_native_report(
+                report,
+                value,
+                native.dynamic.servo_observations,
+                native.dynamic.imu_observation,
+            );
         } else {
             self.startup_servo_observations.store(None);
+            self.startup_imu_observation.store(None);
             self.bus_status.store(Some(Arc::new(report)));
         }
     }
@@ -1474,9 +1482,11 @@ impl RobotState {
         mut report: serde_json::Value,
         native: serde_json::Value,
         observations: duck_control::feetech::observations::Snapshot,
+        imu_observation: Option<duck_control::feetech::imu_observation::Snapshot>,
     ) {
         // Keep the native capture clock outside the JSON cache so repeated RPC replies age.
         self.startup_servo_observations.store(Some(Arc::new(observations)));
+        self.startup_imu_observation.store(imu_observation.map(Arc::new));
         report["native"] = native;
         self.bus_status.store(Some(Arc::new(report)));
     }
@@ -1561,7 +1571,26 @@ fn open_bus(
                 report["configured_imu_profile"] = serde_json::json!(bus.imu_profile.label());
                 state.bus_calibration.store(Some(Arc::new(report)));
             }
-            calibration.validate_motion_for(kind)?;
+            if let Err(problem) = calibration.validate_motion_for(kind) {
+                // An uncommissioned but structurally valid configuration still names
+                // the sole UART. Preserve the motion refusal and collect reads only.
+                if host_imu.is_none() && calibration.validate().is_ok() {
+                    diagnostic_native = (|| -> Result<_, Box<dyn std::error::Error>> {
+                        let mut raw = duck_control::feetech::Bus::open(port)?;
+                        raw.set_imu_protocol(bus.imu_protocol.label())?;
+                        raw.set_imu_profile(bus.imu_profile.label())?;
+                        let mut io = duck_control::feetech::FeetechIo::for_startup(
+                            raw,
+                            calibration.clone(),
+                        )?;
+                        io.observe_startup_imu();
+                        Ok(io.feetech_snapshot())
+                    })()
+                    .ok()
+                    .flatten();
+                }
+                return Err(problem.into());
+            }
             // Optional servo P/D/torque limit (servo-test-parameters.json), read before the
             // bus is opened: a bad file stops motion startup without touching the servos.
             let servo_test = duck_control::hd1910_test::load(path)?;
@@ -1592,6 +1621,9 @@ fn open_bus(
                 }
                 Ok(())
             })();
+            if initialized.is_err() {
+                io.observe_startup_imu();
+            }
             diagnostic_native = io.feetech_snapshot();
             initialized?;
             Ok(io)
@@ -6033,19 +6065,33 @@ fn aged_bus_report<'a>(
     state: &RobotState,
     report: &'a serde_json::Value,
 ) -> std::borrow::Cow<'a, serde_json::Value> {
-    if !report["native"]["servo_observations"].is_object() {
+    if !report["native"]["servo_observations"].is_object()
+        && !report["native"]["imu_observation"].is_object()
+    {
         return std::borrow::Cow::Borrowed(report);
     }
     let raw = state.raw.latest.load_full();
     let startup = state.startup_servo_observations.load_full();
+    let startup_imu = state.startup_imu_observation.load_full();
+    let imu = raw
+        .as_ref()
+        .and_then(|raw| raw.bus.as_ref())
+        .and_then(|bus| bus.native.dynamic.imu_observation.as_ref())
+        .or(startup_imu.as_deref());
     let observation = raw.as_ref()
         .and_then(|raw| raw.bus.as_ref())
         .map(|bus| &bus.native.dynamic.servo_observations)
         .or(startup.as_deref());
-    if let Some(observation) = observation {
+    if observation.is_some() || imu.is_some() {
         let mut value = report.clone();
-        value["native"]["servo_observations"] =
-            serde_json::to_value(observation).expect("servo observations");
+        if let Some(observation) = observation {
+            value["native"]["servo_observations"] =
+                serde_json::to_value(observation).expect("servo observations");
+        }
+        if let Some(imu) = imu.filter(|_| report["native"]["imu_observation"].is_object()) {
+            value["native"]["imu_observation"] =
+                serde_json::to_value(imu).expect("IMU observation");
+        }
         std::borrow::Cow::Owned(value)
     } else {
         std::borrow::Cow::Borrowed(report)
@@ -7133,6 +7179,7 @@ mod tests {
                     metadata: metadata.clone(),
                     dynamic: snapshot::Dynamic {
                         servo_observations: duck_control::feetech::observations::Snapshot::empty(metadata.clone()),
+                        imu_observation: None,
                         torque_enabled: false,
                         torque_state_confirmed: Some(false),
                         gain_mode: "test",

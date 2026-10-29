@@ -548,6 +548,7 @@ pub(crate) mod tests {
             imu_fusion: None,
             dynamic: Native {
                 servo_observations: feetech::observations::Snapshot::empty(metadata.clone()),
+                imu_observation: None,
                 torque_enabled: true,
                 torque_state_confirmed: Some(true),
                 gain_mode: "hd1910_model_contract_p_restore_on_relax_native_d_torque_limit_preserved",

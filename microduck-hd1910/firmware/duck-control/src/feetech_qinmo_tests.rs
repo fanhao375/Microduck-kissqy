@@ -161,6 +161,7 @@ fn model_delivery(delay: Duration, answer: bool, delivery: Delivery) -> (Bus, Sp
         imu_profile: BusImuProfile::Legacy,
         imu_identity: None,
             observations: observations::Observations::default(),
+            last_imu_response_at: None,
     };
     (
         bus,
@@ -171,6 +172,35 @@ fn model_delivery(delay: Duration, answer: bool, delivery: Delivery) -> (Bus, Sp
             worker: Some(worker),
         },
     )
+}
+
+#[test]
+fn independent_imu_observation_uses_only_the_explicit_qinmo_contract() {
+    for (delivery, valid) in [(Delivery::Whole, true), (Delivery::CorruptCore, false)] {
+        let (mut bus, specification) = model_delivery(Duration::ZERO, true, delivery);
+        bus.set_imu_profile("qinmo").unwrap();
+        let observation = bus.observe_startup_imu();
+        assert!(observation.responding);
+        assert_eq!(observation.sample_valid, valid.then_some(true));
+        if valid {
+            let info = observation.info.as_ref().unwrap();
+            assert_eq!(info.profile, "qinmo");
+            assert_eq!(info.identification, "configured_profile");
+            assert!(info.identity.is_empty());
+            assert_eq!(observation.sensor_ready, Some(true));
+            assert_eq!(observation.sample_fresh, None);
+        } else {
+            assert!(observation.info.is_none());
+        }
+        assert!(bus.imu_info().is_none());
+        assert_eq!(
+            specification.requests.lock().unwrap().as_slice(),
+            &[
+                packet(IMU_ID, 1, &[]).unwrap(),
+                packet(IMU_ID, READ, &[56, 15]).unwrap(),
+            ]
+        );
+    }
 }
 
 #[test]

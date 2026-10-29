@@ -188,6 +188,7 @@ fn peer_fault(
         imu_profile: BusImuProfile::Legacy,
         imu_identity: None,
             observations: observations::Observations::default(),
+            last_imu_response_at: None,
     };
     (
         bus,
@@ -197,6 +198,51 @@ fn peer_fault(
             thread: Some(thread),
         },
     )
+}
+
+#[test]
+fn independent_imu_observation_autodetects_dxl2_without_claiming_progress_or_control_identity() {
+    let (mut bus, device) = peer(BusImuProtocol::Dxl2, Duration::ZERO, Duration::ZERO);
+    let started = Instant::now();
+    let observation = bus.observe_startup_imu();
+    assert!(started.elapsed() < Duration::from_millis(100));
+    assert!(observation.responding);
+    let info = observation.info.as_ref().unwrap();
+    assert_eq!(info.protocol, "dxl2");
+    assert_eq!(info.board, "sflp_124_12");
+    assert_eq!(info.identification, "compatibility_layout");
+    assert_eq!(observation.sample_valid, Some(true));
+    assert_eq!(observation.sensor_ready, None);
+    assert_eq!(observation.sample_fresh, None);
+    assert!(bus.imu_info().is_none());
+    let requests = device.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0], packet(IMU_ID, READ, &[0, 5]).unwrap());
+    assert_eq!(
+        requests[1],
+        crate::dxl2::packet(IMU_ID, READ, &[0, 0, 3, 0])
+    );
+    assert_eq!(
+        requests[2],
+        crate::dxl2::packet(IMU_ID, READ, &[124, 0, 12, 0])
+    );
+}
+
+#[test]
+fn independent_imu_observation_rejects_unknown_identity_without_dxl2_fallback() {
+    let (mut bus, device) = peer_fault(
+        BusImuProtocol::Feetech,
+        Duration::ZERO,
+        Duration::ZERO,
+        Fault::UnknownFeetech,
+    );
+    let observation = bus.observe_startup_imu();
+    assert!(observation.responding);
+    assert!(observation.info.is_none());
+    assert!(observation.sample_valid.is_none());
+    assert!(observation.error.unwrap().contains("neither FT6"));
+    assert_eq!(device.requests.lock().unwrap().len(), 1);
+    assert!(bus.imu_info().is_none());
 }
 
 #[test]

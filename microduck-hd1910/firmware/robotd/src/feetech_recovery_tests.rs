@@ -67,6 +67,7 @@ impl RobotIo for RecoveryIo {
         );
         Some(FeetechDiagnostics {
             servo_observations: Default::default(),
+            imu_observation: None,
             configured_imu_profile: "legacy",
             backend: "fake_feetech",
             read_timing_revision: "test",
@@ -128,6 +129,7 @@ impl RobotIo for RecoveryIo {
             metadata: metadata.clone(),
             dynamic: raw::Dynamic {
                 servo_observations: duck_control::feetech::observations::Snapshot::empty(metadata.clone()),
+                        imu_observation: None,
                 torque_enabled: d.torque_enabled,
                 torque_state_confirmed: d.torque_state_confirmed,
                 gain_mode: d.gain_mode,
