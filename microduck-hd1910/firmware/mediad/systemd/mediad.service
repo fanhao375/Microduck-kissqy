@@ -83,7 +83,8 @@ RestartSec=5s
 #
 # AF_INET and AF_INET6 are load-bearing: the signalling server listens on a TCP socket and WebRTC
 # is UDP. Without them the daemon starts and no peer can ever reach it, which is the same shape of
-# failure as padd's missing AF_NETLINK.
+# failure as padd's missing AF_NETLINK. libnice also needs AF_NETLINK to enumerate local
+# interfaces for ICE; opening the signalling TCP connection alone does not prove video works.
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
@@ -92,7 +93,7 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 RestrictNamespaces=yes
 LockPersonality=yes
 CapabilityBoundingSet=

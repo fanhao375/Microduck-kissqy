@@ -1,0 +1,97 @@
+{
+  "schema": "microduck-controller-cache-inventory/1",
+  "deleted": false,
+  "directories": [
+    {
+      "path": "/mnt/f/chengshenzhilu/Robot/Microduck/artifacts/native-release-prep-20261030/frozen-a",
+      "exists": true,
+      "realpath": "/mnt/f/chengshenzhilu/Robot/Microduck/artifacts/native-release-prep-20261030/frozen-a",
+      "allocated_bytes": 95440896,
+      "apparent_bytes": 93750004
+    },
+    {
+      "path": "/mnt/f/chengshenzhilu/Robot/Microduck/artifacts/native-release-prep-20261030/frozen-b",
+      "exists": true,
+      "realpath": "/mnt/f/chengshenzhilu/Robot/Microduck/artifacts/native-release-prep-20261030/frozen-b",
+      "allocated_bytes": 95440896,
+      "apparent_bytes": 93750004
+    },
+    {
+      "path": "/mnt/f/chengshenzhilu/Robot/Microduck/artifacts/native-release-prep-20261030/linux-target-a",
+      "exists": true,
+      "realpath": "/mnt/f/chengshenzhilu/Robot/Microduck/artifacts/native-release-prep-20261030/linux-target-a",
+      "allocated_bytes": 1115439104,
+      "apparent_bytes": 1113844479
+    },
+    {
+      "path": "/mnt/f/chengshenzhilu/Robot/Microduck/artifacts/native-release-prep-20261030/linux-target-b",
+      "exists": true,
+      "realpath": "/mnt/f/chengshenzhilu/Robot/Microduck/artifacts/native-release-prep-20261030/linux-target-b",
+      "allocated_bytes": 209162240,
+      "apparent_bytes": 209255596
+    },
+    {
+      "path": "/mnt/f/chengshenzhilu/Robot/Microduck/artifacts/native-release-prep-20261030/zig-global-cache",
+      "exists": true,
+      "realpath": "/mnt/f/chengshenzhilu/Robot/Microduck/artifacts/native-release-prep-20261030/zig-global-cache",
+      "allocated_bytes": 40210432,
+      "apparent_bytes": 38641702
+    },
+    {
+      "path": "/mnt/f/chengshenzhilu/Robot/Microduck/artifacts/native-release-prep-20261030/zig-local-cache-a",
+      "exists": true,
+      "realpath": "/mnt/f/chengshenzhilu/Robot/Microduck/artifacts/native-release-prep-20261030/zig-local-cache-a",
+      "allocated_bytes": 0,
+      "apparent_bytes": 20674
+    },
+    {
+      "path": "/mnt/f/chengshenzhilu/Robot/Microduck/artifacts/native-release-prep-20261030/zig-local-cache-b",
+      "exists": true,
+      "realpath": "/mnt/f/chengshenzhilu/Robot/Microduck/artifacts/native-release-prep-20261030/zig-local-cache-b",
+      "allocated_bytes": 0,
+      "apparent_bytes": 20674
+    },
+    {
+      "path": "/mnt/f/chengshenzhilu/Robot/Microduck/artifacts/native-release-prep-20261030/tmp-a",
+      "exists": true,
+      "realpath": "/mnt/f/chengshenzhilu/Robot/Microduck/artifacts/native-release-prep-20261030/tmp-a",
+      "allocated_bytes": 0,
+      "apparent_bytes": 4096
+    },
+    {
+      "path": "/mnt/f/chengshenzhilu/Robot/Microduck/artifacts/native-release-prep-20261030/tmp-b",
+      "exists": true,
+      "realpath": "/mnt/f/chengshenzhilu/Robot/Microduck/artifacts/native-release-prep-20261030/tmp-b",
+      "allocated_bytes": 0,
+      "apparent_bytes": 4096
+    }
+  ],
+  "total_allocated_bytes": 1555693568,
+  "preserved_proof_executables": [
+    {
+      "path": "/mnt/f/chengshenzhilu/Robot/Microduck/artifacts/native-release-prep-20261030/padd-host-proof",
+      "source": "/mnt/f/chengshenzhilu/Robot/Microduck/artifacts/native-release-prep-20261030/linux-target-a/debug/padd",
+      "size": 74384472,
+      "sha256": "105ee80b023ba66309417cbe9c2289e1df82d36c02c6a9c852e414939c7ae5db",
+      "shipping": false
+    },
+    {
+      "path": "/mnt/f/chengshenzhilu/Robot/Microduck/artifacts/native-release-prep-20261030/padd-contract-fixture",
+      "source": "/mnt/f/chengshenzhilu/Robot/Microduck/artifacts/native-release-prep-20261030/linux-target-a/debug/deps/padd-1ee51bf31d9dcfb2",
+      "size": 70919424,
+      "sha256": "a0991b8ffa951013fdac53baeb969c83afb1edc060601e4d15ecdb5af2c13825",
+      "shipping": false
+    }
+  ],
+  "rebuild_basis": "native-reviewed-source.tar with frozen source665613a and build_frozen_padd.sh",
+  "preserve": [
+    "native-reviewed-source.tar",
+    "native-source.json",
+    "native-inputs.json",
+    "padd-arm64-a",
+    "padd-arm64-b",
+    "padd-host-proof",
+    "padd-contract-fixture",
+    "all evidence logs/manifests/scripts"
+  ]
+}

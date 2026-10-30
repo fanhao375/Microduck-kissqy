@@ -3,6 +3,34 @@
 What a Radxa Zero 3W does about video. Everything below was observed on a board, not inferred —
 where something is still an assumption it says so.
 
+## 2026-10-30: connected signalling without camera frames
+
+A replica Zero 3W on the vendor 6.1.115 kernel had an identified IMX219 sensor, an enabled
+sensor → DPHY → ISP media graph, and a running `mediad`, but the browser showed no picture.
+These are separate checks: neither an existing video node nor an accepted signalling session
+proves that a video frame reached the browser.
+
+The board's persisted `[media] source` was still `"test"`, and that test pipeline repeatedly
+logged `failed to blit` from the MPP path. The unit also excluded `AF_NETLINK`; libnice logged
+`Failed to retrieve list of network interfaces: Address family not supported by protocol`.
+The shipped unit now permits that family alongside `AF_UNIX`, `AF_INET` and `AF_INET6` so ICE
+can enumerate local interfaces. It does not remove the other service restrictions.
+
+The live repair backed up the existing config and drop-in, changed only the selected media
+source to `"camera"`, and added the same address-family allowance in a mediad-only drop-in.
+Only mediad restarted; robotd's PID stayed unchanged. The default source for boards without a
+camera was not changed. Sensor presence was verified before selecting the camera source.
+
+Verification used a bounded three-frame NV12/JPEG capture followed by a real Edge WebRTC
+consumer using Studio's `CameraLink` without robot-control methods. Two short live sessions
+decoded 67 frames at about 28 fps and 48 frames at about 30 fps, both 1280×720, with ICE and peer
+connection states `connected` and no browser exceptions. The first image was dark; the user
+reported a lens obstruction and removed it, after which a real illuminated scene was visible.
+This verifies the short camera-to-browser path, not sustained frame rate, thermal behavior or
+long-running reconnect stability. Both configuration changes were applied together, so this
+record does not attribute the entire failure to just one of them. Private camera captures stay
+outside the repository.
+
 ## What this settles
 
 `mediad` needs hardware H.264: software encode is not a slower option, it is not an option.

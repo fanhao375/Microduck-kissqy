@@ -1,0 +1,18 @@
+{
+  "schema": "microduck-controller-native-inputs/1",
+  "source_commit": "665613ac628fdc9b1b71f324809f0c16ce2795f2",
+  "source_archive_sha256": "19d477da39233009377f6653dff317ba16457534e9e2436545adf40385b02f38",
+  "official_version": "0.15.1",
+  "target": "aarch64-unknown-linux-gnu.2.31",
+  "size": 3522648,
+  "sha256": "dc1c7043a108964583fc09a11e3d6f87a25e259c346f7ce9154e77500a0881ec",
+  "embedded_revision": "665613ac628fdc9b1b71f324809f0c16ce2795f2",
+  "embedded_build_time": "2026-10-30T23:17:10+09:00",
+  "mapping_protocol": 1,
+  "supported_installed_sha256": [
+    "85fc8051df2ce496abf32bbb5eba3c94c44d875365a8f33a2f53f90facba90db"
+  ],
+  "byte_reproducible": true,
+  "actual_qemu_status_verified": true,
+  "hardware_acceptance": false
+}

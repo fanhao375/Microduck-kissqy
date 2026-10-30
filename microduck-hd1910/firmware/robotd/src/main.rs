@@ -594,6 +594,8 @@ struct RobotState {
     feetech: bool,
     bus_commands: feetech_commissioning::Commands,
     bus_status: ArcSwapOption<serde_json::Value>,
+    startup_servo_observations: ArcSwapOption<duck_control::feetech::observations::Snapshot>,
+    startup_imu_observation: ArcSwapOption<duck_control::feetech::imu_observation::Snapshot>,
     bus_snapshot: ArcSwapOption<feetech_commissioning::Status>,
     bus_calibration: ArcSwapOption<serde_json::Value>,
     raw: raw_stream::Hub,
@@ -778,6 +780,8 @@ impl RobotState {
             feetech: params.bus.protocol == params::BusProtocol::Feetech,
             bus_commands: feetech_commissioning::Commands::default(),
             bus_status: ArcSwapOption::empty(),
+            startup_servo_observations: ArcSwapOption::empty(),
+            startup_imu_observation: ArcSwapOption::empty(),
             bus_snapshot: ArcSwapOption::empty(),
             bus_calibration: ArcSwapOption::empty(),
             raw: raw_stream::Hub::default(),
@@ -1310,7 +1314,7 @@ fn spawn_control_thread(
         state.bus_status.store(Some(Arc::new(serde_json::json!({
             "build":feetech_commissioning::BUILD,
             "mode":if commissioning { "commissioning" } else { "motion" },
-            "phase":"configuring_bus","port":bus.port
+            "phase":"configuring_bus","port":bus.port,"configured_imu_profile":bus.imu_profile.label()
         }))));
     }
 
@@ -1374,6 +1378,8 @@ fn spawn_control_thread(
                         });
                 runtime.block_on(feetech_commissioning::run(
                     &params.bus.port,
+                    params.bus.imu_protocol.label(),
+                    params.bus.imu_profile.label(),
                     &state,
                     period,
                     calibration_path,
@@ -1384,6 +1390,8 @@ fn spawn_control_thread(
             if read_only {
                 runtime.block_on(feetech_read_only::run(
                     &params.bus.port,
+                    params.bus.imu_protocol.label(),
+                    params.bus.imu_profile.label(),
                     &state,
                     period,
                     host,
@@ -1442,6 +1450,47 @@ impl Drop for ControlThreadExit {
 }
 
 impl RobotState {
+    fn publish_startup_native(
+        &self,
+        mut report: serde_json::Value,
+        native: Option<duck_control::feetech_snapshot::Snapshot>,
+    ) {
+        if let Some(native) = native {
+            let mut value = serde_json::to_value(native.metadata.as_ref()).expect("native metadata");
+            value.as_object_mut().unwrap().extend(
+                serde_json::to_value(&native.dynamic)
+                    .expect("native diagnostics")
+                    .as_object().unwrap().clone(),
+            );
+            value["hd1910"] = serde_json::to_value(&native.hd1910).expect("native registers");
+            report["configured_imu_profile"] = serde_json::json!(native.metadata.configured_imu_profile);
+            self.publish_startup_native_report(
+                report,
+                value,
+                native.dynamic.servo_observations,
+                native.dynamic.imu_observation,
+            );
+        } else {
+            self.startup_servo_observations.store(None);
+            self.startup_imu_observation.store(None);
+            self.bus_status.store(Some(Arc::new(report)));
+        }
+    }
+
+    fn publish_startup_native_report(
+        &self,
+        mut report: serde_json::Value,
+        native: serde_json::Value,
+        observations: duck_control::feetech::observations::Snapshot,
+        imu_observation: Option<duck_control::feetech::imu_observation::Snapshot>,
+    ) {
+        // Keep the native capture clock outside the JSON cache so repeated RPC replies age.
+        self.startup_servo_observations.store(Some(Arc::new(observations)));
+        self.startup_imu_observation.store(imu_observation.map(Arc::new));
+        report["native"] = native;
+        self.bus_status.store(Some(Arc::new(report)));
+    }
+
     fn startup_step(&self, step: u8, status: &str, detail: &str) {
         let detail = if status == "waiting" { detail.split("; request_sent=").next().unwrap_or(detail) } else { detail };
         let row = serde_json::json!({"status":status,"detail":detail});
@@ -1508,32 +1557,75 @@ fn open_bus(
     let port = bus.port.as_str();
 
     if bus.protocol == params::BusProtocol::Feetech {
-        let open = || -> Result<_, Box<dyn std::error::Error>> {
+        let mut diagnostic_native = None;
+        let mut open = || -> Result<_, Box<dyn std::error::Error>> {
             let path = bus.feetech_calibration.as_ref().ok_or(
                 "Feetech motion requires a calibration file; start --commissioning to capture it through robotd"
             )?;
             let calibration: duck_control::feetech::Calibration =
                 toml::from_str(&std::fs::read_to_string(path)?)?;
             let kind = host_imu.map_or(TrunkImuKind::Bus, |reader| reader.kind());
-            calibration.validate_motion_for(kind)?;
-            let report = feetech_commissioning::calibration_status(&calibration, path, kind);
+            if let Some(state) = state {
+                let mut report =
+                    feetech_commissioning::calibration_status(&calibration, path, kind);
+                report["configured_imu_profile"] = serde_json::json!(bus.imu_profile.label());
+                state.bus_calibration.store(Some(Arc::new(report)));
+            }
+            if let Err(problem) = calibration.validate_motion_for(kind) {
+                // An uncommissioned but structurally valid configuration still names
+                // the sole UART. Preserve the motion refusal and collect reads only.
+                if host_imu.is_none() && calibration.validate().is_ok() {
+                    diagnostic_native = (|| -> Result<_, Box<dyn std::error::Error>> {
+                        let mut raw = duck_control::feetech::Bus::open(port)?;
+                        raw.set_imu_protocol(bus.imu_protocol.label())?;
+                        raw.set_imu_profile(bus.imu_profile.label())?;
+                        let mut io = duck_control::feetech::FeetechIo::for_startup(
+                            raw,
+                            calibration.clone(),
+                        )?;
+                        io.observe_startup_imu();
+                        Ok(io.feetech_snapshot())
+                    })()
+                    .ok()
+                    .flatten();
+                }
+                return Err(problem.into());
+            }
             // Optional servo P/D/torque limit (servo-test-parameters.json), read before the
             // bus is opened: a bad file stops motion startup without touching the servos.
             let servo_test = duck_control::hd1910_test::load(path)?;
-            let raw = duck_control::feetech::Bus::open(port)?;
+            let mut raw = duck_control::feetech::Bus::open(port)?;
+            raw.set_imu_protocol(bus.imu_protocol.label())?;
+            raw.set_imu_profile(bus.imu_profile.label())?;
             let mut io = match host_imu {
                 Some(reader) => duck_control::feetech::FeetechIo::for_startup_with_imu(
                     raw,
-                    calibration,
+                    calibration.clone(),
                     Box::new(reader.clone()),
                 )?,
-                None => duck_control::feetech::FeetechIo::for_startup(raw, calibration)?,
+                None => duck_control::feetech::FeetechIo::for_startup(raw, calibration.clone())?,
             };
             io.set_servo_test(servo_test);
-            io.confirm_startup_limp()?;
-            if let Some(state) = state {
-                state.bus_calibration.store(Some(Arc::new(report)));
+            let initialized = (|| -> Result<(), Box<dyn std::error::Error>> {
+                io.confirm_startup_limp()?;
+                if let Some(state) = state {
+                    let report = feetech_commissioning::calibration_status_for_bus(
+                        &calibration, path, kind, &io.bus,
+                    );
+                    state.bus_calibration.store(Some(Arc::new(report)));
+                }
+                if kind == TrunkImuKind::Bus {
+                    calibration.validate_bus_mount_for(
+                        io.bus.imu_board().protocol(), io.bus.imu_profile(),
+                    )?;
+                }
+                Ok(())
+            })();
+            if initialized.is_err() {
+                io.observe_startup_imu();
             }
+            diagnostic_native = io.feetech_snapshot();
+            initialized?;
             Ok(io)
         };
         return match open() {
@@ -1546,10 +1638,10 @@ fn open_bus(
             Err(e) => {
                 if let Some(state) = state {
                     state.startup_step(2, "waiting", &e.to_string());
-                    state.bus_status.store(Some(Arc::new(serde_json::json!({
+                    state.publish_startup_native(serde_json::json!({
                         "build":feetech_commissioning::BUILD,"mode":"motion",
-                        "phase":"waiting_for_bus","port":port,"error":e.to_string()
-                    }))));
+                        "phase":"waiting_for_bus","port":port,"configured_imu_profile":bus.imu_profile.label(),"error":e.to_string()
+                    }), diagnostic_native);
                 }
                 if loud { tracing::warn!(error = %e, port, attempt, "hardware initialization waiting"); }
                 None
@@ -1771,10 +1863,12 @@ async fn adopt_startup_pose<T: RobotIo>(
                 if let Some(status) = safety.feetech_control_status() {
                     if !status.all_joints_fresh || status.joints_held {
                         state.startup_step(2, "waiting", "等待全部关节的新鲜反馈；未发送目标");
+                        publish_startup_bus_wait(safety, state, "等待全部关节的新鲜反馈；未发送目标");
                         tokio::time::sleep(STARTUP_RETRY_INTERVAL).await;
                         continue;
                     }
                     if !status.imu_ready {
+                        publish_startup_bus_wait(safety, state, "等待 IMU 数据；确认融合就绪；未发送目标");
                         let delay = if imu_confirmation_reads > 0 {
                             imu_confirmation_reads -= 1;
                             state.startup_step(2, "waiting", "关节反馈已有效；确认 IMU 融合就绪；未发送目标");
@@ -1806,10 +1900,7 @@ async fn adopt_startup_pose<T: RobotIo>(
                 // very first failure rather than after the first log line.
                 state.startup_bus_failures.store(attempt, Ordering::Relaxed);
                 state.startup_step(2, "waiting", &e.to_string());
-                state.bus_status.store(Some(Arc::new(serde_json::json!({
-                    "build":feetech_commissioning::BUILD,"mode":"motion",
-                    "phase":"waiting_for_bus","error":e.to_string()
-                }))));
+                publish_startup_bus_wait(safety, state, &e.to_string());
                 if attempt == 1 || attempt.is_multiple_of(STARTUP_READ_LOG_EVERY) {
                     tracing::warn!(
                         error = %e,
@@ -1823,6 +1914,13 @@ async fn adopt_startup_pose<T: RobotIo>(
     }
 
     None
+}
+
+fn publish_startup_bus_wait<T: RobotIo>(safety: &Safety<T>, state: &RobotState, error: &str) {
+    state.publish_startup_native(serde_json::json!({
+        "build":feetech_commissioning::BUILD,"mode":"motion",
+        "phase":"waiting_for_bus","error":error,
+    }), safety.feetech_snapshot());
 }
 
 fn wants_walking_scale(twist: [f64; 3], body_active: bool) -> bool {
@@ -4694,7 +4792,7 @@ async fn handle(
                     let response = BorrowedBusStatus {
                         jsonrpc: proto::JSONRPC_VERSION,
                         id: &id,
-                        result: report.as_ref(),
+                        result: aged_bus_report(&state, report.as_ref()),
                     };
                     write_line(&mut write_half, &response).await?;
                 } else if let Some(report) = state.bus_snapshot.load_full() {
@@ -4707,14 +4805,14 @@ async fn handle(
                     let response = BorrowedBusStatus {
                         jsonrpc: proto::JSONRPC_VERSION,
                         id: &id,
-                        result: &report,
+                        result: std::borrow::Cow::Borrowed(&report),
                     };
                     write_line(&mut write_half, &response).await?;
                 } else if let Some(report) = state.bus_status.load_full() {
                     let response = BorrowedBusStatus {
                         jsonrpc: proto::JSONRPC_VERSION,
                         id: &id,
-                        result: report.as_ref(),
+                        result: aged_bus_report(&state, report.as_ref()),
                     };
                     write_line(&mut write_half, &response).await?;
                 } else {
@@ -5960,7 +6058,44 @@ fn dispatch(
 struct BorrowedBusStatus<'a> {
     jsonrpc: &'static str,
     id: &'a proto::Id,
-    result: &'a serde_json::Value,
+    result: std::borrow::Cow<'a, serde_json::Value>,
+}
+
+fn aged_bus_report<'a>(
+    state: &RobotState,
+    report: &'a serde_json::Value,
+) -> std::borrow::Cow<'a, serde_json::Value> {
+    if !report["native"]["servo_observations"].is_object()
+        && !report["native"]["imu_observation"].is_object()
+    {
+        return std::borrow::Cow::Borrowed(report);
+    }
+    let raw = state.raw.latest.load_full();
+    let startup = state.startup_servo_observations.load_full();
+    let startup_imu = state.startup_imu_observation.load_full();
+    let imu = raw
+        .as_ref()
+        .and_then(|raw| raw.bus.as_ref())
+        .and_then(|bus| bus.native.dynamic.imu_observation.as_ref())
+        .or(startup_imu.as_deref());
+    let observation = raw.as_ref()
+        .and_then(|raw| raw.bus.as_ref())
+        .map(|bus| &bus.native.dynamic.servo_observations)
+        .or(startup.as_deref());
+    if observation.is_some() || imu.is_some() {
+        let mut value = report.clone();
+        if let Some(observation) = observation {
+            value["native"]["servo_observations"] =
+                serde_json::to_value(observation).expect("servo observations");
+        }
+        if let Some(imu) = imu.filter(|_| report["native"]["imu_observation"].is_object()) {
+            value["native"]["imu_observation"] =
+                serde_json::to_value(imu).expect("IMU observation");
+        }
+        std::borrow::Cow::Owned(value)
+    } else {
+        std::borrow::Cow::Borrowed(report)
+    }
 }
 
 async fn write_line<T: serde::Serialize>(
@@ -6281,6 +6416,7 @@ mod tests {
         assert!(result.is_err(), "zero quaternion must never satisfy startup");
         assert_eq!(reads.load(Ordering::Relaxed), 26, "only one bounded warmup burst");
         assert_eq!(state.startup.borrow()["steps"]["2"]["status"], "waiting");
+        assert_eq!(state.bus_status.load().as_ref().unwrap()["phase"], "waiting_for_bus");
     }
 
     #[test]
@@ -7026,8 +7162,10 @@ mod tests {
             fn feetech_snapshot(&self) -> Option<snapshot::Snapshot> {
                 let ready = self.stage.load(Ordering::Relaxed) >= 2;
                 let metadata = Arc::new(snapshot::Metadata {
+                    configured_imu_profile: "legacy",
                     backend: "feetech_ft6",
                     imu_source: "bus",
+                    imu_bus: None,
                     read_timing_revision: "test",
                     motion_enabled: true,
                     calibration_complete: true,
@@ -7040,6 +7178,8 @@ mod tests {
                 Some(snapshot::Snapshot {
                     metadata: metadata.clone(),
                     dynamic: snapshot::Dynamic {
+                        servo_observations: duck_control::feetech::observations::Snapshot::empty(metadata.clone()),
+                        imu_observation: None,
                         torque_enabled: false,
                         torque_state_confirmed: Some(false),
                         gain_mode: "test",
@@ -9218,6 +9358,45 @@ mod tests {
             assert!(!error.contains("servo test"), "{error}");
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn configured_qinmo_profile_is_visible_when_discovery_cannot_start() {
+        let directory = tempfile::tempdir().unwrap();
+        let calibration = directory.path().join("calibration.toml");
+        std::fs::write(
+            &calibration,
+            include_str!("../../packaging/hd1910-calibration.robot.toml"),
+        )
+        .unwrap();
+        let bus = params::Bus {
+            protocol: params::BusProtocol::Feetech,
+            imu_profile: params::ImuBusProfile::Qinmo,
+            feetech_calibration: Some(calibration),
+            port: "/dev/definitely-not-a-qinmo-bus".into(),
+            ..Default::default()
+        };
+        let state = RobotState::new(
+            &Params::default(),
+            Path::new("/test/robotd.toml"),
+            false,
+            false,
+        );
+        assert!(open_bus(&bus, None, 0, Some(&state)).is_none());
+        let report = state.bus_status.load_full().unwrap();
+        assert_eq!(report["configured_imu_profile"], "qinmo");
+        assert!(report.get("imu_bus").is_none());
+        let calibration = state.bus_calibration.load_full().unwrap();
+        assert_eq!(calibration["configured_imu_profile"], "qinmo");
+        assert_eq!(calibration["imu_source"], "bus");
+        assert_eq!(calibration["imu_mount"]["verified"], false);
+        assert!(
+            calibration["imu_binding_validation"]
+                .as_str()
+                .unwrap()
+                .contains("discovery")
+        );
     }
 
     /// A silent bus must be *degraded*, not unhealthy: it reports the same before and after

@@ -434,7 +434,14 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// Loaded model metadata includes its validated, fixed runtime execution settings;
 /// existing readback reports the applied scale and filters. Install the
 /// matching R17 control.29/console bundle; the raw record envelope is unchanged.
-pub const API_VERSION: u32 = 40;
+/// # v41 — independent native servo observations during startup
+/// `robot.busStatus.native.servo_observations` reports requested, validated UART replies
+/// even when the IMU prevents an atomic control sample. Install the matching control.46
+/// runtime and Studio to display these diagnostics; version skew is still logged and served.
+/// # v42 — independent startup bus-IMU observations
+/// `robot.busStatus.native.imu_observation` is diagnostic evidence even when servo
+/// startup refuses motion. Install matching control.47 and Studio for this display.
+pub const API_VERSION: u32 = 42;
 
 /// The observation width every policy this robot family runs is built against.
 ///

@@ -66,6 +66,9 @@ impl RobotIo for RecoveryIo {
                 .unwrap_or(false),
         );
         Some(FeetechDiagnostics {
+            servo_observations: Default::default(),
+            imu_observation: None,
+            configured_imu_profile: "legacy",
             backend: "fake_feetech",
             read_timing_revision: "test",
             motion_enabled: true,
@@ -84,6 +87,7 @@ impl RobotIo for RecoveryIo {
             imu_age_upper_bound_ms: Some(0),
             imu_status: None,
             imu_source: "bus",
+            imu_bus: None,
             imu_reader: None,
             command_clamps_total: 0,
             partial_samples_total: 0,
@@ -108,12 +112,14 @@ impl RobotIo for RecoveryIo {
         // diagnostic facts through the new read-only hand-off.
         let d = self.feetech_diagnostics().unwrap();
         let metadata = Arc::new(raw::Metadata {
+            configured_imu_profile: "legacy",
             backend: d.backend,
             read_timing_revision: d.read_timing_revision,
             motion_enabled: d.motion_enabled,
             calibration_complete: d.calibration_complete,
             imu_mount_verified: d.imu_mount_verified,
             imu_source: d.imu_source,
+            imu_bus: d.imu_bus.clone(),
             velocity_source: d.velocity_source,
             velocity_rad_s_per_count: d.velocity_rad_s_per_count,
             current_available: d.current_available,
@@ -122,6 +128,8 @@ impl RobotIo for RecoveryIo {
         Some(raw::Snapshot {
             metadata: metadata.clone(),
             dynamic: raw::Dynamic {
+                servo_observations: duck_control::feetech::observations::Snapshot::empty(metadata.clone()),
+                        imu_observation: None,
                 torque_enabled: d.torque_enabled,
                 torque_state_confirmed: d.torque_state_confirmed,
                 gain_mode: d.gain_mode,

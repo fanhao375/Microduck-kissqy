@@ -102,6 +102,8 @@ use duck_ipc_proto as proto;
 use gilrs::{Axis, Button, Gilrs};
 mod input_settings;
 mod loss;
+mod mapping;
+mod mapping_control;
 mod roller_test;
 mod udp;
 
@@ -214,6 +216,14 @@ struct Args {
     /// `padd` says so once and drives anyway.
     #[arg(long, default_value = proto::socket::PAD)]
     tap_socket: PathBuf,
+
+    /// Private physical-controller mapping capability (one request/response per connection).
+    #[arg(long, default_value = "/run/padd/mapping.sock")]
+    mapping_socket: PathBuf,
+
+    /// Persisted physical-controller profiles; independent of the read-only raw tap.
+    #[arg(long, default_value = "/var/lib/padd")]
+    mapping_state_dir: PathBuf,
 }
 
 /// How long to wait between checks when there is no pad.
@@ -616,13 +626,31 @@ enum Source {
 /// is written once, against this.
 enum PadNow<'a> {
     Gilrs(gilrs::Gamepad<'a>),
+    Mapped(gilrs::Gamepad<'a>, mapping::Mapped),
     Udp(&'a udp::receiver::Frame),
+}
+fn control_axis(value: f32, deadzone: f64, calibrated: bool) -> f64 {
+    let value = f64::from(value);
+    if !calibrated && value.abs() < deadzone {
+        0.0
+    } else {
+        value
+    }
+}
+#[cfg(test)]
+mod mapped_control_tests {
+    use super::*;
+    #[test]
+    fn custom_axis_calibration_is_not_dead_zoned_a_second_time() {
+        assert!(control_axis(0.05, 0.1, true) > 0.0);
+        assert_eq!(control_axis(0.05, 0.1, false), 0.0);
+    }
 }
 
 impl PadNow<'_> {
     fn name(&self) -> String {
         match self {
-            Self::Gilrs(pad) => pad.name().to_owned(),
+            Self::Gilrs(pad) | Self::Mapped(pad, _) => pad.name().to_owned(),
             Self::Udp(frame) => frame.name(),
         }
     }
@@ -630,6 +658,7 @@ impl PadNow<'_> {
     fn is_pressed(&self, button: Button) -> bool {
         match self {
             Self::Gilrs(pad) => pad.is_pressed(button),
+            Self::Mapped(_, mapped) => mapped.is_pressed(button),
             Self::Udp(frame) => frame.is_pressed(button),
         }
     }
@@ -637,6 +666,7 @@ impl PadNow<'_> {
     fn value(&self, axis: Axis) -> f32 {
         match self {
             Self::Gilrs(pad) => pad.value(axis),
+            Self::Mapped(_, mapped) => mapped.value(axis),
             Self::Udp(frame) => frame.value(axis),
         }
     }
@@ -651,6 +681,7 @@ impl PadNow<'_> {
     fn trigger(&self, button: Button) -> f64 {
         match self {
             Self::Gilrs(pad) => pad.button_data(button).map(|d| d.value()).unwrap_or(0.0) as f64,
+            Self::Mapped(_, mapped) => mapped.trigger(button),
             Self::Udp(frame) => frame.trigger(button),
         }
     }
@@ -736,6 +767,18 @@ fn main() -> std::process::ExitCode {
         }
     };
 
+    #[cfg(target_os = "linux")]
+    let mut remapping =
+        match mapping::Runtime::serve(&args.mapping_socket, args.mapping_state_dir.clone()) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                tracing::error!(%error,"cannot initialize physical controller mappings");
+                return std::process::ExitCode::FAILURE;
+            }
+        };
+    #[cfg(target_os = "linux")]
+    let mut mapping_generation = remapping.engine.generation;
+
     let mut stream = match connect_robot(&args.socket) {
         Ok(stream) => stream,
         Err(e) => {
@@ -749,17 +792,21 @@ fn main() -> std::process::ExitCode {
     // Which robot is this? A roller duck wants the roller stick shaping. Asked once at startup,
     // then kept in step by the D-pad-up switch below — which is this process asking for the
     // change, so it knows the answer without asking again.
-    let (mut roller, mut roller_spin) = match request(&mut stream, &mut next_id, &proto::Call::RobotMode) {
-        Ok(Some(answer)) => match answer.result_as::<proto::ModeResult>() {
-            Ok(mode) => (mode.mode == "roller", mode.roller_action.as_deref() == Some("spin")),
-            Err(_) => (false, false),
-        },
-        Ok(None) => (false, false),
-        Err(e) => {
-            tracing::error!(error = %e, "cannot read robot mode");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
+    let (mut roller, mut roller_spin) =
+        match request(&mut stream, &mut next_id, &proto::Call::RobotMode) {
+            Ok(Some(answer)) => match answer.result_as::<proto::ModeResult>() {
+                Ok(mode) => (
+                    mode.mode == "roller",
+                    mode.roller_action.as_deref() == Some("spin"),
+                ),
+                Err(_) => (false, false),
+            },
+            Ok(None) => (false, false),
+            Err(e) => {
+                tracing::error!(error = %e, "cannot read robot mode");
+                return std::process::ExitCode::FAILURE;
+            }
+        };
     tracing::warn!(
         socket = %args.socket.display(),
         hz = args.hz,
@@ -881,6 +928,99 @@ fn main() -> std::process::ExitCode {
                 None
             }
         };
+
+        let pad = match &source {
+            Source::Gilrs(gilrs) => pad_id
+                .filter(|_| !pad_disconnected)
+                .and_then(|id| gilrs.connected_gamepad(id))
+                .map(PadNow::Gilrs),
+            Source::Udp(_) => udp_frame.as_ref().map(PadNow::Udp),
+        };
+        #[cfg(target_os = "linux")]
+        let pad = {
+            remapping.watch(
+                pad.as_ref().and_then(|pad| match pad {
+                    PadNow::Gilrs(gamepad) => Some(gamepad),
+                    _ => None,
+                }),
+                tick,
+            );
+            if let Some(pad) = pad.as_ref() {
+                remapping.engine.set_default(mapping::Mapped::from_pad(pad));
+            }
+            remapping.engine.tick(tick);
+            let result = (|| -> std::io::Result<bool> {
+                let mut sync_gate = |runtime: &mut mapping::Runtime| -> std::io::Result<bool> {
+                    let changed = mapping_generation != runtime.engine.generation;
+                    if changed {
+                        edges.clear();
+                        runtime.edges.clear();
+                    }
+                    let blocked = mapping_control::sync(
+                        &mut input,
+                        &mut continuous,
+                        &mut stream,
+                        changed,
+                        runtime.engine.blocked(),
+                        || runtime.publish(),
+                    )?;
+                    mapping_generation = runtime.engine.generation;
+                    Ok(blocked)
+                };
+                sync_gate(&mut remapping)?;
+                // Status/renew polls are cheap; only one eligible begin may spend the
+                // bounded 300 ms robot-proof budget in this tick.
+                let mut proved = false;
+                for _ in 0..8 {
+                    let Some(pending) = remapping.next() else {
+                        break;
+                    };
+                    let candidate = remapping.engine.requires_stopped_proof(&pending.request);
+                    if candidate && proved {
+                        let _=pending.reply.try_send(serde_json::json!({"ok":false,"version":1,"code":"busy","error":"robot stopped proof is busy; retry"}));
+                        continue;
+                    }
+                    let stopped = if candidate {
+                        proved = true;
+                        mapping::prove_stopped(&args.socket)
+                    } else {
+                        false
+                    };
+                    let response =
+                        remapping
+                            .engine
+                            .command(pending.request, stopped, Instant::now());
+                    sync_gate(&mut remapping)?;
+                    let _ = pending.reply.try_send(response);
+                }
+                sync_gate(&mut remapping)
+            })();
+            match result {
+                Err(error) => {
+                    tracing::error!(%error,"controller mapping gate failed");
+                    return std::process::ExitCode::FAILURE;
+                }
+                Ok(true) => {
+                    // Suspension is not a radio loss: it must never run the automatic sit path.
+                    driving = false;
+                    pad_loss = PadLoss::default();
+                    edges.clear();
+                    if let Some(remaining) = period.checked_sub(tick.elapsed()) {
+                        std::thread::sleep(remaining);
+                    }
+                    continue;
+                }
+                Ok(false) => {}
+            }
+            match (pad, remapping.engine.custom()) {
+                (Some(PadNow::Gilrs(gamepad)), Some(mapped)) => {
+                    edges.clear();
+                    edges.extend_from_slice(&remapping.edges);
+                    Some(PadNow::Mapped(gamepad, mapped))
+                }
+                (pad, _) => pad,
+            }
+        };
         let mut toggle_enable = false;
         let mut toggle_head = false;
         let mut toggle_body = false;
@@ -932,13 +1072,6 @@ fn main() -> std::process::ExitCode {
         // Re-read the pad by id after the drain: a `Disconnected` dequeued above may have
         // taken it, and asking for the first pad again would silently hand the robot the
         // *other* pad's sticks. One tick of "pad gone" beats that.
-        let pad = match &source {
-            Source::Gilrs(gilrs) => pad_id
-                .filter(|_| !pad_disconnected)
-                .and_then(|id| gilrs.connected_gamepad(id))
-                .map(PadNow::Gilrs),
-            Source::Udp(_) => udp_frame.as_ref().map(PadNow::Udp),
-        };
         let Some(pad) = pad else {
             // No pad. Send nothing: `robotd`'s deadman stops the robot on its own, which is
             // exactly the wanted behaviour, and inventing a zero command here would mask a
@@ -996,7 +1129,7 @@ fn main() -> std::process::ExitCode {
             match &mut source {
                 // Wakes for the first datagram of a client rather than leaving it half a second.
                 Source::Udp(link) => link.wait(tick + pause, true),
-                Source::Gilrs(_) => std::thread::sleep(pause),
+                Source::Gilrs(_) => std::thread::sleep(pause.min(Duration::from_millis(100))),
             }
             continue;
         };
@@ -1030,7 +1163,7 @@ fn main() -> std::process::ExitCode {
         // enough that a tap following the old one would report the rest of the session as silence.
         if let Some(tap) = tap.as_ref() {
             match &pad {
-                PadNow::Gilrs(gamepad) => {
+                PadNow::Gilrs(gamepad) | PadNow::Mapped(gamepad, _) => {
                     tap.watch(gamepad);
                     // Every tick, like the bindings: switching the feature on in the config has to
                     // start the IMU reader without a restart, and off has to let it go.
@@ -1043,11 +1176,12 @@ fn main() -> std::process::ExitCode {
 
         // The pad's attitude this tick, when the feature is on and the pad has an IMU that has
         // said something believable. `None` is every other case, and Y then means the sticks.
-        let attitude = if imu_head_cfg.enabled && matches!(pad, PadNow::Gilrs(_)) {
-            tap.as_ref().and_then(|tap| tap.attitude())
-        } else {
-            None
-        };
+        let attitude =
+            if imu_head_cfg.enabled && matches!(pad, PadNow::Gilrs(_) | PadNow::Mapped(..)) {
+                tap.as_ref().and_then(|tap| tap.attitude())
+            } else {
+                None
+            };
         if attitude.is_none() && input.imu_head != PadImuHead::Off {
             // The feature went off, or the IMU went away under us. Not silent: a head that stops
             // following mid-turn wants a line in the journal saying why.
@@ -1149,8 +1283,14 @@ fn main() -> std::process::ExitCode {
 
         // This unbound click is a manual test only. Its short-lived reader exists
         // only for the press; idle input adds no state polling or recovery loop.
-        if roller_stand_test && !toggle_enable && !select_released && !relax
-            && !pad.is_pressed(Button::Select) && pressed.is_empty() && !reboot_motors {
+        if roller_stand_test
+            && !toggle_enable
+            && !select_released
+            && !relax
+            && !pad.is_pressed(Button::Select)
+            && pressed.is_empty()
+            && !reboot_motors
+        {
             match roller_test::run(&args.socket) {
                 Ok(()) => tracing::warn!("L3 滑轮起身测试已接受；最多 5 秒，Start 可取消"),
                 Err(reason) => tracing::warn!(%reason, "L3 滑轮起身测试未执行"),
@@ -1310,21 +1450,40 @@ fn main() -> std::process::ExitCode {
         // V160: only the real pad can switch roller A crouch/spin. This leaves
         // ordinary walk and all other buttons untouched. The native robotd mode
         // request refuses a change while moving, sitting or mid-skill.
-        if roller && pad.name() != "Microduck R17 Web Xbox"
-            && input.buttons.allows(Button::DPadLeft) && pad.is_pressed(Button::DPadLeft) {
+        if roller
+            && pad.name() != "Microduck R17 Web Xbox"
+            && input.buttons.allows(Button::DPadLeft)
+            && pad.is_pressed(Button::DPadLeft)
+        {
             let held = input.dpad_left_held_since.get_or_insert(tick);
-            if holds_trusted && tick.duration_since(*held) >= ROLLER_ACTION_HOLD && !input.roller_action_switch_sent {
+            if holds_trusted
+                && tick.duration_since(*held) >= ROLLER_ACTION_HOLD
+                && !input.roller_action_switch_sent
+            {
                 input.roller_action_switch_sent = true;
-                let requested = if roller_spin { "roller_crouch" } else { "roller_spin" };
-                match request(&mut stream, &mut next_id,
-                              &proto::Call::RobotSetMode(proto::SetModeParams { mode: requested.to_owned() })) {
+                let requested = if roller_spin {
+                    "roller_crouch"
+                } else {
+                    "roller_spin"
+                };
+                match request(
+                    &mut stream,
+                    &mut next_id,
+                    &proto::Call::RobotSetMode(proto::SetModeParams {
+                        mode: requested.to_owned(),
+                    }),
+                ) {
                     Ok(Some(answer)) => match answer.result_as::<proto::IntentResult>() {
                         Ok(result) if result.accepted => {
                             roller_spin = !roller_spin;
-                            tracing::warn!(action = if roller_spin { "spin" } else { "crouch" },
-                                           "roller A action switching");
+                            tracing::warn!(
+                                action = if roller_spin { "spin" } else { "crouch" },
+                                "roller A action switching"
+                            );
                         }
-                        Ok(result) => tracing::warn!(reason = ?result.reason, "roller action change refused"),
+                        Ok(result) => {
+                            tracing::warn!(reason = ?result.reason, "roller action change refused")
+                        }
                         Err(error) => tracing::warn!(%error, "invalid roller action response"),
                     },
                     Ok(None) => tracing::warn!("no answer from robotd on roller action change"),
@@ -1339,10 +1498,7 @@ fn main() -> std::process::ExitCode {
             input.roller_action_switch_sent = false;
         }
 
-        let deadzone = |v: f32| {
-            let v = v as f64;
-            if v.abs() < args.deadzone { 0.0 } else { v }
-        };
+        let deadzone = |v: f32| control_axis(v, args.deadzone, matches!(&pad, PadNow::Mapped(..)));
         let left_x = deadzone(pad.value(Axis::LeftStickX));
         let left_y = deadzone(pad.value(Axis::LeftStickY));
         let right_x = deadzone(pad.value(Axis::RightStickX));

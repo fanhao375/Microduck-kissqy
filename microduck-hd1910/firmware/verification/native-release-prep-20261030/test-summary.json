@@ -1,0 +1,30 @@
+{
+  "source_commit": "665613ac628fdc9b1b71f324809f0c16ce2795f2",
+  "padd": {
+    "failed": 0,
+    "passed": 113
+  },
+  "actual_serializer_export_and_consumption_passed": true,
+  "robotd_raw_stream": {
+    "candidate_passed": 6,
+    "baseline_passed": 5,
+    "failed": 2,
+    "same_baseline_failures": [
+      "lazy_bus_rpc_preserves_snapshot_fields_without_streaming",
+      "offline_control_keeps_acquisition_counts_without_full_reports_or_geometry"
+    ]
+  },
+  "production_padd_clippy": "passed with warnings denied",
+  "full_workspace_green_claim": false,
+  "hardware_accessed": false,
+  "arm64_candidate_built": true,
+  "arm64_sha256": "dc1c7043a108964583fc09a11e3d6f87a25e259c346f7ce9154e77500a0881ec",
+  "arm64_size": 3522648,
+  "independent_arm64_builds_byte_identical": true,
+  "fresh_padd_tests": {"passed": 113, "failed": 0},
+  "actual_host_process_smoke": "passed",
+  "actual_qemu_process_smoke_a": "passed",
+  "actual_qemu_process_smoke_b": "passed",
+  "glibc_max": "2.30",
+  "smoke_wrapper_red_green": "long F TMPDIR exceeded Unix socket path limit; short Linux /tmp passed without rebuilding ARM a or changing source665613a"
+}

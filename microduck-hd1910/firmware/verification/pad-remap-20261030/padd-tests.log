@@ -1,0 +1,125 @@
+   Compiling padd v0.15.1 (/root/microduck-remap-native-20261030/padd)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.14s
+     Running unittests src/main.rs (/root/target-v167-autodetect-dxl2-board/debug/deps/padd-1ee51bf31d9dcfb2)
+
+running 112 tests
+test input_settings::tests::mouth_cap_keeps_raw_triggers_for_sound_and_never_opens_at_idle ... ok
+test loss::tests::a_lost_pad_sits_the_robot_after_a_second ... ok
+test loss::tests::a_pad_coming_back_is_greeted_once ... ok
+test loss::tests::the_answers_decide_whether_the_sit_is_done ... ok
+test mapped_control_tests::custom_axis_calibration_is_not_dead_zoned_a_second_time ... ok
+test mapping::native::tests::cross_language_fixture ... ok
+test mapping::native::tests::one_line_request_is_bounded_rejects_partial_multiline_and_nonobjects ... ok
+test mapping::native::tests::physical_and_known_gamesir_bridge_are_eligible_but_web_virtual_devices_are_not ... ok
+test mapping::native::tests::stopped_proof_rejects_active_transition_movement_missing_and_nonfinite_state ... ok
+test mapping::session::tests::an_axis_pulse_inside_one_tick_also_restarts_neutral_stability ... ok
+test mapping::session::tests::raw_history_is_bounded_monotonic_and_new_device_has_no_old_samples ... ok
+test mapping::session::tests::begin_requires_stopped_device_and_unpredictable_owned_lease ... ok
+test mapping::tests::binding_validation_rejects_unknown_roles_capabilities_duplicates_and_bad_ranges ... ok
+test mapping::tests::hat_and_digital_or_analog_triggers_normalize ... ok
+test mapping::session::tests::damaged_existing_store_is_never_overwritten_by_save_or_reset ... ok
+test mapping::session::tests::strict_requests_do_not_accept_unknown_fields_names_or_invalid_profiles ... ok
+test mapping::tests::logical_mapping_converts_y_once_and_preserves_action_edges ... ok
+test mapping::tests::raw_ab_swap_and_normalized_axes_drive_the_same_vocabulary ... ok
+test mapping_control::tests::failed_voice_state_publication_still_clears_outputs_before_returning_error ... ok
+test mapping::session::tests::ordinary_default_disconnect_keeps_existing_pad_loss_behavior ... ok
+test roller_click_tests::inherited_l3_waits_for_release_before_a_new_test_press ... ok
+test mapping::session::tests::even_a_short_press_inside_one_tick_restarts_neutral_stability ... ok
+test mapping::session::tests::only_a_valid_available_begin_can_spend_time_proving_robot_state ... ok
+test input_settings::tests::live_changes_confirm_pid_and_keep_previous_on_invalid_file ... ok
+test mapping::tests::stable_identity_separates_bus_capabilities_and_unique_but_not_event_node_or_values ... ok
+test roller_test::tests::fallen_motion_with_valid_imu_passes ... ok
+test mapping::session::tests::repeated_reader_failures_do_not_repeat_the_pause_transition ... ok
+test mapping::session::tests::held_input_cancel_expiry_drop_and_replacement_wait_for_stable_neutral ... ok
+test roller_test::tests::missing_invalid_and_upright_imu_are_refused ... ok
+test roller_test::tests::home_limp_and_other_skills_are_refused ... ok
+test roller_test::tests::standing_or_unconfirmed_fall_is_refused ... ok
+test roller_test::tests::unhealthy_stale_and_frozen_feedback_are_refused ... ok
+test tap::tests::a_departed_subscriber_is_forgotten ... ok
+test tap::tests::a_frame_survives_the_wire ... ok
+test tap::tests::a_slow_subscriber_is_dropped_from_rather_than_blocking_the_reader ... ok
+test tap::tests::a_subscriber_arriving_mid_stream_is_told_the_device ... ok
+test tap::tests::a_subscriber_arriving_mid_stream_is_told_the_imu_too ... ok
+test tap::tests::dropped_samples_are_not_dropped_frames ... ok
+test tap::tests::the_device_is_only_held_while_a_pad_and_a_watcher_both_exist ... ok
+test tap::tests::every_code_gets_a_name_or_a_number ... ok
+test tap::tests::head_control_holds_the_imu_open_and_reads_the_filter ... ok
+test tests::a_changed_frame_is_sent_at_once ... ok
+test tests::a_hold_does_not_survive_the_pad_going_away ... ok
+test roller_test::tests::native_socket_executes_exactly_one_guarded_skill ... ok
+test tests::a_frame_that_asks_for_motion_is_always_sent ... ok
+test tests::a_pad_dropout_after_the_shutdown_does_not_revive_the_stop ... ok
+test tests::a_release_and_re_press_inside_one_tick_is_a_stop_then_a_new_hold ... ok
+test tests::a_stationary_frame_goes_out_again_on_the_heartbeat ... ok
+test tests::a_two_call_frame_is_one_write_and_two_lines ... ok
+test tests::a_udp_select_released_before_the_first_take_does_not_relax ... ok
+test tests::an_unchanged_stationary_frame_is_not_resent ... ok
+test tests::inherited_buttons_wait_for_release_and_select_release_does_not_relax ... ok
+test tests::grabbed_gamesir_raw_node_cannot_hide_the_mapped_xbox ... ok
+test tests::an_untouched_pad_in_head_mode_holds_both_intents ... ok
+test tests::neutral_web_attachment_preserves_the_first_deliberate_start_press ... ok
+test tests::radio_reconnect_cannot_keep_head_or_body_mode_or_skip_explicit_home ... ok
+test tests::a_rate_this_loop_cannot_run_at_is_refused_rather_than_divided_by ... ok
+test tests::malformed_or_wrong_id_reply_cannot_latch_home ... ok
+test tests::select_stops_on_a_short_release_and_shuts_down_on_a_long_hold ... ok
+test tests::the_head_follows_the_pad_with_the_sticks_signs_gain_and_limit ... ok
+test tests::y_cycles_follow_hold_follow_and_re_centres_each_time ... ok
+test tests::refused_home_does_not_make_the_next_start_enable_the_policy ... ok
+test tests::restart_closing_the_socket_is_an_error_instead_of_successful_home ... ok
+test roller_test::tests::failed_gates_send_no_motion_or_skill_request ... ok
+test udp::health::tests::the_posture_is_read_from_a_state_line_and_nothing_else ... ok
+test udp::receiver::tests::a_datagram_too_far_ahead_is_dropped ... ok
+test udp::receiver::tests::a_first_datagram_is_a_new_session_with_no_edges ... ok
+test udp::receiver::tests::a_re_press_inside_one_tick_is_release_then_press ... ok
+test udp::receiver::tests::a_hold_is_one_press_then_one_release ... ok
+test tap::tests::an_unreadable_sibling_does_not_end_the_imu_search ... ok
+test udp::receiver::tests::a_new_session_from_queued_datagrams_is_unverified_and_expiry_clears_the_mark ... ok
+test udp::receiver::tests::a_restarted_client_is_taken_after_the_timeout ... ok
+test udp::receiver::tests::a_session_first_take_starts_from_the_connecting_datagram ... ok
+test udp::receiver::tests::a_tap_inside_one_tick_is_both_edges_in_order ... ok
+test udp::receiver::tests::another_peer_is_ignored_while_the_first_is_alive ... ok
+test udp::receiver::tests::going_quiet_expires_once_and_frees_the_lock ... ok
+test udp::receiver::tests::malformed_changes_nothing_and_takes_no_lock ... ok
+test udp::receiver::tests::seq_wraps ... ok
+test udp::receiver::tests::start_held_across_a_dropout_is_not_a_new_press ... ok
+test udp::receiver::tests::sticks_read_after_a_hold_up_stay_centred_until_heard_live ... ok
+test udp::receiver::tests::the_newest_state_wins_and_a_late_datagram_is_dropped ... ok
+test udp::tests::a_frame_reads_like_a_gilrs_pad ... ok
+test udp::tests::a_refusal_is_reported_for_thirty_seconds ... ok
+test tap::tests::the_imu_is_the_accelerometer_sibling_under_the_same_hid_device ... ok
+test udp::tests::every_wire_button_has_one_gilrs_button_and_back ... ok
+test udp::tests::the_driving_client_hears_driving_and_another_hears_busy_once_a_second ... ok
+test udp::wire::tests::a_longer_v1_packet_is_read_and_its_tail_ignored ... ok
+test udp::wire::tests::a_packet_round_trips_at_upstreams_offsets ... ok
+test udp::wire::tests::a_robot_report_fits_one_datagram ... ok
+test udp::wire::tests::a_status_is_upstreams_24_bytes ... ok
+test udp::wire::tests::garbage_is_refused_not_panicked_on ... ok
+test udp::wire::tests::reserved_bits_are_split_from_buttons ... ok
+test udp::wire::tests::values_clamp_and_triggers_are_never_negative ... ok
+test mapping::session::tests::save_failure_preserves_live_profile_and_learning_session ... ok
+test mapping::session::tests::default_reader_failure_preserves_gilrs_but_saved_profiles_fail_closed ... ok
+test mapping::native::tests::actual_unix_capability_and_voice_state_publish_no_token_with_private_permissions ... ok
+test mapping::session::tests::failed_replacement_save_keeps_existing_profile_and_disk_contents ... ok
+test mapping::session::tests::preview_save_restart_reset_and_corruption_use_atomic_profiles ... ok
+test mapping_control::tests::main_loop_pause_clears_latches_once_and_bypasses_every_action_path ... ok
+
+running 1 test
+test mapping::session::tests::real_linux_permission_denial_keeps_saved_profile ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 111 filtered out; finished in 0.00s
+
+test mapping::session::tests::real_linux_permission_denial_keeps_saved_profile ... ok
+test tests::stalled_robotd_is_bounded_without_a_background_poll ... ok
+test mapping::native::tests::real_robot_socket_proof_requires_two_fresh_stopped_ticks_and_sends_no_intents ... ok
+test udp::health::tests::health_lands_in_the_snapshot_and_a_missing_robotd_is_said ... ok
+test udp::tests::a_datagram_on_loopback_is_answered_and_drives_until_it_goes_quiet ... ok
+test mapping::native::tests::robot_proof_also_has_an_absolute_deadline_for_dribbling_responses ... ok
+test udp::tests::a_normal_disconnect_is_not_a_hold_up ... ok
+test mapping::native::tests::robot_proof_connect_does_not_block_behind_a_full_unix_backlog ... ok
+test udp::tests::a_client_that_came_and_went_during_a_stall_never_drives ... ok
+test udp::tests::a_client_that_left_during_a_stall_does_not_drive_after_it ... ok
+test mapping::native::tests::slow_socket_client_times_out_without_blocking_control_loop ... ok
+test mapping::native::tests::byte_dribbling_cannot_extend_the_total_request_deadline ... ok
+test udp::tests::a_stalled_loop_is_not_a_client_that_went_away ... ok
+
+test result: ok. 112 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.91s

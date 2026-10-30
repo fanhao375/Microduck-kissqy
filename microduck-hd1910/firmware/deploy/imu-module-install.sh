@@ -12,6 +12,12 @@
 # Run on the board as root, with servo power on (robotd must finish its four startup steps).
 #
 #   sudo bash imu-module-install.sh check
+#   sudo bash imu-module-install.sh detect
+#        Read only: which trunk IMU module answers on /dev/i2c-3 (HAT J5) and /dev/i2c-4 (40-pin
+#        27/28), by the rules at probe_i2c. Exit 0 = exactly one, 2 = several, 3 = none,
+#        4 = not everything could be looked at, or a 0x6B on J5 may be a D1 HAT's head IMU; 1 = failed.
+#   sudo bash imu-module-install.sh install <dir> auto
+#        The install below with the module detect finds; anything but exactly one stops it.
 #   sudo bash imu-module-install.sh install <dir> <bno08x|lsm6dsv16x> <i2c device> <address>
 #        <dir> holds robotd, robotctl, padd (aarch64, built from this branch) and
 #        calibration-config.py, rebuild-config.py, runtime.py, voice-setup.py, service.sh
@@ -54,17 +60,26 @@ BACKUP=''          # set once install has made its backup; a later failure resto
 STOPPED=0          # set once padd (then robotd) was stopped; a failure before the backup starts them again
 IN_DIE=0
 SOURCE_KIND=''     # bno08x / lsm6dsv16x, for the post-start check
+VERIFY_STREAMING=0 # install auto: the post-start check also waits for the IMU reader to stream
+FAKE_BUS=''        # tests only: I2C_FAKE, honoured off the real board paths (fake_bus_setup)
+DETECT_VERDICT='' DETECT_CANDS='' DETECT_HELD=0 DETECT_UNSURE='' DETECT_HINTS=''   # set by detect_run
+DETECT_HELD_BY='' DETECT_NCANDS=0 DETECT_OTHER=0                                    # set by detect_run
+INSTALL_SOURCE='' INSTALL_DEVICE='' INSTALL_ADDRESS='' MOVED_WARNING=''            # set by detect_take
 PARTOF_BEFORE=''   # units that are PartOf robotd, with their state before
 ROLLBACK_FROM=''   # the backup a manual rollback is restoring; an interrupted one says to run it again
 
 # The log file first; the terminal only if it is still there. After an ssh session drops (HUP is
-# ignored, so the run goes on), writing to the dead terminal fails with EIO: that must never reach the
-# ERR trap, or the automatic rollback would stop at its own first log line.
+# ignored, so the run goes on), writing to the dead terminal fails with EIO; when the output is a pipe
+# whose reader is gone (ssh without -t, or | tee, killed), with EPIPE (PIPE is ignored too, or the
+# signal would kill bash before || true). Neither may reach the ERR trap, or the automatic rollback
+# would stop at its own first log line.
 log() {
     local level=$1 cat=$2 line; shift 2
     line=$(printf '%s [%s][%s] %s' "$(date '+%F %T')" "$level" "$cat" "$*")
     printf '%s\n' "$line" >>"$LOG"
-    { printf '%s\n' "$line" >&2; } 2>/dev/null || true
+    # >&2 first, then 2>/dev/null: the line reaches the terminal and only a failed write's own
+    # complaint is dropped (in a { ...; } 2>/dev/null group the line itself went to /dev/null).
+    printf '%s\n' "$line" >&2 2>/dev/null || true
 }
 say() { { printf '%s\n' "$*"; } 2>/dev/null || true; }   # stdout, same rule
 
@@ -105,12 +120,12 @@ die() {
             log ERROR rollback "撤回没有做完：请重跑 sudo bash $0 rollback $ROLLBACK_FROM"
         fi
     fi
-    { echo "失败：$2（日志：$LOG）" >&2; } 2>/dev/null || true
+    echo "失败：$2（日志：$LOG）" >&2 2>/dev/null || true   # same order as in log()
     exit 1
 }
 trap 'die unexpected "第 $LINENO 行意外退出（$BASH_COMMAND）"' ERR
 trap 'die signal "收到中断"' INT TERM
-trap '' HUP   # an ssh session that drops must not leave the board half installed
+trap '' HUP PIPE   # a dropped ssh session or a closed output pipe must not leave the board half installed
 
 need_root() { [ "$(id -u)" = 0 ] || [ "$NO_SYSTEMD" = 1 ] || die precheck '要用 root 运行（sudo bash …）'; }
 
@@ -129,8 +144,11 @@ installed_build() { grep -o "[0-9a-f]\{7\}-feetech-ft6-control\.[0-9]*" "$INSTAL
 #   relax-confirm  -> robot.relax, then wait for torque OFF, restore_pending False and
 #                     temporary_gains_applied False together (V167 restores registers after OFF)
 #   relax-request  -> one robot.relax, never waits
-#   verify <source> -> after start, asked again for 8 s: build, and in motion the IMU source, the
-#                     servo_parameters key, gain_mode
+#   verify <source> [streaming]
+#                  -> after start, asked again for 8 s: build, and in motion the IMU source, the
+#                     servo_parameters key, gain_mode; with "streaming" (install auto) also
+#                     native.imu_reader.state = streaming, asked again for 15 s: robotd's own bring-up
+#                     (product ID / WHO_AM_I) is what proves the chip detect only recognised
 robotd_rpc() {
     python3 - "$ROBOTD_SOCKET" "$WANT_BUILD" "$V167_GAIN_MODE" "$FILE_GAIN_MODE" "$@" <<'PY'
 import json, socket, sys, time
@@ -151,7 +169,7 @@ def settled(report):
             and native.get('torque_state_confirmed') is False
             and hd.get('restore_pending') is False and hd.get('temporary_gains_applied') is False)
 
-def check(report, source):
+def check(report, source, streaming=False):
     problems = []
     if report.get('build') != build: problems.append(f"build {report.get('build')} 不是 {build}")
     native = report.get('native') or {}
@@ -160,6 +178,9 @@ def check(report, source):
         if native.get('imu_source') != source: problems.append(f"imu_source {native.get('imu_source')} 不是 {source}")
         if 'servo_parameters' not in hd: problems.append('native.hd1910 没有 servo_parameters（不是可调版 robotd）')
         if native.get('gain_mode') not in (v167, file_mode): problems.append(f"gain_mode {native.get('gain_mode')}")
+        reader = native.get('imu_reader') or {}
+        if streaming and reader.get('state') != 'streaming':
+            problems.append(f"IMU 读取 {reader.get('state')}，不是 streaming（最近的故障：{reader.get('last_fault')}）")
     return problems
 
 if action == 'state':
@@ -189,17 +210,18 @@ elif action == 'relax-confirm':
         time.sleep(.1)
     print('not settled: ' + last); sys.exit(1)
 elif action == 'verify':
-    source = args[0]
-    until = time.monotonic() + 8; last = ''
+    source, streaming = args[0], args[1:] == ['streaming']
+    until = time.monotonic() + (15 if streaming else 8); last = ''
     while True:
         try:
             report = rpc('robot.busStatus', timeout=5)
-            problems = check(report, source)
+            problems = check(report, source, streaming)
             if not problems:
                 native = report.get('native') or {}; hd = native.get('hd1910') or {}
                 print(json.dumps({'mode': report.get('mode'), 'phase': report.get('phase'), 'build': report.get('build'),
                                   'imu_source': native.get('imu_source'), 'gain_mode': native.get('gain_mode'),
-                                  'servo_parameters': hd.get('servo_parameters', 'absent')}, ensure_ascii=False))
+                                  'servo_parameters': hd.get('servo_parameters', 'absent'),
+                                  'imu_reader': (native.get('imu_reader') or {}).get('state')}, ensure_ascii=False))
                 sys.exit(0)
             last = '; '.join(problems)
         except Exception as exc:
@@ -304,8 +326,10 @@ start_services() {
     log INFO start 'robotd 四步启动完成'
     if [ "$why" = install ]; then
         local seen
-        if ! seen=$(robotd_rpc verify "$SOURCE_KIND" 2>&1); then
-            log ERROR verify "启动后的 busStatus 8 秒内一直不对：$(echo "$seen" | tail -1)"
+        local extra=() wait=8
+        if [ "$VERIFY_STREAMING" = 1 ]; then extra=(streaming); wait=15; fi
+        if ! seen=$(robotd_rpc verify "$SOURCE_KIND" "${extra[@]}" 2>&1); then
+            log ERROR verify "启动后的 busStatus $wait 秒内一直不对：$(echo "$seen" | tail -1)"
             return 1
         fi
         log INFO verify "busStatus：$(echo "$seen" | head -1)"
@@ -467,6 +491,368 @@ try:
 except (ValueError, AssertionError) as exc:
     print(exc); sys.exit(1)
 PY
+}
+
+# --- detecting the trunk IMU module (detect, install auto) ----------------------------------------
+# Only the two buses a module is wired to are looked at; i2c-0 carries the PMIC and is never touched.
+#   /dev/i2c-4 (40-pin 27/28; nothing of the HAT's on it): BNO08x 0x4A/0x4B, LSM6DSV16X 0x6A/0x6B.
+#   /dev/i2c-3 (HAT J5, 40-pin 3/5): BNO08x 0x4A/0x4B. An LSM6DSV16X depends on the HAT found there:
+#     C1 (BMI088 answering at BOTH 0x19 = 0x1E and 0x68 = 0x0F): 0x6A and 0x6B are both modules;
+#     otherwise 0x6A is the D1 HAT's own head IMU (SA0 to ground through R30), never a trunk module:
+#     0x6B is the module only with that 0x6A next to it; 0x6B alone is refused, since a D1 whose R30
+#     is missing may put its head IMU there (SA0 then floats; no default level found in the datasheet),
+#     and a head IMU taken for the trunk is the one mistake the mount check that follows cannot catch
+#     (it is kept per chip type, and tilting the whole duck tilts the head too).
+#     What no rule can tell: a D1 whose R30 is missing (head IMU possibly at 0x6B) AND a module wrongly
+#     set to 0x6A look exactly like D1 + module, and 0x6B is taken; only the documented rule (on a D1
+#     the module is at 0x6B) covers it.
+# Read only, as robotd reads: the node flocked LOCK_EX|LOCK_NB, then per address I2C_SLAVE first —
+# EBUSY there means a kernel driver owns the address, and I2C_RDWR alone would not check that — then
+# a register read (pointer, repeated start, one byte) or one 4-byte read of a BNO08x header (robotd
+# reads a header, then the whole packet, which repeats it; and it drains and resets the chip when it
+# opens it anyway). Every address is read twice, 20 ms apart: one transfer can fail with the servos
+# powered, and one missed answer must not make the other of two modules look like the only one.
+# Only ENXIO / EREMOTEIO is "nothing there" (rk3x reports a NACK as ENXIO; EIO and ETIMEDOUT are the
+# controller's). Anything that could not be looked at, or answered but was not recognised, makes the
+# verdict "unsure" and nothing is installed.
+# Prints LOG / WARN lines (each bus and address, errno names, raw bytes), CAND "<source> <device>
+# <decimal address>", HELD <device> <holder's comm>, UNSURE <why>, HINT <advice>, COUNTS <candidates>
+# <unsure lines not from a held bus>, and last VERDICT one|many|none|unsure.
+probe_i2c() {
+    python3 - "$FAKE_BUS" <<'PY'
+import ctypes, errno, fcntl, json, os, sys, time
+
+FAKE = sys.argv[1]
+BUSES = ('/dev/i2c-3', '/dev/i2c-4')
+I2C_SLAVE, I2C_RDWR, I2C_M_RD = 0x0703, 0x0707, 0x0001
+BNO, LSM, ACC, GYRO = (0x4A, 0x4B), (0x6A, 0x6B), 0x19, 0x68
+WHO_AM_I, LSM_ID, ACC_ID, GYRO_ID = 0x0F, 0x70, 0x1E, 0x0F
+NO_ANSWER = {errno.ENXIO, getattr(errno, 'EREMOTEIO', errno.ENXIO)}
+
+def emit(kind, text): print(f'{kind} {text}', flush=True)
+def ename(e): return errno.errorcode.get(e.errno, str(e.errno)) if getattr(e, 'errno', None) else type(e).__name__
+
+class Msg(ctypes.Structure):
+    _fields_ = [('addr', ctypes.c_uint16), ('flags', ctypes.c_uint16), ('len', ctypes.c_uint16),
+                ('buf', ctypes.POINTER(ctypes.c_uint8))]
+
+class RdWr(ctypes.Structure):
+    _fields_ = [('msgs', ctypes.POINTER(Msg)), ('nmsgs', ctypes.c_uint32)]
+
+class Dev:
+    """The i2c-dev node, opened and locked the way robotd's reader does it."""
+    def __init__(self, path):
+        self.fd = os.open(path, os.O_RDWR)
+        try: fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError: os.close(self.fd); raise
+    def select(self, addr): fcntl.ioctl(self.fd, I2C_SLAVE, addr)
+    def register(self, addr, reg):
+        out, back = (ctypes.c_uint8 * 1)(reg), (ctypes.c_uint8 * 1)()
+        msgs = (Msg * 2)(Msg(addr, 0, 1, out), Msg(addr, I2C_M_RD, 1, back))
+        fcntl.ioctl(self.fd, I2C_RDWR, RdWr(msgs, 2))
+        return back[0]
+    def read4(self, addr):
+        data = os.read(self.fd, 4)
+        if len(data) != 4: raise OSError(errno.EIO, f'read {len(data)} of 4 bytes')
+        return data
+    def close(self): os.close(self.fd)
+
+def fake_spec():
+    spec = json.load(open(FAKE))
+    after = spec.get('_after_stop')   # another bus once robotd is stopped: {"file": <robotd.active>, "bus": {...}}
+    if after and open(after['file']).read().strip() != 'active':
+        spec = dict(after['bus'], _ops_log=spec.get('_ops_log'))
+    return spec
+
+class FakeDev:
+    """Tests only: the same calls, answered from the I2C_FAKE file and failing with real errnos.
+    A register or raw value may be a list: one element per read, the last repeating."""
+    spec = fake_spec() if FAKE else {}
+    counts = {}
+    def __init__(self, path):
+        self.path, bus = path, self.spec.get(path)
+        if bus is None: raise FileNotFoundError(errno.ENOENT, 'No such file or directory', path)
+        if bus.get('open_error'): raise OSError(getattr(errno, bus['open_error']), bus['open_error'], path)
+        held = bus.get('held')
+        if held and (not held.get('while_file') or open(held['while_file']).read().strip() == 'active'):
+            raise BlockingIOError(errno.EWOULDBLOCK, 'Resource temporarily unavailable', path)
+        self.bus = bus
+    def op(self, text):
+        if self.spec.get('_ops_log'):
+            with open(self.spec['_ops_log'], 'a') as f: f.write(f'{self.path} {text}\n')
+    def fail(self, code): raise OSError(getattr(errno, code), code)
+    def nth(self, key, value):
+        if not isinstance(value, list): return value
+        n = self.counts[key] = self.counts.get(key, -1) + 1
+        return value[min(n, len(value) - 1)]
+    def scripted(self, addr):   # errors: every access fails; flaky: one outcome per access, the last repeating
+        key = f'{addr:#04x}'
+        if key in self.bus.get('errors', {}): self.fail(self.bus['errors'][key])
+        seq = self.bus.get('flaky', {}).get(key)
+        if seq:
+            n = self.counts[(self.path, key)] = self.counts.get((self.path, key), -1) + 1
+            if seq[min(n, len(seq) - 1)] != 'ok': self.fail(seq[min(n, len(seq) - 1)])
+    def select(self, addr):
+        self.op(f'SLAVE {addr:#04x}')
+        if f'{addr:#04x}' in self.bus.get('busy', []): self.fail('EBUSY')
+    def register(self, addr, reg):
+        self.op(f'RDWR {addr:#04x}')
+        self.scripted(addr)
+        regs = self.bus.get('regs', {}).get(f'{addr:#04x}')
+        if regs is None: self.fail('ENXIO')
+        return int(self.nth((self.path, 'reg', addr, reg), regs.get(f'{reg:#04x}', '0x00')), 16)
+    def read4(self, addr):
+        self.op(f'READ {addr:#04x}')
+        self.scripted(addr)
+        raw = self.bus.get('raw', {}).get(f'{addr:#04x}')
+        if raw is None: self.fail('ENXIO')
+        return bytes.fromhex(self.nth((self.path, 'raw', addr), raw))
+    def close(self): pass
+
+def holder(path):
+    """(comm, pid) of the process holding the node's flock, from /proc/locks: robotd, or servo-web's
+    imu_i2c.py (python3). A line reads "1: FLOCK ADVISORY WRITE <pid> <major>:<minor>:<inode> ...", the
+    device numbers in hex; both they and the inode must match. (None, None) when it cannot tell."""
+    if FAKE: return (FakeDev.spec[path].get('held') or {}).get('by'), None
+    try:
+        st = os.stat(path)
+        node = (os.major(st.st_dev), os.minor(st.st_dev), st.st_ino)
+        with open('/proc/locks') as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 6 or parts[1] != 'FLOCK': continue
+                major, minor, inode = parts[5].split(':')
+                if (int(major, 16), int(minor, 16), int(inode)) == node:
+                    with open(f'/proc/{parts[4]}/comm') as c: return c.read().strip(), parts[4]
+    except (OSError, ValueError, IndexError): pass
+    return None, None
+
+def header(b):
+    length, channel = (b[0] | b[1] << 8) & 0x7FFF, b[2]
+    return length, channel, (length == 0 or 4 <= length <= 4096) and channel <= 5
+
+def show(seen):
+    kind, value, why = seen
+    if kind == 'absent': return f'没有应答（{why}）'
+    if kind == 'error': return f'出错（{why}）'
+    if isinstance(value, bytes):
+        length, channel, _ = header(value)
+        return f'头 {value.hex(" ")}（长度 {length}，通道 {channel}）'
+    return f'{value:#04x}'
+
+def look(dev, addr, reg):
+    """Two reads 20 ms apart -> (state, value, text); state absent | value | busy | error | unstable."""
+    seen = []
+    for attempt in range(2):
+        if attempt: time.sleep(0.02)
+        try: dev.select(addr)
+        except OSError as e:
+            if e.errno == errno.EBUSY: return 'busy', None, 'EBUSY：内核驱动占着这个地址，没有读'
+            return 'error', None, f'I2C_SLAVE 出错（{ename(e)}）'
+        try: seen.append(('value', dev.register(addr, reg) if reg is not None else dev.read4(addr), ''))
+        except OSError as e: seen.append(('absent' if e.errno in NO_ANSWER else 'error', None, ename(e)))
+    text = ' / '.join(show(s) for s in seen)
+    if any(s[0] == 'error' for s in seen): return 'error', None, text
+    # A BNO08x with reports queued has a new header by the second read: compare whether it answered
+    # and whether the header is valid, not the bytes.
+    same = [(s[0], header(s[1])[2]) if reg is None and s[0] == 'value' else s[:2] for s in seen]
+    if same[0] != same[1]: return 'unstable', None, text
+    return seen[0][0], seen[0][1], text
+
+cands, unsure, hints, buses, held = [], [], [], 0, 0
+for path in BUSES:
+    wire = 'J5（i2c3-pihat）' if path.endswith('3') else '40 针 27/28 脚（i2c4-m0）'
+    try:
+        dev = FakeDev(path) if FAKE else Dev(path)
+    except FileNotFoundError:
+        emit('WARN', f'{path} 不存在：{wire} 的 overlay 没开，这条线不探'); continue
+    except BlockingIOError:
+        comm, pid = holder(path)
+        who = f'{comm}，pid {pid}' if comm and pid else comm or '另一个进程'
+        emit('WARN', f'{path} 被 {who} 占用（同一把 flock），这条线没探'); emit('HELD', f'{path} {comm or "?"}')
+        unsure.append(f'{path} 被 {who} 占用，没探'); held += 1; continue
+    except OSError as e:
+        emit('WARN', f'{path} 打不开（{ename(e)}）'); unsure.append(f'{path} 打不开（{ename(e)}）'); continue
+    buses += 1
+    try:
+        found = {a: look(dev, a, None) for a in BNO}
+        found.update({a: look(dev, a, WHO_AM_I) for a in LSM})
+        if path == '/dev/i2c-3': found.update({a: look(dev, a, 0x00) for a in (ACC, GYRO)})
+    finally:
+        dev.close()
+    for addr, (state, value, text) in found.items():
+        what = 'BNO08x 头' if addr in BNO else 'WHO_AM_I' if addr in LSM else 'chip ID'
+        emit('LOG', f'{path} {addr:#04x} {what}：{text}')
+    for addr in BNO:
+        state, value, text = found[addr]
+        if state == 'absent': continue
+        if state == 'value' and header(value)[2]: cands.append(('bno08x', path, addr)); continue
+        unsure.append(f'{path} {addr:#04x} ' + {'busy': '被内核驱动占着', 'error': f'读出错：{text}',
+                                                'unstable': f'两次读得不一样：{text}'}.get(state, f'有应答，但不像 BNO08x：{text}'))
+        if state == 'value' and value == b'\xff\xff\xff\xff':
+            hints.append(f'{path} {addr:#04x} 读到 ff ff ff ff：BNO08x 可能正在复位，过几秒再试')
+    lsm = []
+    for addr in LSM:
+        state, value, text = found[addr]
+        if state == 'absent': continue
+        if state == 'value' and value == LSM_ID: lsm.append(addr); continue
+        unsure.append(f'{path} {addr:#04x} ' + {'busy': '被内核驱动占着', 'error': f'读出错：{text}',
+                                                'unstable': f'两次读得不一样：{text}'}.get(state, f'有应答，但 WHO_AM_I 不是 0x70：{text}'))
+        if state == 'value':
+            hints.append(f'{path} {addr:#04x} 的 WHO_AM_I 不是 0x70：LSM6DSV16X 可能停在嵌入功能的寄存器页，断电重上再试')
+        if state == 'busy' and path == '/dev/i2c-3' and addr == 0x6A:
+            hints.append('J5 的 0x6a 被内核驱动占着：D1 版 HAT 上可能是给板载 IMU 绑的驱动。'
+                         '确认躯干模块是 0x6B 后，用显式命令：install <文件目录> lsm6dsv16x /dev/i2c-3 0x6B')
+    if path == '/dev/i2c-4':
+        cands += [('lsm6dsv16x', path, a) for a in lsm]
+        continue
+    c1 = found[ACC][:2] == ('value', ACC_ID) and found[GYRO][:2] == ('value', GYRO_ID)
+    for addr in (ACC, GYRO):   # EBUSY or no answer: just no C1; an error or a wavering answer: a bad bus
+        state, value, text = found[addr]
+        if state in ('error', 'unstable'):
+            unsure.append(f'{path} {addr:#04x}（BMI088 的地址）' + ('读出错' if state == 'error' else '两次读得不一样')
+                          + f'：{text}；这条线本身可能有问题，别的地址的「没应答」也不可信')
+    emit('LOG', f'{path}：' + ('认出 C1 版 HAT（BMI088 0x19 = 0x1e，0x68 = 0x0f）' if c1 else
+                              '没认出 C1 版 HAT（BMI088 的 0x19 = 0x1e、0x68 = 0x0f 没有同时对上）'))
+    if c1:
+        cands += [('lsm6dsv16x', path, a) for a in lsm]
+    elif lsm == [0x6A, 0x6B]:
+        emit('LOG', f'{path} 0x6a 当作 D1 版 HAT 板载的头部 IMU 跳过，0x6b 当作躯干模块')
+        cands.append(('lsm6dsv16x', path, 0x6B))
+    elif lsm == [0x6A]:
+        emit('LOG', f'{path} 0x6a 当作 D1 版 HAT 板载的头部 IMU，不是躯干模块；这条线上没有躯干模块')
+        hints.append('D1 版 HAT：J5 上的躯干模块必须设成 0x6B（模块 SA0 接 3.3 V），D1 上 0x6A 是板载的头部 IMU。'
+                     '只有确认 HAT 是 C1（有 BMI088）、只是 BMI088 读不出来时，才可以用显式命令装 0x6A')
+    elif lsm == [0x6B]:
+        unsure.append(f'{path} 0x6b 有一颗 LSM6DSV16X，但这条线上既没认出 C1 版 HAT，也没有 D1 板载的 0x6a：'
+                      '分不清它是躯干模块还是头部 IMU')
+        hints.append('J5 上只有 0x6B：可能是 R30 没焊好的 D1 版 HAT（板载的头部 IMU 落到了 0x6B），也可能是 BMI088 读不出的 '
+                     'C1，或者没插 HAT。先查 HAT；确认 0x6B 就是你接在躯干上的模块，再用显式命令：'
+                     'install <文件目录> lsm6dsv16x /dev/i2c-3 0x6B')
+if not buses and not unsure:
+    hints.append('/dev/i2c-3 和 /dev/i2c-4 都不存在：J5 要 i2c3-pihat overlay，27/28 脚要 i2c4-m0 overlay（见 IMU-MODULE.md）')
+for source, path, addr in cands: emit('CAND', f'{source} {path} {addr}')
+for why in unsure: emit('UNSURE', why)
+for hint in hints: emit('HINT', hint)
+emit('COUNTS', f'{len(cands)} {len(unsure) - held}')
+emit('VERDICT', 'unsure' if unsure else 'one' if len(cands) == 1 else 'many' if cands else 'none')
+PY
+}
+
+# I2C_FAKE answers the probe from a JSON file instead of the bus: fake-board tests only. Unlike
+# NO_SYSTEMD it would make the installer write what it says, so it is refused on the real paths.
+fake_bus_setup() {
+    [ -n "${I2C_FAKE:-}" ] || return 0
+    if [ "$CONFIG_DIR" = /etc/robot/feetech-ft5 ] || [ "$INSTALL_DIR" = /opt/robot/feetech-ft5-r5 ]; then
+        die precheck 'I2C_FAKE 只给假板子测试用，真板子上不认它（sudo 时别带这个环境变量）'
+    fi
+    FAKE_BUS=$I2C_FAKE
+    log WARN detect "测试模式：总线是假的（$I2C_FAKE）"
+}
+
+# One probe, in the main shell: sets DETECT_VERDICT, DETECT_CANDS (lines "source device address"),
+# DETECT_HELD, DETECT_UNSURE, DETECT_HINTS, and logs every line. $1 names the pass in the log.
+detect_run() {
+    local out rc=0 line
+    DETECT_VERDICT='' DETECT_CANDS='' DETECT_HELD=0 DETECT_UNSURE='' DETECT_HINTS=''
+    DETECT_HELD_BY='' DETECT_NCANDS=0 DETECT_OTHER=0
+    out=$(probe_i2c 2>>"$LOG") || rc=$?
+    [ "$rc" = 0 ] || die detect "探测程序本身出错（$1，退出码 $rc，见日志）"
+    while IFS= read -r line; do
+        case $line in
+            'LOG '*) log INFO detect "${line#LOG }" ;;
+            'WARN '*) log WARN detect "${line#WARN }" ;;
+            'CAND '*) DETECT_CANDS+="${line#CAND }"$'\n' ;;
+            'HELD '*) DETECT_HELD=1; DETECT_HELD_BY+="${line#HELD }"$'\n' ;;
+            'COUNTS '*) read -r DETECT_NCANDS DETECT_OTHER <<<"${line#COUNTS }" ;;
+            'UNSURE '*) DETECT_UNSURE+="${line#UNSURE }"$'\n'; log WARN detect "认不准：${line#UNSURE }" ;;
+            'HINT '*) DETECT_HINTS+="${line#HINT }"$'\n' ;;
+            'VERDICT '*) DETECT_VERDICT=${line#VERDICT } ;;
+        esac
+    done <<<"$out"
+    case $DETECT_VERDICT in one|many|none|unsure) ;; *) die detect "探测程序没有给出结论（$1，见日志）" ;; esac
+    log INFO detect "$1：结论 $DETECT_VERDICT"
+}
+
+# The explicit command for each candidate; $1 = the file directory (or a placeholder).
+detect_commands() {
+    local source device address
+    while read -r source device address; do
+        [ -n "$source" ] || continue
+        printf '  %s %s %#04x：sudo bash %s install %s %s %s %#04x\n' \
+            "$source" "$device" "$address" "$0" "$1" "$source" "$device" "$address"
+    done <<<"$DETECT_CANDS"
+}
+
+cand_text() { awk 'NF { printf "%s %s 0x%02x\n", $1, $2, $3 }' <<<"$DETECT_CANDS"; }   # the candidates, addresses in hex
+
+# What the verdict means, for the log, the terminal and die's message; $1 = file directory.
+detect_summary() {
+    local n
+    n=$(sed '/^$/d' <<<"$DETECT_CANDS" | wc -l)
+    case $DETECT_VERDICT in
+        one) printf '识别到：%s\n' "$(cand_text)" ;;
+        many) printf '找到 %s 颗 IMU 模块，不替你选。要用哪颗，就用对应的显式命令：\n%s\n' "$n" "$(detect_commands "$1")" ;;
+        none) printf '%s\n' '两条线上都没找到躯干 IMU 模块（J5 = /dev/i2c-3，27/28 脚 = /dev/i2c-4）。用舵机总线上的 IMU 小板（ID 200）的话，这个脚本不负责切换' ;;
+        unsure) printf '没探全或认不准，不装：\n%s\n' "$(sed '/^$/d; s/^/  /' <<<"$DETECT_UNSURE")"
+                if [ "$n" -gt 0 ]; then printf '已经认出的：%s\n' "$(cand_text | paste -sd ';' -)"; fi ;;
+    esac
+    if [ -n "$DETECT_HINTS" ]; then printf '提示：\n%s\n' "$(sed '/^$/d; s/^/  /' <<<"$DETECT_HINTS")"; fi
+}
+
+cmd_detect() {
+    [ $# -eq 0 ] || die usage '用法：detect（不带参数）'
+    need_root
+    fake_bus_setup
+    take_lock   # an install's probe and this one never meet; held for a few tenths of a second
+    detect_run detect   # every bus and address is on the terminal already, through log
+    local summary
+    summary=$(detect_summary '<文件目录>')
+    log INFO detect "$(tr '\n' ' ' <<<"$summary")"
+    say "$summary"
+    case $DETECT_VERDICT in one) exit 0 ;; many) exit 2 ;; none) exit 3 ;; unsure) exit 4 ;; esac
+}
+
+# install auto, first pass (robotd still running): relaxing the duck for a second look is worth it only
+# when the one thing in the way is robotd holding a bus. Prints why not (for die); 0 = go on.
+first_pass_blocker() {
+    local device comm others=''
+    [ "$DETECT_VERDICT" = one ] && return 0
+    if [ "$DETECT_HELD" = 0 ]; then echo '（停服务之前就已经清楚，鸭子没有卸力）'; return 1; fi
+    while read -r device comm; do
+        [ -n "$device" ] || continue
+        [ "$comm" = robotd ] || others+=" $device（$comm）"
+    done <<<"$DETECT_HELD_BY"
+    if [ -n "$others" ]; then
+        echo "占着线的不是 robotd：$others。停 robotd 也放不开，先停掉它再来（鸭子没有卸力）"; return 1
+    fi
+    if [ "$DETECT_NCANDS" -ge 2 ]; then echo '已经认出两颗以上，停了 robotd 也只会一样多或更多（鸭子没有卸力）'; return 1; fi
+    if [ "$DETECT_OTHER" -gt 0 ]; then
+        echo '除了 robotd 占着的线，别处还有没探全或认不准的，停了 robotd 也解决不了（鸭子没有卸力）'; return 1
+    fi
+    return 0
+}
+
+# install auto: the module detect_run found, into source / device / address and SOURCE_KIND, in the
+# main shell (start_services' check reads SOURCE_KIND). Warns when the wiring moved while this chip
+# type's mount stays verified: the mount is kept per type, not per bus and address.
+detect_take() {
+    local previous mount
+    read -r INSTALL_SOURCE INSTALL_DEVICE INSTALL_ADDRESS <<<"$(sed '/^$/d' <<<"$DETECT_CANDS")"
+    previous=$(python3 - "$CONFIG_DIR/robotd.toml" <<'PY' 2>>"$LOG" || true
+import sys, tomllib
+imu = tomllib.load(open(sys.argv[1], 'rb')).get('trunk_imu') or {}
+if imu.get('source') and imu.get('source') != 'bus':
+    print(imu.get('source'), imu.get('i2c_device'), imu.get('i2c_address'))
+PY
+)
+    if [ -n "$previous" ] && [ "$previous" != "$INSTALL_SOURCE $INSTALL_DEVICE $INSTALL_ADDRESS" ]; then
+        mount=$(mount_state "$INSTALL_SOURCE" 2>/dev/null) || mount=''
+        case $mount in
+            verified*) MOVED_WARNING="IMU 的接法变了（之前 $previous，现在 $INSTALL_SOURCE $INSTALL_DEVICE $INSTALL_ADDRESS），$INSTALL_SOURCE 的安装方向是以前确认的：换了位置或模块，按 IMU-MODULE.md 第 3 节重新确认"
+                       log WARN mount "$MOVED_WARNING" ;;
+        esac
+    fi
 }
 
 set_trunk_imu() {   # file source device address(decimal)
@@ -644,25 +1030,43 @@ if execution.exists():
           f"{'（有 .orig，改过）' if orig.exists() else ''}")
 PY
     echo "SHA256SUMS 核对不过的行：$(echo $(sums_failures)) "
+    echo "看线上接了哪颗 IMU 模块：sudo bash $0 detect（只读）"
+}
+
+# The wiring checks of an explicit install, and again for the module install auto found; sets
+# SOURCE_KIND in the main shell. $4 = 1: install auto, which opened the node itself to find it.
+check_source() {   # source device address(decimal) auto
+    case $1 in
+        bno08x) [[ $3 == 74 || $3 == 75 ]] || die precheck 'BNO08x 地址只能是 0x4A 或 0x4B' ;;
+        lsm6dsv16x) [[ $3 == 106 || $3 == 107 ]] || die precheck 'LSM6DSV16X 地址只能是 0x6A 或 0x6B' ;;
+        *) die precheck "source 只能是 bno08x 或 lsm6dsv16x，不是 $1" ;;
+    esac
+    SOURCE_KIND=$1
+    [ "$4" = 1 ] || [ -c "$2" ] || [ "$NO_SYSTEMD" = 1 ] || die precheck "$2 不存在：先开对应的 I2C overlay（见 IMU-MODULE.md）"
 }
 
 cmd_install() {
-    [ $# -eq 4 ] || die usage '用法：install <文件目录> <bno08x|lsm6dsv16x> <i2c 设备> <地址>'
-    local src=$1 source=$2 device=$3 address f
-    [[ $4 =~ ^(0[xX][0-9a-fA-F]+|[0-9]+)$ ]] || die usage "地址要写成 0x4B 或 75 这样，不是 $4"
-    address=$(( $4 ))
+    local src source='' device='' address='' auto=0 f first_cands='' first_held=0 why
+    if [ $# -eq 2 ] && [ "$2" = auto ]; then
+        src=$1 auto=1
+    elif [ $# -eq 4 ]; then
+        src=$1 source=$2 device=$3
+        [[ $4 =~ ^(0[xX][0-9a-fA-F]+|[0-9]+)$ ]] || die usage "地址要写成 0x4B 或 75 这样，不是 $4"
+        address=$(( $4 ))
+    else
+        die usage '用法：install <文件目录> auto，或 install <文件目录> <bno08x|lsm6dsv16x> <i2c 设备> <地址>'
+    fi
     need_root
     take_lock
-    log INFO precheck "开始安装：$src $source $device $(printf '%#04x' "$address")"
+    if [ "$auto" = 1 ]; then
+        fake_bus_setup
+        log INFO precheck "开始安装：$src（自动识别 IMU 模块）"
+    else
+        log INFO precheck "开始安装：$src $source $device $(printf '%#04x' "$address")"
+    fi
     [ "$(installed_build)" = "$WANT_BUILD" ] \
         || die precheck "板上是 $(installed_build || echo 未知版本)，不是 $WANT_BUILD：先用 kissqy 中控 1.0.167 升级到 V167"
-    case $source in
-        bno08x) [[ $address == 74 || $address == 75 ]] || die precheck 'BNO08x 地址只能是 0x4A 或 0x4B' ;;
-        lsm6dsv16x) [[ $address == 106 || $address == 107 ]] || die precheck 'LSM6DSV16X 地址只能是 0x6A 或 0x6B' ;;
-        *) die precheck "source 只能是 bno08x 或 lsm6dsv16x，不是 $source" ;;
-    esac
-    SOURCE_KIND=$source
-    [ -c "$device" ] || [ "$NO_SYSTEMD" = 1 ] || die precheck "$device 不存在：先开对应的 I2C overlay（见 IMU-MODULE.md）"
+    if [ "$auto" = 0 ]; then check_source "$source" "$device" "$address" 0; fi
     for f in "${BINS[@]}" "${SCRIPTS[@]}"; do [ -f "$src/$f" ] || die precheck "缺文件 $src/$f"; done
     python3 - "$INSTALL_DIR" "$src/robotd" "$src/robotctl" "$src/padd" <<'PY' >>"$LOG" 2>&1 || die precheck 'robotd / robotctl / padd 不是完整的 aarch64 程序（见日志）'
 import sys
@@ -709,7 +1113,29 @@ PY
     fi
     log INFO precheck '检查通过'
 
+    if [ "$auto" = 1 ]; then
+        # A first look while robotd still runs: unless robotd holding a bus is all that is in the way,
+        # the answer is already final and stops here, before the duck is relaxed for nothing.
+        detect_run '停服务之前'
+        first_cands=$DETECT_CANDS first_held=$DETECT_HELD
+        why=$(first_pass_blocker) || die detect "$(detect_summary "$src")"$'\n'"$why"
+    fi
+
     relax_and_stop
+
+    if [ "$auto" = 1 ]; then
+        # The one that counts: robotd is stopped, so nothing of ours holds a bus any more.
+        detect_run '停了 robotd 之后'
+        [ "$DETECT_VERDICT" = one ] || die detect "$(detect_summary "$src")"
+        if [ "$first_held" = 0 ] && [ "$DETECT_CANDS" != "$first_cands" ]; then   # the same bus, looked at twice
+            die detect "停 robotd 前后两遍看到的不一样（之前：$(tr '\n' ' ' <<<"$first_cands")；之后：$(tr '\n' ' ' <<<"$DETECT_CANDS")）：总线或接线可能在变，不装"
+        fi
+        detect_take
+        source=$INSTALL_SOURCE device=$INSTALL_DEVICE address=$INSTALL_ADDRESS
+        check_source "$source" "$device" "$address" 1
+        VERIFY_STREAMING=1
+        log INFO detect "按识别到的装：$source $device $(printf '%#04x' "$address")"
+    fi
 
     local backup
     backup=$BACKUP_ROOT/imu-module-backup-$(date +%Y%m%d-%H%M%S)
@@ -760,6 +1186,8 @@ PY
         log WARN tuning "有舵机参数文件 $(tr -d '\n' < "$CONFIG_DIR/servo-test-parameters.json")：下次 HOME 上力时生效"
     fi
     input_report
+    if [ "$auto" = 1 ]; then say "IMU 模块（自动识别）：$source $device $(printf '%#04x' "$address")"; fi
+    if [ -n "$MOVED_WARNING" ]; then say "注意：$MOVED_WARNING"; fi
     say "完成。备份：$backup"
     say "撤回（回到这次安装之前）：sudo bash $0 rollback $backup"
 }
@@ -799,7 +1227,8 @@ cmd_rollback() {
 
 case ${1:-} in
     check) shift; cmd_check "$@" ;;
+    detect) shift; cmd_detect "$@" ;;
     install) shift; cmd_install "$@" ;;
     rollback) shift; cmd_rollback "$@" ;;
-    *) sed -n '2,27p' "$0"; exit 2 ;;
+    *) sed -n '2,34p' "$0"; exit 1 ;;
 esac

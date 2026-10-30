@@ -1,5 +1,5 @@
 // Modified 2026-10 by fanhao375 (microduck-replica): trunk IMU module over I2C; optional servo P/D/torque-limit file; BNO08x gyro-integrated attitude; see IMU-MODULE.md at the repository root.
-//! Native Feetech TTL packets. No Dynamixel packets or address translation.
+//! Native Feetech servo packets, with explicit or discovered bus-IMU wire/data contracts.
 //!
 //! HD1910 telemetry uses only the 15-byte feedback block at 56..=70.
 //! FT6 shares that 15-byte block length; all 16 devices use one Sync Read. With the trunk
@@ -21,6 +21,11 @@ use crate::io::{ImuStale, IoError, JointTargets, Result, RobotIo, Sensors, SlowS
 use crate::model::{JOINT_NAMES, NUM_JOINTS};
 use crate::trunk_imu::{HostImu, HostImuGate, HostImuHealth, TrunkImuKind};
 
+#[path = "feetech_observations.rs"]
+pub mod observations;
+#[path = "feetech_imu_observation.rs"]
+pub mod imu_observation;
+
 pub const BAUD: u32 = 1_000_000;
 pub const IMU_ID: u8 = 200;
 pub const SYNC_ADDRESS: u8 = 56;
@@ -30,6 +35,132 @@ pub const IMU_DIAGNOSTIC_ADDRESS: u8 = 124;
 pub const IMU_LENGTH: u8 = 15;
 pub const IMU_DIAGNOSTIC_LENGTH: u8 = 20;
 pub const IMU_IDENTITY: [u8; 5] = [6, 0, 0, 0, 0xf2];
+/// Model number of microduck-replica's own bus IMU board (imu_to_dxl), little-endian at 3..5.
+pub const IMU_TO_DXL_MODEL: [u8; 2] = [0x44, 0x4d];
+
+/// Legacy boards are identified by their register bytes; Qinmo is an explicit configured
+/// profile. The board/layout also decides its position in a Feetech Sync Read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum BusImuBoard {
+    /// kissqy's FT6 board: first in the list, as its firmware expects.
+    Ft6,
+    /// microduck-replica's imu_to_dxl (Feetech protocol since firmware 0.2.0): last. It speaks
+    /// after hearing the device before it, while Feetech servos start their predicted slots on a
+    /// timer — first in the list, the next servo talks over its checksum (measured on firmware
+    /// 1.0.0 with Feetech 3.46 servos: 3/30 replies first, 30/30 middle or last).
+    ImuToDxl,
+    /// DXL 2.0 SFLP register layout, ID 200, address 124, twelve bytes.
+    Dxl2,
+    /// Explicit protocol-1.2 data profile; PING and layout validation are not vendor authentication.
+    Qinmo,
+}
+impl BusImuBoard {
+    pub fn from_identity(raw: &[u8]) -> Option<Self> {
+        if raw == IMU_IDENTITY {
+            Some(Self::Ft6)
+        } else if raw.len() == 5 && raw[2] == 0 && raw[3..5] == IMU_TO_DXL_MODEL {
+            Some(Self::ImuToDxl)
+        } else {
+            None
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ft6 => "ft6",
+            Self::ImuToDxl => "imu_to_dxl",
+            Self::Dxl2 => "sflp_124_12",
+            Self::Qinmo => "qinmo",
+        }
+    }
+
+    pub fn protocol(self) -> BusImuProtocol {
+        if self == Self::Dxl2 {
+            BusImuProtocol::Dxl2
+        } else {
+            BusImuProtocol::Feetech
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BusImuProtocol {
+    #[default]
+    Auto,
+    Feetech,
+    Dxl2,
+}
+impl BusImuProtocol {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Feetech => "feetech",
+            Self::Dxl2 => "dxl2",
+        }
+    }
+}
+
+/// A configured data contract, independent of the on-wire protocol or vendor identity.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BusImuProfile {
+    #[default]
+    Legacy,
+    Qinmo,
+}
+impl BusImuProfile {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Qinmo => "qinmo",
+        }
+    }
+    pub fn gyro_dps_per_lsb(self) -> f64 {
+        match self {
+            Self::Legacy => 0.0175,
+            Self::Qinmo => 1.0 / 16.4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BusImuInfo {
+    pub protocol: &'static str,
+    pub board: &'static str,
+    pub identity: Vec<u8>,
+    pub profile: &'static str,
+    pub gyro_dps_per_lsb: f64,
+    pub identification: &'static str,
+}
+
+#[cfg(all(test, unix))]
+#[path = "feetech_dxl2_tests.rs"]
+mod dxl2_transport_tests;
+
+#[cfg(all(test, unix))]
+#[path = "feetech_qinmo_tests.rs"]
+mod qinmo_transport_tests;
+
+/// The Sync Read list for the 56/15 telemetry: the IMU first or last, by board.
+pub fn telemetry_ids(board: BusImuBoard, servo_ids: &[u8]) -> Vec<u8> {
+    let mut ids = Vec::with_capacity(servo_ids.len() + 1);
+    if board == BusImuBoard::Ft6 {
+        ids.push(IMU_ID);
+    }
+    ids.extend_from_slice(servo_ids);
+    if matches!(board, BusImuBoard::ImuToDxl | BusImuBoard::Qinmo) {
+        ids.push(IMU_ID);
+    }
+    ids
+}
+
+fn unknown_imu(raw: &[u8]) -> IoError {
+    error(format!(
+        "ID 200 is neither FT6 (06 00 00 00 f2) nor imu_to_dxl (model 0x4D44, firmware 0.2.0 or later); \
+         it reported {raw:02x?}. If this is a Qinmo board, select Qinmo on the IMU page \
+         while the main program is stopped, then verify its mounting again; the profile is not autodetected"
+    ))
+}
 /// FT6 sets status bit1 at TX when quaternion age exceeds this bound.
 pub const IMU_FRESH_BOUND_MS: u16 = 30;
 pub const BROADCAST: u8 = 254;
@@ -168,6 +299,13 @@ pub struct Bus {
     timeout: Duration,
     read_only: bool,
     pub last_sync: SyncTrace,
+    /// The bus IMU board, once `identify_imu` has read it; FT6 until then.
+    imu_board: BusImuBoard,
+    imu_protocol: BusImuProtocol,
+    imu_profile: BusImuProfile,
+    imu_identity: Option<Vec<u8>>,
+    observations: observations::Observations,
+    last_imu_response_at: Option<Instant>,
 }
 
 /// Minimal acquisition result. No recovery, raw-packet history or UART polling.
@@ -204,7 +342,208 @@ impl Bus {
             timeout: Duration::from_millis(30),
             read_only: false,
             last_sync: SyncTrace::default(),
+            imu_board: BusImuBoard::Ft6,
+            imu_protocol: BusImuProtocol::Auto,
+            imu_profile: BusImuProfile::Legacy,
+            imu_identity: None,
+            observations: observations::Observations::default(),
+            last_imu_response_at: None,
         })
+    }
+
+    /// Discover ID 200 under the saved profile and establish its telemetry layout/order.
+    /// Qinmo's configured profile is never presented as authenticated vendor identity.
+    pub fn identify_imu(&mut self) -> Result<BusImuBoard> {
+        self.imu_identity = None;
+        if self.imu_profile == BusImuProfile::Qinmo {
+            // The first valid frame locks Qinmo's protocol for 20 seconds of idle.
+            // Never probe DXL2 or assume an undocumented identity table on this path.
+            self.ping(IMU_ID)?;
+            ImuSample::decode_qinmo(&self.read(IMU_ID, SYNC_ADDRESS, IMU_LENGTH)?)?;
+            self.imu_board = BusImuBoard::Qinmo;
+            self.imu_identity = Some(Vec::new());
+            return Ok(self.imu_board);
+        }
+        let mut feetech_failure = None;
+        if self.imu_protocol != BusImuProtocol::Dxl2 {
+            match self.read(IMU_ID, 0, 5) {
+                Ok(raw) => {
+                    let board =
+                        BusImuBoard::from_identity(&raw).ok_or_else(|| unknown_imu(&raw))?;
+                    self.imu_board = board;
+                    self.imu_identity = Some(raw);
+                    return Ok(board);
+                }
+                Err(problem) if self.imu_protocol == BusImuProtocol::Feetech => {
+                    return Err(problem);
+                }
+                Err(problem) => feetech_failure = Some(problem),
+            }
+        }
+        match self.dxl2_read(0, 3, Instant::now() + self.timeout) {
+            Ok(raw) => {
+                let core = self.dxl2_read(124, 12, Instant::now() + self.timeout)?;
+                ImuSample::decode_dxl2(&core)?;
+                self.imu_board = BusImuBoard::Dxl2;
+                self.imu_identity = Some(raw);
+                Ok(self.imu_board)
+            }
+            Err(problem) => Err(error(format!(
+                "IMU ID 200 detection failed: Feetech {feetech_failure:?}; DXL2 {problem}"
+            ))),
+        }
+    }
+
+    pub fn set_imu_protocol(&mut self, value: &str) -> Result<()> {
+        let protocol = match value {
+            "auto" => BusImuProtocol::Auto,
+            "feetech" => BusImuProtocol::Feetech,
+            "dxl2" => BusImuProtocol::Dxl2,
+            _ => return Err(error("IMU protocol must be auto, feetech or dxl2")),
+        };
+        if self.imu_profile == BusImuProfile::Qinmo && protocol == BusImuProtocol::Dxl2 {
+            return Err(error("Qinmo profile requires imu_protocol=auto or feetech"));
+        }
+        self.imu_protocol = protocol;
+        self.imu_identity = None;
+        Ok(())
+    }
+
+    /// Set once before discovery, while the main program is stopped.
+    pub fn set_imu_profile(&mut self, value: &str) -> Result<()> {
+        let profile = match value {
+            "legacy" => BusImuProfile::Legacy,
+            "qinmo" => BusImuProfile::Qinmo,
+            _ => return Err(error("IMU profile must be legacy or qinmo")),
+        };
+        if profile == BusImuProfile::Qinmo && self.imu_protocol == BusImuProtocol::Dxl2 {
+            return Err(error("Qinmo profile requires imu_protocol=auto or feetech"));
+        }
+        self.imu_profile = profile;
+        self.imu_identity = None;
+        Ok(())
+    }
+
+    pub fn imu_profile(&self) -> BusImuProfile {
+        self.imu_profile
+    }
+
+    pub fn imu_info(&self) -> Option<BusImuInfo> {
+        Some(BusImuInfo {
+            protocol: self.imu_board.protocol().label(),
+            board: self.imu_board.label(),
+            identity: self.imu_identity.clone()?,
+            profile: self.imu_profile.label(),
+            gyro_dps_per_lsb: self.imu_profile.gyro_dps_per_lsb(),
+            identification: match self.imu_board {
+                BusImuBoard::Qinmo => "configured_profile",
+                BusImuBoard::Dxl2 => "compatibility_layout",
+                BusImuBoard::Ft6 | BusImuBoard::ImuToDxl => "legacy_identity",
+            },
+        })
+    }
+
+    fn dxl2_read(&mut self, address: u16, length: u16, deadline: Instant) -> Result<Vec<u8>> {
+        let started = Instant::now();
+        let mut trace = SyncTrace {
+            address: address as u8,
+            length: length as u8,
+            missing_ids: vec![IMU_ID],
+            ..SyncTrace::default()
+        };
+        let mut decoder = crate::dxl2::Decoder::default();
+        let result = (|| {
+            let params = [address.to_le_bytes(), length.to_le_bytes()].concat();
+            self.send(&crate::dxl2::packet(IMU_ID, READ, &params), deadline)?;
+            trace.request_sent = true;
+            let mut chunk = [0u8; 128];
+            while Instant::now() < deadline {
+                self.poll_timeout(deadline)?;
+                match self.port.read(&mut chunk) {
+                    Ok(count) => {
+                        trace.rx_bytes += count;
+                        let mut answer = None;
+                        for byte in &chunk[..count] {
+                            if let Some(status) = decoder.push(*byte) {
+                                if status.id != IMU_ID {
+                                    continue;
+                                }
+                                self.last_imu_response_at = Some(Instant::now());
+                                if status.error != 0 {
+                                    return Err(error(format!(
+                                        "DXL2 IMU200 status error 0x{:02x}",
+                                        status.error
+                                    )));
+                                }
+                                if status.data.len() != usize::from(length) {
+                                    return Err(error(format!(
+                                        "DXL2 IMU200 expected {length} bytes, got {}",
+                                        status.data.len()
+                                    )));
+                                }
+                                if answer.is_none() {
+                                    answer = Some((status.data, status.wire_len));
+                                }
+                            }
+                        }
+                        if let Some((data, wire_len)) = answer {
+                            // Inspect the entire read, including bytes after the
+                            // expected frame. Unsolicited frames and even a short
+                            // noise tail disqualify clean partial acquisition.
+                            trace.discarded = trace.rx_bytes.saturating_sub(wire_len) as u64;
+                            if decoder.bad_checksums != 0 {
+                                return Err(error("DXL2 IMU200 checksum error"));
+                            }
+                            if Instant::now() >= deadline {
+                                return Err(error(
+                                    "DXL2 IMU200 response exceeded transaction deadline",
+                                ));
+                            }
+                            return Ok(data);
+                        }
+                    }
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(e) => return Err(error(e.to_string())),
+                }
+            }
+            Err(error(format!(
+                "DXL2 IMU200 response timeout ({} checksum errors)",
+                decoder.bad_checksums
+            )))
+        })();
+        trace.elapsed_us = started.elapsed().as_micros() as u64;
+        trace.deadline_exceeded = Instant::now() >= deadline;
+        trace.bad_checksums = decoder.bad_checksums;
+        trace.discarded = trace.discarded.max(decoder.discarded);
+        if result.is_ok() {
+            trace.missing_ids.clear();
+        }
+        self.last_sync = trace;
+        result
+    }
+
+    pub fn imu_board(&self) -> BusImuBoard {
+        self.imu_board
+    }
+
+    /// Retain replies before an initialization error drops this UART owner.
+    /// This does not read registers or construct a usable control sample.
+    pub fn servo_observations(&self, calibration: &Calibration) -> observations::Snapshot {
+        let metadata = crate::feetech_snapshot::Metadata {
+            joints: calibration.joints.iter().map(|joint| crate::feetech_snapshot::JointMetadata {
+                id: joint.id,
+                name: joint.name.clone(),
+                calibrated: joint.calibrated,
+            }).collect(),
+            ..Default::default()
+        };
+        self.observations.snapshot(std::sync::Arc::new(metadata), Instant::now())
     }
 
     /// Enforced at the packet boundary, including every existing write API.
@@ -216,7 +555,14 @@ impl Bus {
     }
 
     fn send(&mut self, bytes: &[u8], deadline: Instant) -> Result<()> {
-        if self.read_only && !matches!(bytes.get(4).copied(), Some(1 | READ | SYNC_READ)) {
+        let instruction = bytes
+            .get(if bytes.starts_with(&crate::dxl2::HEADER) {
+                7
+            } else {
+                4
+            })
+            .copied();
+        if self.read_only && !matches!(instruction, Some(1 | READ | SYNC_READ)) {
             return Err(error("read-only motor bus: write instruction refused"));
         }
         self.port
@@ -272,6 +618,9 @@ impl Bus {
         let tx = packet(id, inst, params)?;
         let deadline = Instant::now() + budget;
         self.send(&tx, deadline)?;
+        if inst == READ {
+            self.observations.requested(&[id], Instant::now());
+        }
         let mut decoder = Decoder::default();
         let mut one = [0u8; 1];
         while Instant::now() < deadline {
@@ -287,6 +636,12 @@ impl Bus {
                         // successful status. Do not interpret the echoed READ as error 2.
                         if status.error == inst && status.data == params {
                             continue;
+                        }
+                        if id == IMU_ID {
+                            self.last_imu_response_at = Some(Instant::now());
+                        }
+                        if inst == READ {
+                            self.observations.replied(&status, params[0], params[1], Instant::now());
                         }
                         if status.error != 0 {
                             return Err(error(format!(
@@ -375,6 +730,18 @@ impl Bus {
         ids: &[u8],
         allow_partial: bool,
     ) -> Result<BTreeMap<u8, Vec<u8>>> {
+        self.sync_read_window(address, length, ids, allow_partial, None, false)
+    }
+
+    fn sync_read_window(
+        &mut self,
+        address: u8,
+        length: u8,
+        ids: &[u8],
+        allow_partial: bool,
+        window: Option<(Instant, Instant)>,
+        external_imu: bool,
+    ) -> Result<BTreeMap<u8, Vec<u8>>> {
         let started = Instant::now();
         let budget = if address == SYNC_ADDRESS {
             Duration::from_millis(TELEMETRY_DEADLINE_MS)
@@ -383,7 +750,15 @@ impl Bus {
         } else {
             Duration::from_millis(4)
         };
-        let deadline = started + if self.read_only { self.timeout } else { budget };
+        let deadline = started
+            + if self.read_only
+                && !(self.imu_profile == BusImuProfile::Qinmo && address == SYNC_ADDRESS)
+            {
+                self.timeout
+            } else {
+                budget
+            };
+        let (started, deadline) = window.unwrap_or((started, deadline));
         let mut pending = ids.iter().copied().collect::<BTreeSet<_>>();
         let mut decoder = Decoder::for_sync_read(length);
         let mut rx_bytes = 0;
@@ -393,6 +768,7 @@ impl Bus {
         let result = (|| {
             self.send(&sync_read_packet(address, length, ids)?, deadline)?;
             request_sent = true;
+            self.observations.requested(ids, Instant::now());
             let mut replies = BTreeMap::new();
             let mut failure = None;
             let mut bytes = [0u8; 256];
@@ -406,6 +782,9 @@ impl Bus {
                         rx_bytes += count;
                         for byte in &bytes[..count] {
                             if let Some(status) = decoder.push(*byte) {
+                                if pending.contains(&status.id) {
+                                    self.observations.replied(&status, address, length, Instant::now());
+                                }
                                 if let Err(error) =
                                     accept_sync_status(&mut pending, &mut replies, status, length)
                                 {
@@ -451,7 +830,7 @@ impl Bus {
             if allow_partial
                 && address == SYNC_ADDRESS
                 && length == SYNC_LENGTH
-                && replies.contains_key(&IMU_ID)
+                && (external_imu || replies.contains_key(&IMU_ID))
                 && !pending.is_empty()
                 && !pending.contains(&IMU_ID)
                 && decoder.bad_checksums == 0
@@ -492,8 +871,10 @@ impl Bus {
         if servo_ids.len() != NUM_JOINTS || servo_ids.contains(&IMU_ID) {
             return Err(error("telemetry requires all 15 joints plus IMU 200"));
         }
-        let mut ids = [IMU_ID; NUM_JOINTS + 1];
-        ids[1..].copy_from_slice(servo_ids);
+        if self.imu_board == BusImuBoard::Dxl2 {
+            return self.dxl2_telemetry(servo_ids, false);
+        }
+        let ids = telemetry_ids(self.imu_board, servo_ids);
         self.sync_read(SYNC_ADDRESS, SYNC_LENGTH, &ids)
     }
 
@@ -515,9 +896,57 @@ impl Bus {
         if servo_ids.len() != NUM_JOINTS || servo_ids.contains(&IMU_ID) {
             return Err(error("telemetry requires all 15 joints plus IMU 200"));
         }
-        let mut ids = vec![IMU_ID];
-        ids.extend_from_slice(servo_ids);
+        if self.imu_board == BusImuBoard::Dxl2 {
+            return self.dxl2_telemetry(servo_ids, true);
+        }
+        let ids = telemetry_ids(self.imu_board, servo_ids);
         self.sync_read_inner(SYNC_ADDRESS, SYNC_LENGTH, &ids, true)
+    }
+
+    fn dxl2_telemetry(
+        &mut self,
+        servo_ids: &[u8],
+        allow_partial: bool,
+    ) -> Result<BTreeMap<u8, Vec<u8>>> {
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(TELEMETRY_DEADLINE_MS);
+        let raw = match self.dxl2_read(124, 12, deadline) {
+            Ok(raw) => raw,
+            Err(problem) => {
+                // Totals describe one telemetry acquisition, including an
+                // IMU failure before any servo request was attempted.
+                self.last_sync.address = SYNC_ADDRESS;
+                self.last_sync.length = SYNC_LENGTH;
+                self.last_sync.elapsed_us = started.elapsed().as_micros() as u64;
+                return Err(problem);
+            }
+        };
+        let imu_trace = self.last_sync.clone();
+        let clean_imu = imu_trace.discarded == 0 && imu_trace.bad_checksums == 0;
+        let result = self.sync_read_window(
+            SYNC_ADDRESS,
+            SYNC_LENGTH,
+            servo_ids,
+            allow_partial,
+            Some((started, deadline)),
+            clean_imu,
+        );
+        self.last_sync.rx_bytes += imu_trace.rx_bytes;
+        self.last_sync.bad_checksums += imu_trace.bad_checksums;
+        self.last_sync.discarded += imu_trace.discarded;
+        let mut blocks = result?;
+        blocks.insert(IMU_ID, raw);
+        Ok(blocks)
+    }
+
+    pub fn decode_imu(&self, raw: &[u8]) -> Result<ImuSample> {
+        if self.imu_profile == BusImuProfile::Qinmo {
+            ImuSample::decode_qinmo(raw)
+        } else if self.imu_board == BusImuBoard::Dxl2 {
+            ImuSample::decode_dxl2(raw)
+        } else {
+            ImuSample::decode(raw)
+        }
     }
 
     pub fn feedback(&mut self, id: u8) -> Result<Feedback> {
@@ -525,6 +954,13 @@ impl Bus {
     }
 
     pub fn imu(&mut self) -> Result<ImuSample> {
+        if self.imu_profile == BusImuProfile::Qinmo {
+            return ImuSample::decode_qinmo(&self.read(IMU_ID, SYNC_ADDRESS, IMU_LENGTH)?);
+        }
+        if self.imu_board == BusImuBoard::Dxl2 {
+            let raw = self.dxl2_read(124, 12, Instant::now() + self.timeout)?;
+            return ImuSample::decode_dxl2(&raw);
+        }
         ImuSample::decode_diagnostic(&self.read(
             IMU_ID,
             IMU_DIAGNOSTIC_ADDRESS,
@@ -584,7 +1020,8 @@ pub fn sync_read_packet(address: u8, length: u8, ids: &[u8]) -> Result<Vec<u8>> 
         || ids.is_empty()
         || ids.len() > 251
         || ids.iter().any(|id| *id >= BROADCAST || !unique.insert(*id))
-        || (ids.contains(&IMU_ID) && ids[0] != IMU_ID)
+        // The IMU answers first (FT6) or last (imu_to_dxl), never between servos.
+        || (ids.contains(&IMU_ID) && ids[0] != IMU_ID && ids[ids.len() - 1] != IMU_ID)
     {
         return Err(error("invalid Feetech Sync Read address/length/ID order"));
     }
@@ -711,14 +1148,41 @@ impl ServoSample {
 /// for the fast block: FT6 status provides a conservative age bound instead.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImuSample {
+    reading: SensorReading,
     pub block: [u8; 12],
-    pub sequence: u32,
+    pub sequence: Option<u32>,
     pub age_ms: Option<u16>,
     pub age_upper_bound_ms: Option<u16>,
-    pub status: u8,
+    pub status: Option<u8>,
     pub ready: bool,
 }
 impl ImuSample {
+    pub fn reading(&self) -> SensorReading {
+        self.reading
+    }
+
+    pub fn decode_qinmo(raw: &[u8]) -> Result<Self> {
+        let block: [u8; 12] = raw
+            .get(..12)
+            .and_then(|v| v.try_into().ok())
+            .filter(|_| raw.len() == 15)
+            .ok_or_else(|| error("Qinmo IMU requires 56/15"))?;
+        if raw[13] & !1 != 0 || raw[14] != 0 {
+            return Err(error("unsupported Qinmo IMU status/reserved byte"));
+        }
+        let ready = raw[13] & 1 == 0;
+        let reading = crate::imu::qinmo_reading(&block, ready)
+            .ok_or_else(|| error("Qinmo IMU has an invalid quaternion"))?;
+        Ok(Self {
+            reading,
+            block,
+            sequence: Some(u32::from(raw[12])),
+            age_ms: None,
+            age_upper_bound_ms: None,
+            status: Some(raw[13]),
+            ready,
+        })
+    }
     pub fn decode(raw: &[u8]) -> Result<Self> {
         if raw.len() != usize::from(IMU_LENGTH) {
             return Err(IoError::ShortRead {
@@ -732,11 +1196,12 @@ impl ImuSample {
         }
         let ready = raw[13] & 0x07 == 0;
         Ok(Self {
+            reading: crate::imu::parse_block(raw[..12].try_into().unwrap()),
             block: raw[..12].try_into().unwrap(),
-            sequence: u32::from(raw[12]),
+            sequence: Some(u32::from(raw[12])),
             age_ms: None,
             age_upper_bound_ms: ready.then_some(IMU_FRESH_BOUND_MS),
-            status: raw[13],
+            status: Some(raw[13]),
             ready,
         })
     }
@@ -749,20 +1214,76 @@ impl ImuSample {
             return Err(error("unsupported Feetech IMU schema/flags"));
         }
         Ok(Self {
+            reading: crate::imu::parse_block(raw[..12].try_into().unwrap()),
             block: raw[..12].try_into().unwrap(),
-            sequence: u32::from_le_bytes(raw[12..16].try_into().unwrap()),
+            sequence: Some(u32::from_le_bytes(raw[12..16].try_into().unwrap())),
             age_ms: Some(u16::from_le_bytes([raw[16], raw[17]])),
             age_upper_bound_ms: Some(u16::from_le_bytes([raw[16], raw[17]])),
-            status: u8::from(raw[18] & 1 == 0),
+            status: Some(u8::from(raw[18] & 1 == 0)),
             ready: raw[18] & 1 != 0,
         })
     }
 
     pub fn is_fresh(&self, transaction_us: u64) -> bool {
         self.ready
-            && self
-                .age_upper_bound_ms
-                .is_some_and(|age| transaction_us.saturating_add(u64::from(age) * 1000) <= 50_000)
+            && if self.age_upper_bound_ms.is_none() {
+                transaction_us <= TELEMETRY_DEADLINE_MS * 1000
+            } else {
+                self.age_upper_bound_ms.is_some_and(|age| {
+                    transaction_us.saturating_add(u64::from(age) * 1000) <= 50_000
+                })
+            }
+    }
+
+    pub fn decode_dxl2(raw: &[u8]) -> Result<Self> {
+        let block: [u8; 12] = raw
+            .try_into()
+            .map_err(|_| error("DXL2 SFLP IMU requires 124/12"))?;
+        let ready = crate::imu::parse_block(&block).quat.is_some();
+        if !ready && block[6..12].iter().any(|b| *b != 0) {
+            return Err(error("DXL2 IMU200 has an invalid SFLP quaternion"));
+        }
+        Ok(Self {
+            reading: crate::imu::parse_block(&block),
+            block,
+            sequence: None,
+            age_ms: None,
+            age_upper_bound_ms: None,
+            status: None,
+            ready,
+        })
+    }
+}
+
+/// The same freshness evidence gates commissioning and motion. DXL2 has no
+/// counter: only actual repeated bytes can establish a frozen stream.
+#[derive(Default)]
+pub struct BusImuFreshness {
+    last_sequence: Option<u32>,
+    last_block: Option<[u8; 12]>,
+    pub stale: ImuStale,
+}
+impl BusImuFreshness {
+    pub fn check(&mut self, sample: &ImuSample, transaction_us: u64) -> Result<()> {
+        let duplicate = match sample.sequence {
+            Some(seq) => self.last_sequence == Some(seq),
+            None => self.last_block == Some(sample.block),
+        };
+        self.stale.run = if duplicate {
+            self.stale.run.saturating_add(1)
+        } else {
+            0
+        };
+        self.stale.total = self.stale.total.saturating_add(u64::from(duplicate));
+        self.last_sequence = sample.sequence;
+        self.last_block = Some(sample.block);
+        let limit = if sample.sequence.is_some() { 3 } else { 24 };
+        if !sample.is_fresh(transaction_us) || self.stale.run >= limit {
+            return Err(error(
+                "IMU not ready or stale (invalid reading / Feetech counter / DXL2 repeated core bytes)",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -775,6 +1296,13 @@ pub struct Calibration {
     pub motion_enabled: bool,
     #[serde(default)]
     pub imu_mount_verified: bool,
+    /// The wire format under which this bus mounting was verified. Legacy
+    /// files describe Feetech; they cannot silently authorize a DXL2 mount.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imu_bus_protocol: Option<BusImuProtocol>,
+    /// Missing in older files means the legacy units and quaternion readiness semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imu_bus_profile: Option<BusImuProfile>,
     /// Sensor-to-trunk rotation [w, x, y, z], not a heading reset.
     #[serde(default = "default_imu_mount")]
     pub imu_mount_quat: [f64; 4],
@@ -878,6 +1406,36 @@ impl JointCalibration {
     }
 }
 impl Calibration {
+    pub fn validate_bus_mount_for(
+        &self,
+        protocol: BusImuProtocol,
+        profile: BusImuProfile,
+    ) -> Result<()> {
+        self.validate_bus_mount(protocol)?;
+        let bound = self.imu_bus_profile.unwrap_or_default();
+        if bound != profile
+            || (profile == BusImuProfile::Qinmo && protocol != BusImuProtocol::Feetech)
+        {
+            return Err(error(format!(
+                "IMU mounting was verified for profile {}, configured {}; redo IMU mounting calibration before motion",
+                bound.label(),
+                profile.label()
+            )));
+        }
+        Ok(())
+    }
+    pub fn validate_bus_mount(&self, protocol: BusImuProtocol) -> Result<()> {
+        let bound = self.imu_bus_protocol.unwrap_or(BusImuProtocol::Feetech);
+        if bound == BusImuProtocol::Auto || protocol != bound {
+            return Err(error(format!(
+                "IMU mounting was verified for {}, detected {}; redo IMU mounting calibration before motion",
+                bound.label(),
+                protocol.label()
+            )));
+        }
+        Ok(())
+    }
+
     fn feedback_speed_scale(&self) -> Option<f64> {
         Some(crate::hd1910::SPEED_RAD_S_PER_COUNT)
     }
@@ -886,6 +1444,8 @@ impl Calibration {
         Self {
             motion_enabled: false,
             imu_mount_verified: false,
+            imu_bus_protocol: None,
+            imu_bus_profile: None,
             imu_mount_quat: default_imu_mount(),
             joints: JOINT_NAMES
                 .iter()
@@ -932,6 +1492,11 @@ impl Calibration {
         }
     }
     pub fn validate(&self) -> Result<()> {
+        if self.imu_bus_protocol == Some(BusImuProtocol::Auto) {
+            return Err(error(
+                "a verified IMU binding must name feetech or dxl2, not auto",
+            ));
+        }
         for kind in TrunkImuKind::ALL {
             let mount_norm = self.imu_mount(kind).quat.iter().map(|v| v * v).sum::<f64>();
             if !mount_norm.is_finite() || (mount_norm - 1.0).abs() > 1e-6 {
@@ -1176,6 +1741,10 @@ impl TelemetryTotals {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct FeetechDiagnostics {
+    pub servo_observations: observations::Snapshot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub imu_observation: Option<imu_observation::Snapshot>,
+    pub configured_imu_profile: &'static str,
     pub backend: &'static str,
     pub read_timing_revision: &'static str,
     pub motion_enabled: bool,
@@ -1200,6 +1769,8 @@ pub struct FeetechDiagnostics {
     /// Which trunk IMU this is: a [`TrunkImuKind`] label. `imu_mount_verified`, `imu_ready`
     /// and the `imu_*` figures above are that source's.
     pub imu_source: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub imu_bus: Option<BusImuInfo>,
     /// A host-read IMU's reader, in its own words. Absent for the bus board.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub imu_reader: Option<HostImuHealth>,
@@ -1256,9 +1827,8 @@ enum TrunkImu {
     /// The FT6 board, ID 200, answering in the servos' own Sync Read. Exactly the state
     /// `FeetechIo` kept before there was any other source.
     Bus {
-        decoder: SflpDecoder,
-        last_sequence: Option<u32>,
-        stale: ImuStale,
+        decoder: TrunkFrame,
+        freshness: BusImuFreshness,
         latest_age_ms: Option<u16>,
         latest_age_upper_bound_ms: Option<u16>,
         latest_status: Option<u8>,
@@ -1292,13 +1862,13 @@ impl TrunkImu {
     }
     fn stale(&self) -> ImuStale {
         match self {
-            Self::Bus { stale, .. } => *stale,
+            Self::Bus { freshness, .. } => freshness.stale,
             Self::Host { gate, .. } => gate.stale(),
         }
     }
     fn sequence(&self) -> Option<u32> {
         match self {
-            Self::Bus { last_sequence, .. } => *last_sequence,
+            Self::Bus { freshness, .. } => freshness.last_sequence,
             Self::Host { gate, .. } => gate.sequence(),
         }
     }
@@ -1337,6 +1907,7 @@ impl TrunkImu {
 /// is fixed when it opens.
 pub struct FeetechIo {
     pub bus: Bus,
+    imu_observation: Option<imu_observation::Snapshot>,
     calibration: Calibration,
     imu: TrunkImu,
     latest_ready: bool,
@@ -1375,11 +1946,7 @@ impl FeetechIo {
     }
     pub fn from_bus(mut bus: Bus, calibration: Calibration) -> Result<Self> {
         calibration.validate()?;
-        if bus.read(IMU_ID, 0, 5)? != IMU_IDENTITY {
-            return Err(error(
-                "ID 200 requires FT6 firmware (06 00 00 00 f2); flash FT6 before enabling IMU",
-            ));
-        }
+        bus.identify_imu()?;
         Self::for_startup(bus, calibration)?.adopt_torque_state()
     }
     /// The servos on `bus`; the trunk IMU from `reader`, under that source's own mount. ID 200
@@ -1415,9 +1982,8 @@ impl FeetechIo {
     pub fn for_startup(bus: Bus, calibration: Calibration) -> Result<Self> {
         calibration.validate()?;
         let imu = TrunkImu::Bus {
-            decoder: SflpDecoder::new(calibration.imu_mount_quat),
-            last_sequence: None,
-            stale: ImuStale::default(),
+            decoder: TrunkFrame::new(calibration.imu_mount_quat),
+            freshness: BusImuFreshness::default(),
             latest_age_ms: None,
             latest_age_upper_bound_ms: None,
             latest_status: None,
@@ -1450,6 +2016,7 @@ impl FeetechIo {
     fn with_trunk_imu(bus: Bus, calibration: Calibration, imu: TrunkImu) -> Self {
         Self {
             bus,
+            imu_observation: None,
             calibration,
             imu,
             latest_ready: false,
@@ -1500,13 +2067,15 @@ impl FeetechIo {
         self.bus.verify_torque(&ids, false)?;
         self.torque_enabled = false;
         self.torque_state_confirmed = Some(false);
-        if matches!(self.imu, TrunkImu::Bus { .. }) && self.bus.read(IMU_ID, 0, 5)? != IMU_IDENTITY
-        {
-            return Err(error(
-                "ID 200 requires FT6 firmware (06 00 00 00 f2); flash FT6 before enabling IMU",
-            ));
+        if matches!(self.imu, TrunkImu::Bus { .. }) {
+            self.bus.identify_imu()?;
         }
         Ok(())
+    }
+    pub fn observe_startup_imu(&mut self) {
+        if matches!(self.imu, TrunkImu::Bus { .. }) {
+            self.imu_observation = Some(self.bus.observe_startup_imu());
+        }
     }
     fn ids(&self) -> Vec<u8> {
         self.calibration
@@ -1514,6 +2083,41 @@ impl FeetechIo {
             .iter()
             .map(|joint| joint.id)
             .collect()
+    }
+
+    fn diagnostic_metadata(&self) -> crate::feetech_snapshot::Metadata {
+        crate::feetech_snapshot::Metadata {
+            configured_imu_profile: self.bus.imu_profile.label(),
+            backend: "feetech_ft6",
+            read_timing_revision: READ_TIMING_REVISION,
+            motion_enabled: self.calibration.motion_enabled,
+            calibration_complete: self.calibration.joints.iter().all(|j| j.calibrated),
+            imu_mount_verified: self.imu_mount_verified(),
+            imu_source: self.imu.kind().label(),
+            imu_bus: self.bus.imu_info(),
+            velocity_source: crate::hd1910::VELOCITY_SOURCE,
+            velocity_rad_s_per_count: self.calibration.feedback_speed_scale(),
+            current_available: self.calibration.units_verified,
+            joints: self.calibration.joints.iter()
+                .map(|j| crate::feetech_snapshot::JointMetadata {
+                    name: j.name.clone(), id: j.id, calibrated: j.calibrated,
+                }).collect(),
+        }
+    }
+
+    fn snapshot_metadata(&self) -> std::sync::Arc<crate::feetech_snapshot::Metadata> {
+        self.snapshot_metadata
+            .get_or_init(|| std::sync::Arc::new(self.diagnostic_metadata()))
+            .clone()
+    }
+
+    fn imu_mount_verified(&self) -> bool {
+        self.calibration.imu_mount(self.imu.kind()).verified
+            && (self.imu.kind() != TrunkImuKind::Bus
+                || self
+                    .calibration
+                    .validate_bus_mount_for(self.bus.imu_board.protocol(), self.bus.imu_profile)
+                    .is_ok())
     }
     fn require_fresh_sample(&self) -> Result<()> {
         if self
@@ -1565,29 +2169,15 @@ impl FeetechIo {
         let mut blocks = result?;
         let (imu, raw_imu, host_age) = match &mut self.imu {
             TrunkImu::Bus {
-                decoder,
-                last_sequence,
-                stale,
-                ..
+                decoder, freshness, ..
             } => {
-                let raw_imu = ImuSample::decode(
+                let raw_imu = self.bus.decode_imu(
                     &blocks
                         .remove(&IMU_ID)
                         .ok_or_else(|| error("Feetech Sync Read omitted IMU ID 200"))?,
                 )?;
-                if *last_sequence == Some(raw_imu.sequence) {
-                    stale.total = stale.total.saturating_add(1);
-                    stale.run = stale.run.saturating_add(1);
-                } else {
-                    stale.run = 0;
-                }
-                *last_sequence = Some(raw_imu.sequence);
-                if !raw_imu.is_fresh(self.bus.last_sync.elapsed_us) || stale.run >= 3 {
-                    return Err(error(
-                        "Feetech IMU not ready or stale (>50 ms / 3 repeated reads)",
-                    ));
-                }
-                (decoder.decode(&raw_imu.block), Some(raw_imu), None)
+                freshness.check(&raw_imu, self.bus.last_sync.elapsed_us)?;
+                (decoder.push(raw_imu.reading()), Some(raw_imu), None)
             }
             // Taken after the servos' transaction, so it is as fresh as this tick can have.
             TrunkImu::Host {
@@ -1713,7 +2303,7 @@ impl FeetechIo {
             && !raw_imu.is_fresh(started.elapsed().as_micros() as u64)
         {
             return Err(error(
-                "Feetech telemetry cycle too slow; IMU sample now older than 50 ms",
+                "telemetry cycle exceeded the IMU freshness window",
             ));
         }
         self.hd1910.delay_velocity(started, &mut out, &fresh);
@@ -1747,7 +2337,7 @@ impl FeetechIo {
                 if let Some(raw_imu) = raw_imu {
                     *latest_age_ms = raw_imu.age_ms;
                     *latest_age_upper_bound_ms = raw_imu.age_upper_bound_ms;
-                    *latest_status = Some(raw_imu.status);
+                    *latest_status = raw_imu.status;
                 }
             }
             TrunkImu::Host { latest_age_ms, .. } => {
@@ -1837,6 +2427,10 @@ impl RobotIo for FeetechIo {
         let ids = self.ids();
         let previously_off = self.torque_state_confirmed == Some(false);
         if on {
+            if matches!(self.imu, TrunkImu::Bus { .. }) {
+                self.calibration
+                    .validate_bus_mount_for(self.bus.imu_board.protocol(), self.bus.imu_profile)?;
+            }
             self.calibration.validate_motion_for(self.imu.kind())?;
             self.require_fresh_sample()?;
             if !self.imu_ready() {
@@ -1926,7 +2520,7 @@ impl RobotIo for FeetechIo {
                             .as_ref()
                             .is_some_and(|old| Some(old.at) == self.latest_sample_at)
                 }),
-            imu_mount_verified: self.calibration.imu_mount(self.imu.kind()).verified,
+            imu_mount_verified: self.imu_mount_verified(),
             imu_ready: self.imu_ready(),
             torque_state_confirmed: self.torque_state_confirmed,
             joints_held: (0..self.latest_joints.len()).any(|i| self.joint_holding(i, now)),
@@ -1956,11 +2550,14 @@ impl RobotIo for FeetechIo {
         }
         let (imu_age_ms, imu_age_upper_bound_ms, imu_status) = self.imu.latest();
         Some(FeetechDiagnostics {
+            imu_observation: self.imu_observation.clone(),
+            servo_observations: self.bus.observations.snapshot(std::sync::Arc::new(self.diagnostic_metadata()), now),
+            configured_imu_profile: self.bus.imu_profile.label(),
             backend: "feetech_ft6",
             read_timing_revision: READ_TIMING_REVISION,
             motion_enabled: self.calibration.motion_enabled,
             calibration_complete: self.calibration.joints.iter().all(|j| j.calibrated),
-            imu_mount_verified: self.calibration.imu_mount(self.imu.kind()).verified,
+            imu_mount_verified: self.imu_mount_verified(),
             torque_enabled: self.torque_enabled,
             torque_state_confirmed: self.torque_state_confirmed,
             gain_mode: self.gain_mode(),
@@ -1976,6 +2573,7 @@ impl RobotIo for FeetechIo {
             imu_age_upper_bound_ms,
             imu_status,
             imu_source: self.imu.kind().label(),
+            imu_bus: self.bus.imu_info(),
             imu_reader: self.imu.reader_health(),
             command_clamps_total: self.command_clamps_total,
             partial_samples_total: self.partial_samples_total,
@@ -1995,32 +2593,7 @@ impl RobotIo for FeetechIo {
 
     fn feetech_snapshot(&self) -> Option<crate::feetech_snapshot::Snapshot> {
         use crate::feetech_snapshot as snapshot;
-        let metadata = self
-            .snapshot_metadata
-            .get_or_init(|| {
-                std::sync::Arc::new(snapshot::Metadata {
-                    backend: "feetech_ft6",
-                    read_timing_revision: READ_TIMING_REVISION,
-                    motion_enabled: self.calibration.motion_enabled,
-                    calibration_complete: self.calibration.joints.iter().all(|j| j.calibrated),
-                    imu_mount_verified: self.calibration.imu_mount(self.imu.kind()).verified,
-                    imu_source: self.imu.kind().label(),
-                    velocity_source: crate::hd1910::VELOCITY_SOURCE,
-                    velocity_rad_s_per_count: self.calibration.feedback_speed_scale(),
-                    current_available: self.calibration.units_verified,
-                    joints: self
-                        .calibration
-                        .joints
-                        .iter()
-                        .map(|j| snapshot::JointMetadata {
-                            name: j.name.clone(),
-                            id: j.id,
-                            calibrated: j.calibrated,
-                        })
-                        .collect(),
-                })
-            })
-            .clone();
+        let metadata = self.snapshot_metadata();
         let now = Instant::now();
         let mut joints = snapshot::Samples::default();
         let mut stale_joint_ids = snapshot::Samples::default();
@@ -2069,6 +2642,8 @@ impl RobotIo for FeetechIo {
         Some(snapshot::Snapshot {
             metadata: metadata.clone(),
             dynamic: snapshot::Dynamic {
+                imu_observation: self.imu_observation.clone(),
+                servo_observations: self.bus.observations.snapshot(metadata.clone(), now),
                 torque_enabled: self.torque_enabled,
                 torque_state_confirmed: self.torque_state_confirmed,
                 gain_mode: self.gain_mode(),
@@ -2106,6 +2681,138 @@ impl RobotIo for FeetechIo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qinmo_profile_binding_requires_a_new_verification_even_on_feetech() {
+        let cal = Calibration::commissioning(crate::model::JOINT_IDS);
+        // Top-level keys must precede the joint table array.
+        let text = format!(
+            "imu_bus_profile = 'qinmo'\n{}",
+            toml::to_string(&cal).unwrap()
+        );
+        let parsed = toml::from_str::<Calibration>(&text);
+        assert!(
+            parsed.is_ok(),
+            "explicit calibration profile must deserialize: {parsed:?}"
+        );
+        let bound = parsed.unwrap();
+        assert!(
+            bound
+                .validate_bus_mount_for(BusImuProtocol::Feetech, BusImuProfile::Qinmo)
+                .is_ok()
+        );
+        assert!(
+            bound
+                .validate_bus_mount_for(BusImuProtocol::Feetech, BusImuProfile::Legacy)
+                .is_err()
+        );
+        assert!(
+            cal.validate_bus_mount_for(BusImuProtocol::Feetech, BusImuProfile::Qinmo)
+                .is_err()
+        );
+        assert!(
+            cal.validate_bus_mount_for(BusImuProtocol::Feetech, BusImuProfile::Legacy)
+                .is_ok()
+        );
+        assert!(
+            bound
+                .validate_bus_mount_for(BusImuProtocol::Dxl2, BusImuProfile::Qinmo)
+                .is_err()
+        );
+        let saved = toml::to_string(&bound).unwrap();
+        let restored: Calibration = toml::from_str(&saved).unwrap();
+        assert_eq!(restored.imu_bus_profile, Some(BusImuProfile::Qinmo));
+    }
+
+    #[test]
+    fn qinmo_core_units_ready_identity_and_invalid_frames() {
+        let mut raw = [0u8; 15];
+        raw[..2].copy_from_slice(&1640i16.to_le_bytes());
+        raw[2..4].copy_from_slice(&(-1640i16).to_le_bytes());
+        let sample = ImuSample::decode_qinmo(&raw).unwrap();
+        let reading = sample.reading();
+        assert!((reading.gyro[0].to_degrees() - 100.0).abs() < 1e-10);
+        assert!((reading.gyro[1].to_degrees() + 100.0).abs() < 1e-10);
+        assert_eq!(reading.quat, Some([1.0, 0.0, 0.0, 0.0]));
+        assert_eq!(sample.age_upper_bound_ms, None);
+        let legacy = ImuSample::decode(&raw).unwrap().reading();
+        assert!((legacy.gyro[0].to_degrees() - 28.7).abs() < 1e-10);
+        assert!(legacy.quat.is_none());
+        let mut frame = TrunkFrame::new([1.0, 0.0, 0.0, 0.0]);
+        for _ in 0..24 {
+            frame.push(reading);
+        }
+        assert!(!frame.ready());
+        frame.push(reading);
+        assert!(frame.ready());
+        raw[13] = 1;
+        let initializing = ImuSample::decode_qinmo(&raw).unwrap();
+        assert!(!initializing.ready);
+        assert!(initializing.reading().quat.is_none());
+        assert!(!initializing.is_fresh(0));
+        for status in [2, 4, 8, 0x80] {
+            raw[13] = status;
+            assert!(ImuSample::decode_qinmo(&raw).is_err());
+        }
+        raw[13] = 0;
+        raw[14] = 1;
+        assert!(ImuSample::decode_qinmo(&raw).is_err());
+        raw[14] = 0;
+        for packed in [0x7c00u16, 0x7e00, 0x4000] {
+            raw[6..8].copy_from_slice(&packed.to_le_bytes());
+            assert!(ImuSample::decode_qinmo(&raw).is_err());
+        }
+        assert!(ImuSample::decode_qinmo(&raw[..12]).is_err());
+    }
+
+    #[test]
+    fn qinmo_freshness_uses_counter_wrap_transaction_and_duplicate_guard() {
+        let mut gate = BusImuFreshness::default();
+        let mut raw = [0u8; 15];
+        for seq in [254, 255, 0, 1] {
+            raw[12] = seq;
+            let sample = ImuSample::decode_qinmo(&raw).unwrap();
+            assert!(gate.check(&sample, 10_000).is_ok());
+        }
+        let sample = ImuSample::decode_qinmo(&raw).unwrap();
+        assert!(gate.check(&sample, 10_000).is_ok());
+        assert!(gate.check(&sample, 10_000).is_ok());
+        assert!(gate.check(&sample, 10_000).is_err());
+        raw[12] = 2;
+        let sample = ImuSample::decode_qinmo(&raw).unwrap();
+        assert!(gate.check(&sample, 20_000).is_ok());
+        raw[12] = 3;
+        assert!(
+            gate.check(&ImuSample::decode_qinmo(&raw).unwrap(), 20_001)
+                .is_err()
+        );
+    }
+
+    /// ID 200 is kissqy's FT6 board or our own imu_to_dxl (0.2.0 and 1.0.0 report model 0x4D44);
+    /// anything else, including a big-endian flag, is refused.
+    #[test]
+    fn bus_imu_board_is_known_by_its_identity_bytes() {
+        assert_eq!(BusImuBoard::from_identity(&IMU_IDENTITY), Some(BusImuBoard::Ft6));
+        assert_eq!(BusImuBoard::from_identity(&[0, 2, 0, 0x44, 0x4d]), Some(BusImuBoard::ImuToDxl));
+        assert_eq!(BusImuBoard::from_identity(&[1, 0, 0, 0x44, 0x4d]), Some(BusImuBoard::ImuToDxl));
+        for raw in [&[1u8, 0, 1, 0x44, 0x4d][..], &[6, 0, 0, 0, 0xf3], &[0, 0, 0, 0, 0], &[6, 0, 0, 0]] {
+            assert_eq!(BusImuBoard::from_identity(raw), None, "{raw:02x?}");
+        }
+        assert!(unknown_imu(&[1, 2, 3, 4, 5]).to_string().contains("[01, 02, 03, 04, 05]"));
+    }
+
+    /// FT6 answers first; imu_to_dxl last, after hearing the servo before it (first in the list,
+    /// the next Feetech servo talks over it). Between servos is never sent.
+    #[test]
+    fn the_imu_is_first_for_ft6_and_last_for_imu_to_dxl() {
+        let servos = [10, 11, 12];
+        assert_eq!(super::telemetry_ids(BusImuBoard::Ft6, &servos), vec![IMU_ID, 10, 11, 12]);
+        assert_eq!(super::telemetry_ids(BusImuBoard::ImuToDxl, &servos), vec![10, 11, 12, IMU_ID]);
+        assert!(sync_read_packet(SYNC_ADDRESS, SYNC_LENGTH, &[IMU_ID, 10, 11]).is_ok());
+        assert!(sync_read_packet(SYNC_ADDRESS, SYNC_LENGTH, &[10, 11, IMU_ID]).is_ok());
+        assert!(sync_read_packet(SYNC_ADDRESS, SYNC_LENGTH, &[10, IMU_ID, 11]).is_err());
+        assert!(sync_read_packet(SYNC_ADDRESS, SYNC_LENGTH, &[IMU_ID]).is_ok());
+    }
 
     #[test]
     fn position_feedback_and_angles_keep_the_unmodified_signed_coordinate() {
@@ -2248,6 +2955,15 @@ mod tests {
                 if master.read_exact(&mut header).is_err() {
                     continue;
                 }
+                if header == crate::dxl2::HEADER {
+                    // This peer is a Feetech-only board. Consume and ignore
+                    // a read-only DXL2 fallback probe, just as real firmware does.
+                    let mut rest = [0u8; 3];
+                    master.read_exact(&mut rest).unwrap();
+                    let mut body = vec![0; usize::from(u16::from_le_bytes([rest[1], rest[2]]))];
+                    master.read_exact(&mut body).unwrap();
+                    continue;
+                }
                 let mut body = vec![0u8; header[3] as usize];
                 master.read_exact(&mut body).unwrap();
                 let address = body[1];
@@ -2316,6 +3032,12 @@ mod tests {
             timeout: Duration::from_millis(30),
             read_only: false,
             last_sync: SyncTrace::default(),
+            imu_board: BusImuBoard::Ft6,
+            imu_protocol: BusImuProtocol::Auto,
+            imu_profile: BusImuProfile::Legacy,
+            imu_identity: None,
+            observations: observations::Observations::default(),
+            last_imu_response_at: None,
         };
         let mut io = FeetechIo::from_bus(bus, calibrated()).unwrap();
         for _ in 0..30 {
@@ -2409,6 +3131,12 @@ mod tests {
                 timeout: Duration::from_millis(30),
                 read_only: false,
                 last_sync: SyncTrace::default(),
+                imu_board: BusImuBoard::Ft6,
+                imu_protocol: BusImuProtocol::Auto,
+                imu_profile: BusImuProfile::Legacy,
+                imu_identity: None,
+                observations: observations::Observations::default(),
+                last_imu_response_at: None,
             };
             let result = bus.telemetry(&crate::model::JOINT_IDS);
             finish.send(()).unwrap();
@@ -2459,6 +3187,12 @@ mod tests {
             timeout: Duration::from_millis(30),
             read_only: false,
             last_sync: SyncTrace::default(),
+            imu_board: BusImuBoard::Ft6,
+            imu_protocol: BusImuProtocol::Auto,
+            imu_profile: BusImuProfile::Legacy,
+            imu_identity: None,
+            observations: observations::Observations::default(),
+            last_imu_response_at: None,
         };
         bus.verify_torque(&ids, false).unwrap();
         assert!(bus.last_sync.missing_ids.is_empty());
@@ -2608,7 +3342,7 @@ mod tests {
         for sequence in [254, 255, 0, 1] {
             raw[12] = sequence;
             let sample = ImuSample::decode(&raw).unwrap();
-            assert_eq!(sample.sequence, u32::from(sequence));
+            assert_eq!(sample.sequence, Some(u32::from(sequence)));
             assert!(sample.age_ms.is_none());
             assert_eq!(sample.age_upper_bound_ms, Some(30));
             assert!(sample.is_fresh(15_000));
@@ -2632,7 +3366,7 @@ mod tests {
         diagnostic[18] = 1;
         diagnostic[19] = 1;
         let sample = ImuSample::decode_diagnostic(&diagnostic).unwrap();
-        assert_eq!(sample.sequence, u32::MAX);
+        assert_eq!(sample.sequence, Some(u32::MAX));
         assert_eq!(sample.age_ms, Some(9));
         assert!(sample.is_fresh(15_000));
         assert!(ImuSample::decode_diagnostic(&raw).is_err());
@@ -2954,6 +3688,8 @@ mod hd1910_transport_tests {
         checksum_id: Option<u8>,
         status_id: Option<u8>,
         imu_stale: bool,
+        imu_bad_quat: bool,
+        imu_reserved: u8,
         identity_missing_reads: usize,
         reject_torque_off_id: Option<u8>,
     }
@@ -3008,6 +3744,18 @@ mod hd1910_transport_tests {
             while !d.load(Ordering::Relaxed) {
                 let mut header = [0u8; 4];
                 if master.read_exact(&mut header).is_err() {
+                    continue;
+                }
+                if header == crate::dxl2::HEADER {
+                    // A Feetech-only peer ignores the bounded fallback probe.
+                    let mut rest = [0u8; 3];
+                    master.read_exact(&mut rest).unwrap();
+                    let mut dxl_body = vec![0; usize::from(u16::from_le_bytes([rest[1], rest[2]]))];
+                    master.read_exact(&mut dxl_body).unwrap();
+                    frame_log
+                        .lock()
+                        .unwrap()
+                        .push([&header[..], &rest[..], &dxl_body[..]].concat());
                     continue;
                 }
                 let mut body = vec![0u8; header[3] as usize];
@@ -3071,6 +3819,10 @@ mod hd1910_transport_tests {
                     }
                     if id == IMU_ID && addr == 56 {
                         data[7] = 0x30;
+                        if fault.imu_bad_quat {
+                            data[6..12].fill(0xff);
+                        }
+                        data[14] = fault.imu_reserved;
                         data[12] = seq;
                         if fault.imu_stale {
                             data[13] = 1;
@@ -3096,6 +3848,12 @@ mod hd1910_transport_tests {
                 timeout: Duration::from_millis(30),
                 read_only: false,
                 last_sync: SyncTrace::default(),
+                imu_board: BusImuBoard::Ft6,
+                imu_protocol: BusImuProtocol::Auto,
+                imu_profile: BusImuProfile::Legacy,
+                imu_identity: None,
+                observations: observations::Observations::default(),
+                last_imu_response_at: None,
             },
             Emulator {
                 faults,
@@ -3119,6 +3877,91 @@ mod hd1910_transport_tests {
         c.motion_enabled = true;
         c.imu_mount_verified = true;
         c
+    }
+
+    #[test]
+    fn independent_imu_observation_keeps_identity_when_sample_does_not_reply() {
+        let (mut bus, device) = emulator(false);
+        device.faults.lock().unwrap().missing = vec![IMU_ID];
+        let observation = bus.observe_startup_imu();
+        assert!(observation.responding);
+        assert_eq!(observation.info.as_ref().unwrap().board, "ft6");
+        assert_eq!(observation.sample_valid, None);
+        assert!(observation.error.is_some());
+        assert!(bus.imu_info().is_none());
+        assert!(device.writes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn independent_imu_observation_flags_and_age_never_become_control_samples() {
+        for (bad_quat, stale, reserved, valid) in [
+            (false, false, 0, true),
+            (true, false, 0, false),
+            (false, true, 0, true),
+            (false, false, 1, false),
+        ] {
+            let (bus, device) = emulator(false);
+            {
+                let mut faults = device.faults.lock().unwrap();
+                faults.imu_bad_quat = bad_quat;
+                faults.imu_stale = stale;
+                faults.imu_reserved = reserved;
+            }
+            let mut io = FeetechIo::for_startup(bus, calibration()).unwrap();
+            io.observe_startup_imu();
+            let snapshot = io.feetech_snapshot().unwrap();
+            let first = serde_json::to_value(&snapshot.dynamic).unwrap();
+            let observation = &first["imu_observation"];
+            assert_eq!(observation["responding"], true);
+            assert_eq!(observation["info"]["board"], "ft6");
+            assert_eq!(observation["sample_valid"], valid);
+            assert_ne!(
+                observation["sample_fresh"], true,
+                "one sample cannot prove progression"
+            );
+            if reserved == 0 {
+                assert_eq!(observation["sensor_ready"], !stale);
+            }
+            assert!(first["sample_age_ms"].is_null());
+            assert_eq!(first["imu_ready"], false);
+            assert_eq!(first["imu_sequence"], serde_json::Value::Null);
+            assert!(snapshot.metadata.imu_bus.is_none());
+            assert!(!io.command_enabled);
+            assert!(io.torque_state_confirmed.is_none());
+            std::thread::sleep(Duration::from_millis(15));
+            let aged = serde_json::to_value(&snapshot.dynamic).unwrap();
+            assert!(aged["imu_observation"]["age_ms"].as_u64().unwrap() >= 10);
+            assert!(device.writes.lock().unwrap().is_empty());
+            assert!(
+                device
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|(inst, _, ids)| *inst == READ && ids == &[IMU_ID])
+            );
+        }
+    }
+
+    #[test]
+    fn independent_imu_observation_does_not_probe_bus_for_a_host_source() {
+        let (bus, device) = emulator(false);
+        let mut io = FeetechIo::for_startup_with_imu(
+            bus,
+            calibration(),
+            Box::new(FreshHost::new(TrunkImuKind::Lsm6dsv16x)),
+        )
+        .unwrap();
+        io.observe_startup_imu();
+        assert!(
+            io.feetech_snapshot()
+                .unwrap()
+                .dynamic
+                .imu_observation
+                .is_none()
+        );
+        assert!(device.requests.lock().unwrap().is_empty());
+        assert!(device.writes.lock().unwrap().is_empty());
     }
 
     /// A module read by the host that always has a fresh, settled sample: a new sequence on
@@ -3194,6 +4037,137 @@ mod hd1910_transport_tests {
             },
         );
         c
+    }
+
+    #[test]
+    fn startup_servo_observations_survive_missing_host_imu_without_control_data() {
+        struct AbsentHost;
+        impl HostImu for AbsentHost {
+            fn kind(&self) -> TrunkImuKind { TrunkImuKind::Lsm6dsv16x }
+            fn latest(&self) -> Option<crate::trunk_imu::HostImuSample> { None }
+            fn health(&self) -> HostImuHealth { HostImuHealth::default() }
+        }
+        let (bus, device) = emulator(false);
+        let mut io = FeetechIo::for_startup_with_imu(
+            bus, calibration_for(TrunkImuKind::Lsm6dsv16x), Box::new(AbsentHost),
+        ).unwrap();
+        assert!(io.read().unwrap_err().to_string().contains("IMU"));
+        let diagnostic = io.feetech_diagnostics().unwrap();
+        let wire = serde_json::to_value(&diagnostic).unwrap();
+        let observations = &wire["servo_observations"];
+        assert_eq!(observations["attempted"], true);
+        let rows = observations["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), NUM_JOINTS);
+        for (row, joint) in rows.iter().zip(&io.calibration.joints) {
+            assert_eq!(row["id"], joint.id);
+            assert_eq!(row["name"], joint.name);
+            assert_eq!(row["responding"], true);
+            assert!(row["check_age_ms"].is_u64());
+            assert!(row["reply_age_ms"].is_u64());
+            assert!(row["feedback_age_ms"].is_u64());
+            assert_eq!(row["position_raw"], 2048);
+            assert_eq!(row["volts"], 7.4);
+        }
+        let fixture: serde_json::Value = serde_json::from_str(include_str!("../tests/fixtures/startup-servo-observations.json")).unwrap();
+        let mut normalized = observations.clone();
+        normalized["age_ms"] = 0.into();
+        for row in normalized["rows"].as_array_mut().unwrap() {
+            for key in ["check_age_ms", "reply_age_ms", "feedback_age_ms"] { row[key] = 0.into(); }
+        }
+        assert_eq!(normalized, fixture["native"]["servo_observations"]);
+        assert!(!diagnostic.all_joints_fresh);
+        assert!(diagnostic.joints.is_empty());
+        assert!(io.latest_sample_at.is_none());
+        assert!(io.joint_feedback.iter().all(Option::is_none));
+        assert!(io.set_torque(true).is_err());
+        assert!(device.writes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn startup_servo_observations_preserve_partial_replies_and_reject_bad_checksums() {
+        let (bus, device) = emulator(false);
+        let mut io = FeetechIo::for_startup(bus, calibration()).unwrap();
+        device.faults.lock().unwrap().missing = vec![IMU_ID, 22];
+        device.faults.lock().unwrap().checksum_id = Some(32);
+        assert!(io.read().is_err());
+        let wire = serde_json::to_value(io.feetech_diagnostics().unwrap()).unwrap();
+        assert_eq!(wire["servo_observations"]["attempted"], true);
+        let rows = wire["servo_observations"]["rows"].as_array().unwrap();
+        for row in rows {
+            let missing = [22, 32].contains(&(row["id"].as_u64().unwrap() as u8));
+            assert_eq!(row["responding"], !missing);
+            assert_eq!(row["reply_age_ms"].is_null(), missing);
+            assert_eq!(row["position_raw"].is_null(), missing);
+        }
+        assert!(io.latest_sample_at.is_none());
+        assert!(io.joint_feedback.iter().all(Option::is_none));
+        assert!(device.writes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn startup_servo_observations_torque_reply_proves_presence_without_feedback() {
+        let (bus, _device) = emulator(false);
+        let mut io = FeetechIo::for_startup(bus, calibration()).unwrap();
+        let before = serde_json::to_value(io.feetech_diagnostics().unwrap()).unwrap();
+        assert_eq!(before["servo_observations"]["attempted"], false);
+        assert!(before["servo_observations"]["rows"][0]["responding"].is_null());
+        io.bus.sync_read(40, 1, &io.ids()).unwrap();
+        let wire = serde_json::to_value(io.feetech_diagnostics().unwrap()).unwrap();
+        for row in wire["servo_observations"]["rows"].as_array().unwrap() {
+            assert_eq!(row["responding"], true);
+            assert!(row["reply_age_ms"].is_u64());
+            for key in ["feedback_age_ms", "position_raw", "speed_raw", "load_raw", "current_raw", "volts", "temperature_c"] {
+                assert!(row[key].is_null(), "{key} must not be fabricated from torque");
+            }
+        }
+        assert_eq!(io.torque_state_confirmed, None);
+        assert!(!io.feetech_control_status().unwrap().all_joints_fresh);
+    }
+
+    #[test]
+    fn startup_servo_observations_latest_miss_keeps_history_and_unrelated_reads_do_not_refresh_it() {
+        let (bus, device) = emulator(false);
+        let mut io = FeetechIo::for_startup(bus, calibration()).unwrap();
+        io.read().unwrap();
+        let control_at = io.latest_sample_at;
+        device.faults.lock().unwrap().missing = vec![IMU_ID, 22];
+        assert!(io.read().is_err());
+        let snapshot = io.feetech_snapshot().unwrap();
+        let observations = &snapshot.dynamic.servo_observations;
+        let before = serde_json::to_value(observations).unwrap();
+        let row = &before["rows"][index(22)];
+        assert_eq!(row["responding"], false);
+        assert!(row["check_age_ms"].is_u64());
+        assert!(row["reply_age_ms"].is_u64());
+        assert_eq!(row["position_raw"], 2048);
+        assert_eq!(io.latest_sample_at, control_at);
+        // A later read of another servo cannot make ID 22's checked/reply/feedback times new.
+        std::thread::sleep(Duration::from_millis(30));
+        io.bus.read(10, 40, 1).unwrap();
+        let after = serde_json::to_value(io.feetech_snapshot().unwrap().dynamic.servo_observations).unwrap();
+        let later = &after["rows"][index(22)];
+        for key in ["check_age_ms", "reply_age_ms", "feedback_age_ms"] {
+            assert!(later[key].as_u64().unwrap() >= row[key].as_u64().unwrap() + 20, "{key}");
+        }
+        assert_eq!(later["responding"], false);
+        let aged = serde_json::to_value(observations).unwrap();
+        assert!(aged["age_ms"].as_u64().unwrap() >= before["age_ms"].as_u64().unwrap() + 20);
+        assert_eq!(aged["rows"], before["rows"]);
+    }
+
+    #[test]
+    fn startup_servo_observations_survive_invalid_bus_imu_without_advancing_atomic_samples() {
+        let (bus, device) = emulator(false);
+        let mut io = FeetechIo::for_startup(bus, calibration()).unwrap();
+        device.faults.lock().unwrap().imu_stale = true;
+        assert!(io.read().is_err());
+        let wire = serde_json::to_value(io.feetech_diagnostics().unwrap()).unwrap();
+        assert!(wire["servo_observations"]["rows"].as_array().unwrap().iter().all(|row| row["responding"] == true && row["position_raw"] == 2048));
+        assert!(io.latest_sample_at.is_none());
+        assert!(io.joint_feedback.iter().all(Option::is_none));
+        assert!(!io.feetech_control_status().unwrap().all_joints_fresh);
+        assert!(!io.imu_ready());
+        assert!(device.writes.lock().unwrap().is_empty());
     }
 
     /// A module source puts nothing on the bus but the servos. Every request is a Sync Read of

@@ -666,9 +666,74 @@ address 0x4A or 0x4B) or `lsm6dsv16x` (the board's own chip on a breakout, 0x6A 
 must fail as a bus fault, not quietly start trusting whatever else is on I²C. `Params::load`
 refuses a module with the Dynamixel backend, and an address the chip cannot be strapped to.
 
-**Nothing about the bus board changes.** Its block is parsed as it always was — a golden test
-pins the decoder's output exactly — the `sync_read` is the same sixteen devices, and its mount
-stays in the calibration's top-level `imu_mount_quat` / `imu_mount_verified`.
+**The Feetech backend discovers the bus IMU once, before acquisition.**
+`[bus] imu_protocol` defaults to `"auto"`; `"feetech"` and `"dxl2"` force a wire format and
+never fall back. `[bus] imu_profile` defaults to `"legacy"`, preserving existing configurations.
+Under that profile, ID 200 is probed with read-only requests:
+the FT6 identity or the compatible IMU-to-DXL Feetech identity selects the existing 56/15
+block and its first/last reply ordering. If that format does not answer, DXL 2.0 identity
+and a decodable 124/12 SFLP block select DXL2. An unknown responding Feetech identity or
+an unsupported DXL2 layout is an error. Detection changes neither IDs, baud nor EEPROM;
+there is no per-tick rescan or silent protocol switch after failure. This is layout
+compatibility, not a claim to support every manufacturer, Euler/full-float firmware or ID.
+
+`imu_profile = "qinmo"` explicitly selects Qinmo IMU-DXL protocol 1.2 data semantics on the
+native fifteen-servo Feetech bus, ID 200 at 1 Mbps. With `imu_protocol = "auto"` or
+`"feetech"`, the first request is Feetech PING, followed by a bounded address-56/length-15
+READ. No identity READ at 0/5, DXL2 probe, protocol fallback or per-tick rescan occurs.
+`qinmo` plus `dxl2`, or plus Dynamixel servos, is refused at configuration validation. Qinmo
+locks to its first valid wire protocol until 20 seconds without valid communication;
+cross-protocol retries would defeat discovery. Its Wizard model 1030 / firmware 3 is a
+compatibility identity, not vendor authentication. Neither that identity, ID 200, packet
+shape, missing legacy identity nor gyro magnitude selects Qinmo automatically. Its data
+profile is one saved installation choice, made by the matching IMU webpage while the main
+program is stopped, followed by controlled reconnect. It is then used automatically at startup.
+
+Qinmo's signed little-endian gyro words are divided by 16.4 in degrees/s, then converted to
+rad/s. Binary16 XYZ reconstruct W >= 0 and normalize before the existing mount and median.
+Byte 12 is the real wrapping u8 sample counter; byte 13 permits only bit 0 (not ready), and
+byte 14 must be zero. Wrong lengths, reserved bits/bytes and nonfinite or grossly over-unit
+quaternions are rejected. Ready zero XYZ is identity; the legacy SFLP all-zero sentinel and
+17.5 mdps/LSB conversion remain unchanged. The 25-valid-quaternion ready gate still applies.
+The published reference is [Qinmo protocol 1.2 at commit 4644a9d](https://gitee.com/QinmoTech/IMU-DXL/blob/4644a9d19e07ac47f2c145c5e064c96683a5450b/docs/PROTOCOL.md);
+its repository provides documentation/debugger code, not manufacturer MCU firmware.
+
+**One owner and one telemetry deadline.** The same `Bus` reads a DXL2 IMU by unicast READ,
+then the fifteen Feetech servos by Sync Read, sharing one absolute 20 ms deadline. CRC errors,
+foreign packets or noise in either part disqualify a partial read. Legacy Feetech IMU telemetry
+keeps its original schema, sequence/status and age bound. Qinmo joins the fifteen servos in
+one 56/15 Sync Read, answering last. Its control and read-only telemetry retain the 20 ms
+transaction deadline; the manufacturer's 60 ms debugger timeout is not a control budget.
+Qinmo reports no sensor-age guarantee, so age and age-upper-bound diagnostics remain absent.
+Freshness requires an on-time host transaction, ready/valid data and actual sample-counter
+progression: the third consecutive duplicate is refused. This bounds frozen streams; it
+does not prove a sensor acquisition timestamp. DXL2 supplies only the real 12-byte
+SFLP core: no sensor sequence, status bits or sensor-side age are invented. Its host transaction
+must be on time; 25 identical core payloads are treated as frozen. Both paths retain the
+existing 25-valid-quaternion ready gate. Motion, commissioning and read-only sampling use
+the same profile-aware readings. Diagnostics include `configured_imu_profile` even before
+discovery succeeds, so the webpage can recover a wrong selection. A successful `imu_bus`
+report includes protocol, board/layout, profile, `gyro_dps_per_lsb`, identity and identification
+evidence. Qinmo uses `protocol="feetech"`, `board="qinmo"`, `profile="qinmo"`,
+`gyro_dps_per_lsb=1/16.4`, `identity=[]`, `identification="configured_profile"`.
+Legacy reports preserve existing semantic fields and add `profile="legacy"` and the 0.0175
+scale. Recognized FT6/imu_to_dxl identity uses `identification="legacy_identity"`; generic
+DXL2 identity plus a decodable SFLP block uses `identification="compatibility_layout"`.
+These labels do not authenticate a manufacturer.
+
+**A verified mount is bound to its bus protocol and data profile.** Its quaternion remains in the top-level
+`imu_mount_quat` / `imu_mount_verified`, with `imu_bus_protocol = "feetech"` or `"dxl2"`
+and `imu_bus_profile = "legacy"` or `"qinmo"` saved by successful `verify-imu`. Missing bindings
+mean Feetech and legacy. A mismatch keeps the daemon accessible and limp, but refuses motion
+startup and torque-on; use commissioning to redo the IMU mounting
+calibration. A physical mounting or module change also requires recalibration, even when
+the protocol is unchanged. Calibration status preserves the raw persisted document, while
+top-level `imu_mount={quat,verified}` and `imu_mount_verified` report the effective binding;
+`imu_binding_validation` explains a mismatch and also appears as `motion_validation`.
+Before discovery the effective bus mount is unverified. I²C sources keep their existing
+separate calibration slots. The configuration and metadata are additive; IPC API_VERSION
+is 41 with the independent startup observations below; version skew itself is never a blanket refusal. A Qinmo selection requires
+a matching runtime binary. [Selection and verification guide](../robot/qinmo-imu.md).
 
 **A module is read by a thread, not by the tick.** `robotd/src/trunk_imu_i2c.rs` owns the
 i2c-dev file and runs one state machine per chip on the codecs in `duck-control`
@@ -687,6 +752,57 @@ device fault is five failed transfers in a row, or nothing new published for the
 between NACKs, is reopened rather than read forever. One failed transfer or garbled packet is
 only dropped and counted (`dropped` in the health), and read again at the poll interval. The
 control thread never waits on the reader: a slow, wedged or absent module is an old sample.
+
+**Startup servo replies are independent diagnostics (control.46, API 41).** The sole native
+UART owner retains checksum-valid replies from requested servo IDs, including the valid
+subset of a transaction that later fails. `robot.busStatus.native.servo_observations` has
+`attempted`, `age_ms` and `rows` in configured joint order. Each row contains `id`, `name`,
+nullable `responding`, `check_age_ms`, `reply_age_ms`, `feedback_age_ms`, `position_raw`,
+`speed_raw`, `load_raw`, `current_raw`, `volts` and `temperature_c`. A sent READ/Sync Read
+checks only its requested IDs; the latest check answers true/false and an unchecked ID
+remains null. A later miss preserves reply/feedback history with its original timestamps.
+Only successful decoded address-56/length-15 feedback supplies telemetry; a torque reply
+proves presence with null telemetry. An IMU reply never becomes a servo row.
+
+Row ages are measured at capture. Snapshot `age_ms` is measured again on each busStatus
+response, even when the cached startup report or sampler stops changing. Consumers add
+snapshot age to the row ages; checked state, successful replies and telemetry each have
+their own freshness. Startup initialization failures after opening the UART, failed pose
+reads and pending IMU/joint readiness all publish this evidence without additional probes.
+These observations never update control samples, satisfy motion or IMU readiness, authorize
+goals/torque, or confirm emergency torque-off. Atomic sample validation, torque readback,
+startup retry cadence and the existing control-status gates are unchanged.
+This includes factory-default commissioning: if torque-OFF readback succeeds but IMU
+identification fails, the waiting report retains servo presence before dropping the UART.
+That diagnostic report includes the configured IMU source/profile and shares the same
+RPC-time age calculation; commissioning still waits for the required IMU identification.
+
+**Startup bus-IMU evidence is independent too (control.47, API 42).** When motion or
+commissioning initialization refuses, that same UART owner may capture ID 200 with
+read-only requests under a shared 60 ms maximum budget. The original torque-off/readback,
+identity and motion-calibration refusals remain authoritative. A structurally valid but
+uncommissioned motion configuration can capture this evidence before returning its
+original calibration refusal; this path writes nothing. Missing/malformed configuration,
+an invalid calibration structure or an unavailable UART leaves the observation unknown.
+An I2C-selected source never probes the bus IMU. Legacy uses only its configured transport
+(auto may try Feetech then DXL2); explicit Qinmo uses PING and 56/15 and never probes DXL2.
+
+`robot.busStatus.native.imu_observation` contains `source: "bus"`, `attempted`, `responding`,
+`age_ms`, nullable `info` (the complete `BusImuInfo`), `sample_valid`, `sensor_ready`,
+`sample_fresh`, `sequence` and `error`. A checksum-valid ID 200 response proves response,
+including an unsupported identity/status, but does not authenticate a board or its data.
+Unknown identity stays `info: null`; a recognized legacy identity survives a missing or
+invalid sample. Qinmo and DXL2 keep their configured/compatibility identification meanings.
+An isolated valid sample cannot prove progression: freshness stays null unless known
+stale/not-ready status disproves it. DXL2 has no independent board-ready status, so that
+field stays null. Snapshot age advances at every RPC even after acquisition stops; a new
+report without this field cannot inherit a previous startup capture.
+
+This capture never mutates the control board/identity cache, accepted IMU sample, ready
+gate, mounting verification, goals, gains or torque authority. It adds no UART owner,
+thread, steady-state control polling or startup retry timer. Install the matching
+control.47 runtime and Studio to display it; older runtimes leave it unknown. Existing
+complete-robot startup and the independent servo observations remain unchanged.
 
 **Same post-processing, same meaning.** Every source goes through `imu::TrunkFrame` — the mount,
 holding the last quaternion, the 25-sample ready gate, the three-point median — so `ImuData`

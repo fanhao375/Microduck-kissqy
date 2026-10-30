@@ -14,8 +14,9 @@ pub struct JointMetadata {
     pub calibrated: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 pub struct Metadata {
+    pub configured_imu_profile: &'static str,
     pub backend: &'static str,
     pub read_timing_revision: &'static str,
     pub motion_enabled: bool,
@@ -23,6 +24,8 @@ pub struct Metadata {
     pub imu_mount_verified: bool,
     /// See [`crate::feetech::FeetechDiagnostics::imu_source`].
     pub imu_source: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub imu_bus: Option<crate::feetech::BusImuInfo>,
     pub velocity_source: &'static str,
     pub velocity_rad_s_per_count: Option<f64>,
     pub current_available: bool,
@@ -111,6 +114,9 @@ pub struct HdState {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Dynamic {
+    pub servo_observations: crate::feetech::observations::Snapshot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub imu_observation: Option<crate::feetech::imu_observation::Snapshot>,
     pub torque_enabled: bool,
     pub torque_state_confirmed: Option<bool>,
     pub gain_mode: &'static str,

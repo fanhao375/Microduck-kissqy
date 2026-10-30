@@ -39,3 +39,4 @@ pub mod hd1910;
 pub mod hd1910_test;
 
 pub mod deployment;
+mod dxl2;

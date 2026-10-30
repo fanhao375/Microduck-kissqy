@@ -488,12 +488,14 @@ pub(crate) mod tests {
 
     pub(crate) fn fixture(cycle: u64) -> Snapshot {
         let metadata = Arc::new(Metadata {
+            configured_imu_profile: "legacy",
             backend: "feetech_ft6",
             read_timing_revision: feetech::READ_TIMING_REVISION,
             motion_enabled: true,
             calibration_complete: true,
             imu_mount_verified: true,
             imu_source: "bus",
+            imu_bus: None,
             velocity_source: hd1910::VELOCITY_SOURCE,
             velocity_rad_s_per_count: Some(hd1910::SPEED_RAD_S_PER_COUNT),
             current_available: false,
@@ -545,6 +547,8 @@ pub(crate) mod tests {
             hd1910,
             imu_fusion: None,
             dynamic: Native {
+                servo_observations: feetech::observations::Snapshot::empty(metadata.clone()),
+                imu_observation: None,
                 torque_enabled: true,
                 torque_state_confirmed: Some(true),
                 gain_mode: "hd1910_model_contract_p_restore_on_relax_native_d_torque_limit_preserved",
@@ -662,6 +666,40 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn stopped_pad_mapping_wire_uses_actual_flattened_serializer() {
+        let snapshot = fixture(42);
+        let bus = snapshot.bus.as_ref().unwrap().report();
+        let policies = proto::PoliciesResult {
+            mode: "walk".into(),
+            enabled: true,
+            homed: Some(true),
+            sitting: Some(false),
+            ..Default::default()
+        };
+        let mut first = (**snapshot.state.as_ref().unwrap()).clone();
+        first.t_ns = 1_000_000_000;
+        first.velocities = vec![0.0; NUM_JOINTS];
+        let mut second = first.clone();
+        second.t_ns += 20_000_000;
+        second.t += 0.02;
+        let wire = json!({
+            "schema":"padd-stopped-wire/v1",
+            "producer":"robotd::raw_stream::Bus::report + duck_ipc_proto::PoliciesResult/RobotState",
+            "bus":bus,"policies":policies,"states":[first,second]
+        });
+        assert_eq!(
+            wire["policies"]["enabled"], true,
+            "configured policy availability is not actual policy execution"
+        );
+        assert_eq!(wire["bus"]["policy_enabled"], false);
+        assert_eq!(wire["bus"]["homed"], true);
+        assert!(wire["bus"].get("dynamic").is_none());
+        if let Some(path) = std::env::var_os("PADD_STOPPED_WIRE_FIXTURE") {
+            std::fs::write(path, serde_json::to_string_pretty(&wire).unwrap() + "\n").unwrap();
+        }
+    }
+
     async fn data(receiver: &mut broadcast::Receiver<Arc<Packet>>) -> Arc<Packet> {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -744,6 +782,31 @@ pub(crate) mod tests {
         assert_eq!(report["native"]["joints"][0]["name"], proto::JOINT_NAMES[0]);
         assert_eq!(report["native"]["joints"][0]["missing_total"], u64::MAX);
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn startup_servo_observations_age_at_each_rpc_with_a_frozen_cached_report() {
+        for startup_only in [false, true] {
+        let state = Arc::new(RobotState::new(
+            &crate::Params::default(), std::path::Path::new("/test/robotd.toml"), false, false,
+        ));
+        let frozen = fixture(42);
+        let mut report = frozen.bus.as_ref().unwrap().report();
+        report["phase"] = json!("waiting_for_bus");
+        if startup_only {
+            state.publish_startup_native(report, Some(frozen.bus.unwrap().native));
+        } else {
+            state.raw.publish(frozen);
+            state.bus_status.store(Some(Arc::new(report)));
+        }
+        let query = || json!({"jsonrpc":"2.0","id":1,"method":"robot.busStatus"});
+        let first: Value = serde_json::from_str(&crate::tests::ipc_response(state.clone(), query()).await).unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let second: Value = serde_json::from_str(&crate::tests::ipc_response(state.clone(), query()).await).unwrap();
+        let first_age = first["result"]["native"]["servo_observations"]["age_ms"].as_u64().unwrap();
+        let second_age = second["result"]["native"]["servo_observations"]["age_ms"].as_u64().unwrap();
+        assert!(second_age >= first_age + 30, "frozen cached evidence must age: {first_age} -> {second_age}");
+        }
     }
 
     #[tokio::test]

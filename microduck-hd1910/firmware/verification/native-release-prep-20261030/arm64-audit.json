@@ -1,0 +1,41 @@
+{
+  "schema": "microduck-controller-elf-audit/1",
+  "source_commit": "665613ac628fdc9b1b71f324809f0c16ce2795f2",
+  "independent_builds": [
+    {
+      "slot": "a",
+      "size": 3522648,
+      "sha256": "dc1c7043a108964583fc09a11e3d6f87a25e259c346f7ce9154e77500a0881ec",
+      "interpreter": "/lib/ld-linux-aarch64.so.1",
+      "needed": [
+        "libc.so.6",
+        "libdl.so.2",
+        "libm.so.6",
+        "libpthread.so.0",
+        "libudev.so.1"
+      ],
+      "glibc_max": "2.30",
+      "embedded_revision_bytes_verified": true,
+      "embedded_build_time_bytes_verified": true
+    },
+    {
+      "slot": "b",
+      "size": 3522648,
+      "sha256": "dc1c7043a108964583fc09a11e3d6f87a25e259c346f7ce9154e77500a0881ec",
+      "interpreter": "/lib/ld-linux-aarch64.so.1",
+      "needed": [
+        "libc.so.6",
+        "libdl.so.2",
+        "libm.so.6",
+        "libpthread.so.0",
+        "libudev.so.1"
+      ],
+      "glibc_max": "2.30",
+      "embedded_revision_bytes_verified": true,
+      "embedded_build_time_bytes_verified": true
+    }
+  ],
+  "glibc_limit": "2.31",
+  "no_rpath": true,
+  "hardware_acceptance": false
+}

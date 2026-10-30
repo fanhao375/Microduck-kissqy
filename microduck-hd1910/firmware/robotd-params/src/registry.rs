@@ -107,6 +107,16 @@ pub const REGISTRY: &[Entry] = &[
         "Native servo protocol",
     ),
     entry(
+        "bus.imu_protocol",
+        Kind::Choice(&["auto", "feetech", "dxl2"]),
+        "IMU protocol on a native Feetech servo bus; read-only startup detection by default",
+    ),
+    entry(
+        "bus.imu_profile",
+        Kind::Choice(&["legacy", "qinmo"]),
+        "Saved IMU data profile on native Feetech; change with robotd stopped, then verify the mounting again",
+    ),
+    entry(
         "bus.feetech_calibration",
         Kind::OptionalPath,
         "Mounted Feetech calibration",

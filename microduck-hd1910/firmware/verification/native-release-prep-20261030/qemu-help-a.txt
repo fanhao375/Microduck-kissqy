@@ -1,0 +1,72 @@
+Drive the robot from a gamepad
+
+Usage: padd-arm64-a [OPTIONS]
+
+Options:
+      --socket <SOCKET>
+          `robotd`'s socket
+
+          [default: /run/robotd.sock]
+
+      --config <CONFIG>
+          Where the button bindings are read from — the same file everything else is configured in
+
+          [default: /etc/robot/robotd.toml]
+
+      --hz <HZ>
+          How often to read the pad, 1–1000 Hz. Matching the control rate exactly buys nothing — the loop reads the latest value once per tick — but staying at or above it keeps the added latency under one tick.
+
+          Not quite how often intents are *sent*: a frame identical to the last one and asking for no motion is held back, down to [`HEARTBEAT`]. See [`Continuous`].
+
+          [default: 50]
+
+      --deadzone <DEADZONE>
+          Deflection below this counts as centre. Analogue sticks rarely rest at exactly zero, and without this the robot creeps. The prototype's value
+
+          [default: 0.1]
+
+      --max-linear <MAX_LINEAR>
+          Full-deflection forward/strafe speed, m/s. The prototype's alpha default
+
+          [default: 0.3]
+
+      --max-linear-backward <MAX_LINEAR_BACKWARD>
+          Full-deflection backward speed, m/s — the prototype caps reverse separately
+
+          [default: 0.3]
+
+      --max-angular <MAX_ANGULAR>
+          Full-deflection turn rate, rad/s
+
+          [default: 1.5]
+
+      --max-head <MAX_HEAD>
+          Full-deflection head travel, radians. The head command feeds the policy's observation rather than a servo directly, so this is the prototype's generous 2.5 — the network itself decides how far the head actually goes
+
+          [default: 2.5]
+
+      --input-settings <INPUT_SETTINGS>
+          R17 optional persisted mouth/head limits, reloaded without restarting padd
+
+      --tap-socket <TAP_SOCKET>
+          Where to serve the raw input tap: the pad's own event stream, for `robotctl monitor`.
+
+          Read-only, and nothing on the driving path depends on it — if the socket cannot be created `padd` says so once and drives anyway.
+
+          [default: /run/padd/pad.sock]
+
+      --mapping-socket <MAPPING_SOCKET>
+          Private physical-controller mapping capability (one request/response per connection)
+
+          [default: /run/padd/mapping.sock]
+
+      --mapping-state-dir <MAPPING_STATE_DIR>
+          Persisted physical-controller profiles; independent of the read-only raw tap
+
+          [default: /var/lib/padd]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version

@@ -5,9 +5,9 @@ use super::{Ordering, RobotState};
 use clap::Subcommand;
 use duck_control::feetech::ImuMount;
 use duck_control::feetech::{
-    Bus, Calibration, IMU_ID, IMU_IDENTITY, ImuSample, ServoSample, signed_position_word,
+    Bus, BusImuFreshness, BusImuInfo, Calibration, IMU_ID, ServoSample, signed_position_word,
 };
-use duck_control::imu::{ImuData, SensorReading, SflpDecoder, TrunkFrame};
+use duck_control::imu::{ImuData, SensorReading, TrunkFrame};
 use duck_control::model::{JOINT_IDS, NUM_JOINTS};
 use duck_control::trunk_imu::{HostImu, HostImuGate, TrunkImuKind};
 use duck_ipc_proto as proto;
@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::oneshot;
 
-pub const BUILD: &str = "1fa8438-feetech-ft6-control.43";
+pub const BUILD: &str = "0791fcd-feetech-qinmo-control.47";
 const MAX_PENDING: usize = 16;
 const POSITION_TOLERANCE: u16 = 8;
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(4);
@@ -81,6 +81,27 @@ pub enum BusCommand {
         #[serde(default)]
         mount_wxyz: Vec<f64>,
     },
+    /// Ramp all fifteen joints together to the HOME pose and keep them there, torque on, so
+    /// the robot can stand for a standing IMU check without leaving commissioning. Holds until
+    /// `relax` (robot.relax / robot.stop), a sustained bus failure or the service stopping.
+    /// The zero is each joint's saved `zero_raw`; `directions` (one -1/+1 per joint, in the
+    /// calibration's joint order) stands in for the saved ones, which on a fresh image are
+    /// still placeholders. Omit it to use the saved directions.
+    HoldHome {
+        #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
+        #[serde(default)]
+        directions: Vec<i8>,
+        #[arg(long, default_value_t = HOME_HOLD_RAMP_MS)]
+        #[serde(default = "home_hold_ramp_ms")]
+        duration_ms: u64,
+    },
+}
+
+/// The same two seconds motion's ramp to HOME (`HOME_RAMP` in main.rs) takes, plus one: here
+/// nothing balances, so a robot coming up from limp is given a little longer.
+const HOME_HOLD_RAMP_MS: u64 = 3000;
+fn home_hold_ramp_ms() -> u64 {
+    HOME_HOLD_RAMP_MS
 }
 
 fn command_timeout(command: &BusCommand) -> Duration {
@@ -93,6 +114,9 @@ fn command_timeout(command: &BusCommand) -> Duration {
                 + Duration::from_secs(8 * NUM_JOINTS as u64 + 15)
         }
         BusCommand::VerifyImu { .. } => NOSE_DOWN_WINDOW + Duration::from_secs(10),
+        BusCommand::HoldHome { duration_ms, .. } => {
+            Duration::from_millis((*duration_ms).min(60_000)) + HOLD_SETTLE + Duration::from_secs(10)
+        }
         _ => Duration::from_secs(15),
     }
 }
@@ -348,9 +372,48 @@ pub(crate) fn calibration_status(
         "uncalibrated_joints":missing, "imu_source": source.label(),
         "motion_validation":calibration.validate_motion_for(source).err().map(|e| e.to_string()),
         "note":"Capture uses a manually known joint angle; encoder center is not joint zero."});
-    if source != TrunkImuKind::Bus {
-        let mount = calibration.imu_mount(source);
-        status["imu_mount"] = json!({"quat": mount.quat, "verified": mount.verified});
+    let mount = calibration.imu_mount(source);
+    // A persisted bus verification is not effective until the discovered wire format and
+    // configured data profile have both been checked. I2C has its independent mount slot.
+    let verified = source != TrunkImuKind::Bus && mount.verified;
+    status["imu_mount"] = json!({"quat": mount.quat, "verified": verified});
+    status["imu_mount_verified"] = json!(verified);
+    if source == TrunkImuKind::Bus {
+        let pending = "IMU bus discovery has not established a binding";
+        status["imu_binding_validation"] = json!(pending);
+        status["motion_validation"] = json!(pending);
+    }
+    status
+}
+
+pub(crate) fn calibration_status_for_bus(
+    calibration: &Calibration,
+    path: &Path,
+    source: TrunkImuKind,
+    bus: &Bus,
+) -> Value {
+    let mut status = calibration_status(calibration, path, source);
+    status["configured_imu_profile"] = json!(bus.imu_profile().label());
+    if source == TrunkImuKind::Bus {
+        let binding = if bus.imu_info().is_none() {
+            Some("IMU bus discovery has not established a binding".to_owned())
+        } else {
+            calibration
+                .validate_bus_mount_for(bus.imu_board().protocol(), bus.imu_profile())
+                .err()
+                .map(|e| e.to_string())
+        };
+        let verified = calibration.imu_mount_verified && binding.is_none();
+        status["imu_mount"]["verified"] = json!(verified);
+        status["imu_mount_verified"] = json!(verified);
+        status["imu_bus"] = json!(bus.imu_info());
+        status["imu_binding_validation"] = json!(binding);
+        status["motion_validation"] = json!(binding.or_else(|| {
+            calibration
+                .validate_motion_for(source)
+                .err()
+                .map(|e| e.to_string())
+        }));
     }
     status
 }
@@ -430,6 +493,178 @@ struct Motion {
     last_target: Option<i32>,
     torque_confirmed: Option<bool>,
     deadline: Instant,
+}
+
+/// After the ramp, joints carrying the robot's weight sit a few counts off their goal:
+/// `hold-home` answers once every joint is within [`HOLD_TOLERANCE`] or this much time has
+/// passed, and keeps holding either way.
+const HOLD_SETTLE: Duration = Duration::from_secs(2);
+/// About 2.6°.
+const HOLD_TOLERANCE: u32 = 30;
+/// A joint still this far off once settled (about 20°) is blocked or turning the wrong way:
+/// stop rather than keep pushing.
+const HOLD_GIVE_UP: u32 = 230;
+/// Consecutive failed reads a settled hold rides out: the servos keep their last goal, and
+/// dropping a standing robot on one lost packet would be the worse outcome. A ramp, like any
+/// commissioning movement, stops on the first.
+const HOLD_READ_FAILURES: u32 = 25;
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum HoldStage {
+    Preload,
+    Enable,
+    Ramping,
+    Holding,
+}
+
+/// All joints at once, in `ids` order. Unlike [`Motion`] it outlives its request: the reply
+/// goes out once the robot is at HOME, and the hold stays until something releases it.
+struct Hold {
+    from: Vec<i32>,
+    targets: Vec<i32>,
+    directions: Vec<i8>,
+    started: Instant,
+    duration: Duration,
+    stage: HoldStage,
+    reply: Option<oneshot::Sender<Reply>>,
+    last_written: Option<Vec<i32>>,
+    max_error: u32,
+}
+
+#[derive(Clone, Serialize)]
+pub struct HoldStatus {
+    stage: &'static str,
+    max_error_deg: f64,
+    directions: Vec<i8>,
+}
+
+/// HOME in raw counts for each joint, from its saved zero and `directions` (or its saved
+/// direction). Refuses anything a joint's saved limits or the single-turn encoder cannot hold.
+fn home_targets(calibration: &Calibration, directions: &[i8]) -> Result<(Vec<i32>, Vec<i8>), String> {
+    let joints = &calibration.joints;
+    if !directions.is_empty()
+        && (directions.len() != joints.len() || directions.iter().any(|d| ![-1, 1].contains(d)))
+    {
+        return Err(format!(
+            "hold-home directions need exactly {} values of -1/+1, in calibration joint order",
+            joints.len()
+        ));
+    }
+    let home = duck_control::deployment::home();
+    let mut targets = Vec::with_capacity(joints.len());
+    let mut used = Vec::with_capacity(joints.len());
+    for (i, joint) in joints.iter().enumerate() {
+        let direction = directions.get(i).copied().unwrap_or(joint.direction);
+        let angle = home[i];
+        if let (Some(min), Some(max)) = (joint.min_rad, joint.max_rad)
+            && !(min..=max).contains(&angle)
+        {
+            return Err(format!("{}: HOME is outside its saved physical limits", joint.name));
+        }
+        let raw = f64::from(joint.zero_raw)
+            + f64::from(direction) * angle * 4096.0 / std::f64::consts::TAU;
+        if !(0.0..=4095.0).contains(&raw) {
+            return Err(format!("{}: HOME falls outside the single-turn encoder", joint.name));
+        }
+        targets.push(raw.round() as i32);
+        used.push(direction);
+    }
+    Ok((targets, used))
+}
+
+fn hold_error(samples: &BTreeMap<u8, ServoSample>, ids: &[u8], targets: &[i32]) -> u32 {
+    ids.iter()
+        .zip(targets)
+        .map(|(id, target)| samples[id].feedback.position_signed_raw.abs_diff(*target))
+        .max()
+        .unwrap_or(0)
+}
+
+/// Forget the hold, telling its requester why if it is still waiting. Torque is the caller's.
+fn cancel_hold(hold: &mut Option<Hold>, reason: &str) {
+    if let Some(Hold { reply: Some(reply), .. }) = hold.take() {
+        let _ = reply.send(Err(format!("hold-home stopped: {reason}")));
+    }
+}
+
+/// Advance a hold by one cycle. Torque goes on only after every goal has been set to where
+/// the joint already is, as a single-joint move does, so enabling never jumps.
+fn step_hold(
+    bus: &mut Bus,
+    samples: &BTreeMap<u8, ServoSample>,
+    ids: &[u8],
+    hold: &mut Option<Hold>,
+    off_pending: &mut Option<String>,
+) {
+    let Some(h) = hold.as_mut() else {
+        return;
+    };
+    if h.reply.as_ref().is_some_and(|r| r.is_closed()) {
+        cancel_hold(hold, "request abandoned");
+        *off_pending = torque_off(bus, ids).err();
+        return;
+    }
+    let step = (|| -> Result<(), String> {
+        match h.stage {
+            HoldStage::Preload => {
+                let rows = ids
+                    .iter()
+                    .map(|id| (*id, samples[id].feedback.position_signed_raw))
+                    .collect::<Vec<_>>();
+                h.from = ids.iter().map(|id| samples[id].feedback.position_raw).collect();
+                bus.signed_positions(&rows).map_err(|e| e.to_string())?;
+                h.stage = HoldStage::Enable;
+            }
+            HoldStage::Enable => {
+                bus.torque(ids, true).map_err(|e| e.to_string())?;
+                bus.verify_torque(ids, true).map_err(|e| e.to_string())?;
+                h.started = Instant::now();
+                h.stage = HoldStage::Ramping;
+            }
+            HoldStage::Ramping => {
+                let elapsed = h.started.elapsed();
+                let fraction = (elapsed.as_secs_f64() / h.duration.as_secs_f64()).min(1.0);
+                let goals = h
+                    .from
+                    .iter()
+                    .zip(&h.targets)
+                    .map(|(from, to)| {
+                        (f64::from(*from) + f64::from(to - from) * fraction).round() as i32
+                    })
+                    .collect::<Vec<_>>();
+                if h.last_written.as_ref() != Some(&goals) {
+                    let rows = ids.iter().copied().zip(goals.iter().copied()).collect::<Vec<_>>();
+                    bus.signed_positions(&rows).map_err(|e| e.to_string())?;
+                    h.last_written = Some(goals);
+                }
+                h.max_error = hold_error(samples, ids, &h.targets);
+                if elapsed >= h.duration
+                    && (h.max_error <= HOLD_TOLERANCE || elapsed >= h.duration + HOLD_SETTLE)
+                {
+                    if h.max_error > HOLD_GIVE_UP {
+                        return Err(format!(
+                            "a joint is still {:.0}° from HOME; check its direction or what blocks it",
+                            f64::from(h.max_error) * 360.0 / 4096.0
+                        ));
+                    }
+                    h.stage = HoldStage::Holding;
+                    if let Some(reply) = h.reply.take() {
+                        let _ = reply.send(Ok(json!({"holding":true,"torque":"on",
+                            "max_error_deg":f64::from(h.max_error) * 360.0 / 4096.0,
+                            "directions":h.directions})));
+                    }
+                }
+            }
+            HoldStage::Holding => {
+                h.max_error = hold_error(samples, ids, &h.targets);
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = step {
+        cancel_hold(hold, &error);
+        *off_pending = torque_off(bus, ids).err();
+    }
 }
 
 fn torque_off(bus: &mut Bus, ids: &[u8]) -> Result<(), String> {
@@ -695,6 +930,7 @@ fn process_job(
     off_pending: &mut Option<String>,
     imu: ImuContext,
     verifying: &mut Option<PendingVerify>,
+    hold: &mut Option<Hold>,
 ) {
     if job.reply.is_closed() {
         return;
@@ -705,6 +941,7 @@ fn process_job(
                 .reply
                 .send(Err("verify-imu cancelled by relax; nothing saved".into()));
         }
+        cancel_hold(hold, "relax");
         let stop_error = abort_motion(bus, ids, motion, "movement interrupted by relax");
         *off_pending = stop_error.clone();
         let result =
@@ -713,9 +950,12 @@ fn process_job(
         return;
     }
     if matches!(job.command, BusCommand::CalibrationStatus) {
-        let _ = job
-            .reply
-            .send(Ok(calibration_status(calibration, path, imu.source)));
+        let _ = job.reply.send(Ok(calibration_status_for_bus(
+            calibration,
+            path,
+            imu.source,
+            bus,
+        )));
         return;
     }
     if verifying.is_some() {
@@ -735,6 +975,19 @@ fn process_job(
         let _ = job.reply.send(Err(
             "a movement is already active; use bus relax to interrupt it".into(),
         ));
+        return;
+    }
+    // Standing on HOME: the IMU may be checked, nothing may move a joint.
+    if let Some(h) = hold.as_ref()
+        && !matches!(job.command, BusCommand::VerifyImu { .. })
+    {
+        let _ = job.reply.send(if matches!(job.command, BusCommand::HoldHome { .. })
+            && h.stage == HoldStage::Holding
+        {
+            Ok(json!({"holding":true,"torque":"on","already":true,"directions":h.directions}))
+        } else {
+            Err("the robot is holding HOME; relax first".into())
+        });
         return;
     }
     match job.command {
@@ -837,7 +1090,7 @@ fn process_job(
                 save_calibration(path, &updated)?;
                 *calibration = updated;
                 Ok(json!({"saved":true,"id":id,"position_raw":samples[&id].feedback.position_raw,
-                    "known_angle_deg":angle_deg,"calibration":calibration_status(calibration,path,imu.source)}))
+                    "known_angle_deg":angle_deg,"calibration":calibration_status_for_bus(calibration,path,imu.source,bus)}))
             });
             let _ = job.reply.send(result);
         }
@@ -860,10 +1113,13 @@ fn process_job(
                     }
                 };
                 if imu.source == TrunkImuKind::Bus {
-                    save_verified(calibration, path, imu.source, mount, None).map(
-                        |(updated, status)| {
+                    let mut candidate = calibration.clone();
+                    candidate.imu_bus_protocol = Some(bus.imu_board().protocol());
+                    candidate.imu_bus_profile = Some(bus.imu_profile());
+                    save_verified(&candidate, path, imu.source, mount, None).map(
+                        |(updated, _status)| {
                             *calibration = updated;
-                            status
+                            calibration_status_for_bus(calibration, path, imu.source, bus)
                         },
                     )
                 } else {
@@ -892,6 +1148,33 @@ fn process_job(
                 )
             };
             let _ = job.reply.send(result);
+        }
+        BusCommand::HoldHome {
+            directions,
+            duration_ms,
+        } => {
+            if !(500..=60_000).contains(&duration_ms) {
+                let _ = job.reply.send(Err("hold-home duration-ms must be 500..60000".into()));
+                return;
+            }
+            match home_targets(calibration, &directions) {
+                Ok((targets, directions)) => {
+                    *hold = Some(Hold {
+                        from: vec![],
+                        targets,
+                        directions,
+                        started: Instant::now(),
+                        duration: Duration::from_millis(duration_ms),
+                        stage: HoldStage::Preload,
+                        reply: Some(job.reply),
+                        last_written: None,
+                        max_error: 0,
+                    });
+                }
+                Err(error) => {
+                    let _ = job.reply.send(Err(error));
+                }
+            }
         }
         BusCommand::Relax
         | BusCommand::CalibrationStatus
@@ -1040,7 +1323,8 @@ pub struct ImuStatus {
     id: Option<u8>,
     /// Which trunk IMU: a `TrunkImuKind` label.
     source: &'static str,
-    sequence: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sequence: Option<u32>,
     ready: bool,
     valid: bool,
     gravity: [f64; 3],
@@ -1082,6 +1366,7 @@ pub struct MotionStatus {
 /// Plain snapshot published at 10 Hz. JSON is produced only by the IPC thread.
 #[derive(Clone, Serialize)]
 pub struct Status {
+    configured_imu_profile: &'static str,
     build: &'static str,
     port: String,
     mode: &'static str,
@@ -1099,6 +1384,8 @@ pub struct Status {
     last_sample: Option<Sample>,
     calibrated: bool,
     imu_mount_verified: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    imu_bus: Option<BusImuInfo>,
     /// What `verify-imu` is waiting for, while it waits.
     #[serde(skip_serializing_if = "Option::is_none")]
     imu_verification: Option<&'static str>,
@@ -1106,6 +1393,9 @@ pub struct Status {
     torque_off_pending: Option<String>,
     power_pending: bool,
     motion: Option<MotionStatus>,
+    /// Present while `hold-home` has the joints: `ramping`, then `holding`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hold: Option<HoldStatus>,
     policy_motion_enabled: bool,
     updated_at_us: u64,
 }
@@ -1115,6 +1405,8 @@ pub struct Status {
 /// that module's mount.
 pub async fn run(
     port: &str,
+    imu_protocol: &str,
+    imu_profile: &str,
     state: &RobotState,
     period: Duration,
     calibration_path: &Path,
@@ -1125,28 +1417,44 @@ pub async fn run(
     let mut calibration = match read_calibration(calibration_path) {
         Ok(c) => c,
         Err(error) => {
-            state.bus_status.store(Some(Arc::new(json!({"build":BUILD,"mode":"commissioning","phase":"configuration_error","error":error}))));
+            state.bus_status.store(Some(Arc::new(json!({"build":BUILD,"mode":"commissioning","phase":"configuration_error","configured_imu_profile":imu_profile,"error":error}))));
             state.startup_bus_failures.store(1, Ordering::Relaxed);
             return;
         }
     };
-    state
-        .bus_calibration
-        .store(Some(Arc::new(calibration_status(
-            &calibration,
-            calibration_path,
-            source,
-        ))));
+    let mut initial_status = calibration_status(&calibration, calibration_path, source);
+    initial_status["configured_imu_profile"] = json!(imu_profile);
+    state.bus_calibration.store(Some(Arc::new(initial_status)));
     let ids = calibration.joints.iter().map(|j| j.id).collect::<Vec<_>>();
-    state.startup_step(2, "starting", "标定模式：读取已有标定，关闭并确认扭矩，初始化 IMU");
+    state.startup_step(
+        2,
+        "starting",
+        "标定模式：读取已有标定，关闭并确认扭矩，初始化 IMU",
+    );
     let mut bus = loop {
         if state.shutdown.load(Ordering::Relaxed) { return; }
+        let mut startup_observations = None;
+        let mut startup_imu_observation = None;
         let connect = (|| -> Result<Bus, String> {
             let mut bus = Bus::open(port).map_err(|e| e.to_string())?;
-            torque_off(&mut bus, &ids)?;
-            if host_imu.is_none() && bus.read(IMU_ID, 0, 5).map_err(|e| e.to_string())? != IMU_IDENTITY {
-                return Err("IMU200 requires FT6 firmware (06 00 00 00 f2)".into());
+            bus.set_imu_protocol(imu_protocol)
+                .map_err(|e| e.to_string())?;
+            bus.set_imu_profile(imu_profile)
+                .map_err(|e| e.to_string())?;
+            let initialized = (|| -> Result<(), String> {
+                torque_off(&mut bus, &ids)?;
+                if host_imu.is_none() {
+                    bus.identify_imu().map_err(|e| format!("IMU200: {e}"))?;
+                }
+                Ok(())
+            })();
+            if initialized.is_err() {
+                if host_imu.is_none() {
+                    startup_imu_observation = Some(bus.observe_startup_imu());
+                }
+                startup_observations = Some(bus.servo_observations(&calibration));
             }
+            initialized?;
             Ok(bus)
         })();
         match connect {
@@ -1154,11 +1462,29 @@ pub async fn run(
             Err(error) => {
                 state.startup_bus_failures.fetch_add(1, Ordering::Relaxed);
                 state.startup_step(2, "waiting", &error);
-                state.bus_status.store(Some(Arc::new(json!({"build":BUILD,"mode":"commissioning","phase":"waiting_for_bus","error":error}))));
+                let report = json!({"build":BUILD,"mode":"commissioning","phase":"waiting_for_bus","configured_imu_profile":imu_profile,"error":error});
+                if let Some(observations) = startup_observations {
+                    let native = json!({
+                        "backend":"feetech_ft6", "configured_imu_profile":imu_profile,
+                        "imu_source":source.label(), "servo_observations":&observations,
+                        "imu_observation":&startup_imu_observation,
+                    });
+                    state.publish_startup_native_report(report, native, observations, startup_imu_observation);
+                } else {
+                    state.publish_startup_native(report, None);
+                }
                 tokio::time::sleep(super::STARTUP_RETRY_INTERVAL).await;
             }
         }
     };
+    state
+        .bus_calibration
+        .store(Some(Arc::new(calibration_status_for_bus(
+            &calibration,
+            calibration_path,
+            source,
+            &bus,
+        ))));
     state.startup_step(3, "success", "标定模式不加载策略模型");
     state.startup_bus_failures.store(0, Ordering::Relaxed);
     let mut ticker = super::control_ticker(period);
@@ -1170,11 +1496,11 @@ pub async fn run(
     let mut rate_ticks = 0u64;
     let mut total_success = 0u64;
     let mut total_failures = 0u64;
-    let mut last_sequence = None;
-    let mut stale_run = 0u64;
+    let mut bus_freshness = BusImuFreshness::default();
     let mut motion: Option<Motion> = None;
+    let mut hold: Option<Hold> = None;
     let mut off_pending = None;
-    let mut imu_decoder = SflpDecoder::new(calibration.imu_mount_quat);
+    let mut imu_decoder = TrunkFrame::new(calibration.imu_mount_quat);
     let mut imu_frame = TrunkFrame::new(calibration.imu_mount(source).quat);
     let mut imu_gate = HostImuGate::default();
     let mut imu_epoch = None;
@@ -1240,7 +1566,7 @@ pub async fn run(
                     imu_status = Some(ImuStatus {
                         id: None,
                         source: source.label(),
-                        sequence: sample.sequence,
+                        sequence: Some(sample.sequence),
                         ready: true,
                         valid,
                         gravity: decoded.gravity,
@@ -1259,18 +1585,19 @@ pub async fn run(
                 }
                 return Ok(());
             }
-            let imu = ImuSample::decode(&blocks[&IMU_ID]).map_err(|e| format!("IMU200: {e}"))?;
-            let duplicate = last_sequence == Some(imu.sequence);
-            stale_run = if duplicate { stale_run + 1 } else { 0 };
-            last_sequence = Some(imu.sequence);
-            if duplicate {
-                state.imu_stale_blocks.fetch_add(1, Ordering::Relaxed);
-            }
-            state.imu_stale_run.store(stale_run, Ordering::Relaxed);
-            let decoded = imu_decoder.decode(&imu.block);
-            if !imu.is_fresh(bus.last_sync.elapsed_us) || stale_run >= 3 {
-                return Err("IMU200 data stale or not ready".into());
-            }
+            let imu = bus
+                .decode_imu(&blocks[&IMU_ID])
+                .map_err(|e| format!("IMU200: {e}"))?;
+            let before = bus_freshness.stale;
+            let checked = bus_freshness.check(&imu, bus.last_sync.elapsed_us);
+            state
+                .imu_stale_blocks
+                .fetch_add(bus_freshness.stale.total - before.total, Ordering::Relaxed);
+            state
+                .imu_stale_run
+                .store(bus_freshness.stale.run, Ordering::Relaxed);
+            checked.map_err(|e| e.to_string())?;
+            let decoded = imu_decoder.push(imu.reading());
             let valid = imu_decoder.ready();
             state.imu_ready.store(valid, Ordering::Relaxed);
             if publish {
@@ -1283,7 +1610,10 @@ pub async fn run(
                     gravity: decoded.gravity,
                     gyro_rad_s: decoded.gyro,
                     quaternion_wxyz: decoded.quat,
-                    mount_verified: calibration.imu_mount_verified,
+                    mount_verified: calibration.imu_mount_verified
+                        && calibration
+                            .validate_bus_mount_for(bus.imu_board().protocol(), bus.imu_profile())
+                            .is_ok(),
                     age_ms: None,
                     epoch: None,
                     accuracy: None,
@@ -1311,6 +1641,12 @@ pub async fn run(
             if motion.is_some() {
                 off_pending = abort_motion(&mut bus, &ids, &mut motion, error);
             }
+            if hold.as_ref().is_some_and(|h| {
+                h.stage != HoldStage::Holding || consecutive >= HOLD_READ_FAILURES
+            }) {
+                cancel_hold(&mut hold, error);
+                off_pending = torque_off(&mut bus, &ids).err();
+            }
             if consecutive == 1 {
                 tracing::warn!(cycle,%error,"bus read failed");
             }
@@ -1330,6 +1666,7 @@ pub async fn run(
                             reading: None,
                         },
                         &mut verifying,
+                        &mut hold,
                     );
                 } else {
                     let _ = job.reply.send(Err(error.clone()));
@@ -1411,22 +1748,25 @@ pub async fn run(
                         reading: host_reading,
                     },
                     &mut verifying,
+                    &mut hold,
                 );
                 if changes_calibration {
                     state
                         .bus_calibration
-                        .store(Some(Arc::new(calibration_status(
+                        .store(Some(Arc::new(calibration_status_for_bus(
                             &calibration,
                             calibration_path,
                             source,
+                            &bus,
                         ))));
                 }
                 if old_mount != calibration.imu_mount(source).quat {
-                    imu_decoder = SflpDecoder::new(calibration.imu_mount_quat);
+                    imu_decoder = TrunkFrame::new(calibration.imu_mount_quat);
                     imu_frame = TrunkFrame::new(calibration.imu_mount(source).quat);
                 }
             }
             step_motion(&mut bus, &samples, &ids, &mut motion, &mut off_pending);
+            step_hold(&mut bus, &samples, &ids, &mut hold, &mut off_pending);
         }
         if let Some(mut pending) = verifying.take() {
             let reading = if error.is_none() { host_reading } else { None };
@@ -1456,10 +1796,11 @@ pub async fn run(
                     if result.is_ok() {
                         state
                             .bus_calibration
-                            .store(Some(Arc::new(calibration_status(
+                            .store(Some(Arc::new(calibration_status_for_bus(
                                 &calibration,
                                 calibration_path,
                                 source,
+                                &bus,
                             ))));
                         if old_mount != calibration.imu_mount(source).quat {
                             imu_frame = TrunkFrame::new(calibration.imu_mount(source).quat);
@@ -1469,9 +1810,13 @@ pub async fn run(
                 }
             }
         }
-        state
-            .moving
-            .store(motion.is_some() || off_pending.is_some(), Ordering::Relaxed);
+        // A settled hold is standing, not moving: safe to restart, as motion's standing is.
+        state.moving.store(
+            motion.is_some()
+                || off_pending.is_some()
+                || hold.as_ref().is_some_and(|h| h.stage != HoldStage::Holding),
+            Ordering::Relaxed,
+        );
         state.ticks.store(cycle, Ordering::Relaxed);
         if error.is_none() && total_success == 1 {
             state.startup_step(2, "success", "标定采集第一份有效反馈已读取");
@@ -1495,6 +1840,7 @@ pub async fn run(
         if publish || error.is_some() {
             let power = state.bus_commands.power_pending.load(Ordering::Relaxed);
             state.bus_snapshot.store(Some(Arc::new(Status {
+                configured_imu_profile: bus.imu_profile().label(),
                 build: BUILD,
                 port: port.to_owned(),
                 mode: "commissioning",
@@ -1504,8 +1850,12 @@ pub async fn run(
                     "read_error"
                 } else if off_pending.is_some() {
                     "stop_unconfirmed"
-                } else if motion.is_some() {
+                } else if motion.is_some()
+                    || hold.as_ref().is_some_and(|h| h.stage != HoldStage::Holding)
+                {
                     "moving"
+                } else if hold.is_some() {
+                    "holding"
                 } else {
                     "ready"
                 },
@@ -1521,12 +1871,23 @@ pub async fn run(
                 last_failure: last_failure.clone(),
                 last_sample: last_sample.clone(),
                 calibrated: calibration.joints.iter().all(|j| j.calibrated),
-                imu_mount_verified: calibration.imu_mount(source).verified,
+                imu_mount_verified: calibration.imu_mount(source).verified
+                    && (source != TrunkImuKind::Bus
+                        || calibration
+                            .validate_bus_mount_for(bus.imu_board().protocol(), bus.imu_profile())
+                            .is_ok()),
+                imu_bus: bus.imu_info(),
                 imu_verification: verifying
                     .as_ref()
                     .map(|_| "verify-imu: tip the robot nose-down by 15-30 degrees and hold it"),
                 torque_state: if off_pending.is_some() {
                     "unknown"
+                } else if let Some(h) = &hold {
+                    match h.stage {
+                        HoldStage::Preload => "off",
+                        HoldStage::Enable => "unknown",
+                        HoldStage::Ramping | HoldStage::Holding => "all_enabled",
+                    }
                 } else if let Some(m) = &motion {
                     match m.torque_confirmed {
                         Some(true) => "single_joint_enabled",
@@ -1545,14 +1906,28 @@ pub async fn run(
                     action: if m.center { "center" } else { "move" },
                     completed_ids: m.completed.clone(),
                 }),
+                hold: hold.as_ref().map(|h| HoldStatus {
+                    stage: if h.stage == HoldStage::Holding { "holding" } else { "ramping" },
+                    max_error_deg: f64::from(h.max_error) * 360.0 / 4096.0,
+                    directions: h.directions.clone(),
+                }),
                 updated_at_us: state.started.elapsed().as_micros() as u64,
             })));
+            // robot.busStatus serves the startup report while its phase is a startup one
+            // (`configuring_bus` from main.rs), and commissioning never replaced it: clients saw
+            // "configuring_bus" forever and never this snapshot (`ready`, `last_sample`). Once a
+            // read has succeeded, drop it — the same thing motion does after its first complete
+            // observation (`motion_report_started` in main.rs).
+            if total_success > 0 {
+                state.bus_status.store(None);
+            }
             next_publish = tick + Duration::from_millis(100);
         }
         if tick.elapsed() > period {
             state.missed.fetch_add(1, Ordering::Relaxed);
         }
     }
+    cancel_hold(&mut hold, "service stopping");
     let stop_error = abort_motion(&mut bus, &ids, &mut motion, "service stopping");
     if let Some(error) = stop_error {
         tracing::error!(%error,"shutdown torque-off not confirmed");
@@ -1585,6 +1960,8 @@ mod tests {
             .bus_status
             .store(Some(Arc::new(json!({"phase":"older-value-cache"}))));
         let report = Status {
+            configured_imu_profile: "legacy",
+            imu_bus: None,
             build: BUILD,
             port: "/dev/test-no-uart".into(),
             mode: "commissioning",
@@ -1611,6 +1988,7 @@ mod tests {
             torque_off_pending: None,
             power_pending: false,
             motion: None,
+            hold: None,
             policy_motion_enabled: false,
             updated_at_us: 840_000,
         };
@@ -2123,6 +2501,52 @@ mod tests {
         assert!(error.contains("side going down"), "{error}");
     }
 
+    /// `hold-home` stands on the policy's HOME: each joint's saved zero, turned by the
+    /// direction the caller gives (a fresh image's saved ones are placeholders) or the saved one.
+    #[test]
+    fn hold_home_targets_follow_zero_direction_and_home() {
+        let mut calibration = Calibration::commissioning(JOINT_IDS);
+        let home = duck_control::deployment::home();
+        let counts = |rad: f64| rad * 4096.0 / std::f64::consts::TAU;
+        let (saved, used) = home_targets(&calibration, &[]).unwrap();
+        assert_eq!(used, vec![1; NUM_JOINTS]);
+        for i in 0..NUM_JOINTS {
+            assert_eq!(saved[i], (2048.0 + counts(home[i])).round() as i32);
+        }
+        let mut flipped = vec![1i8; NUM_JOINTS];
+        flipped[5] = -1;
+        calibration.joints[5].zero_raw = 2000;
+        let (targets, used) = home_targets(&calibration, &flipped).unwrap();
+        assert_eq!(used, flipped);
+        assert_eq!(targets[5], (2000.0 - counts(home[5])).round() as i32);
+        assert_eq!(targets[0], saved[0]);
+    }
+
+    #[test]
+    fn hold_home_refuses_bad_directions_and_limits() {
+        let mut calibration = Calibration::commissioning(JOINT_IDS);
+        assert!(home_targets(&calibration, &[1, -1]).unwrap_err().contains("exactly"));
+        let mut zero = vec![1i8; NUM_JOINTS];
+        zero[3] = 0;
+        assert!(home_targets(&calibration, &zero).is_err());
+        // left_hip_pitch HOME is about -26°: a saved range that excludes it refuses.
+        calibration.joints[2].min_rad = Some(0.0);
+        calibration.joints[2].max_rad = Some(1.0);
+        assert!(home_targets(&calibration, &[]).unwrap_err().contains("limits"));
+    }
+
+    #[test]
+    fn hold_home_parses_with_and_without_its_options() {
+        let bare: BusCommand = serde_json::from_value(json!({"action":"hold-home"})).unwrap();
+        assert!(matches!(bare, BusCommand::HoldHome { ref directions, duration_ms: 3000 } if directions.is_empty()));
+        let full: BusCommand = serde_json::from_value(
+            json!({"action":"hold-home","directions":[1,-1,1,1,1,1,1,1,1,1,1,1,1,1,1],"duration_ms":2500}),
+        )
+        .unwrap();
+        assert!(matches!(full, BusCommand::HoldHome { ref directions, duration_ms: 2500 } if directions[1] == -1));
+        assert!(serde_json::from_value::<BusCommand>(json!({"action":"hold-home","speed":1})).is_err());
+    }
+
     /// A verified mount lands in that module's slot; the bus board's mount is not touched, and
     /// motion stays off until enabled again.
     #[test]
@@ -2153,8 +2577,8 @@ mod tests {
 
     /// The calibration report names the mount in use for a module — its slot, or its default
     /// while uncommissioned — so the console's IMU panel shows and confirms that one, not the
-    /// bus board's top-level keys it used to read on every robot. The bus board's report has no
-    /// such field: its mount is those keys, and its report stays as it was.
+    /// bus board's top-level keys it used to read on every robot. A bus mount remains
+    /// effectively unverified until discovery also checks its protocol/profile binding.
     #[test]
     fn the_calibration_report_names_a_modules_mount_in_use() {
         let path = Path::new("/tmp/unused-calibration.toml");
@@ -2175,7 +2599,7 @@ mod tests {
             json!({"quat": [0.0, 0.0, 0.0, 1.0], "verified": true})
         );
         let bus = calibration_status(&calibration, path, TrunkImuKind::Bus);
-        assert!(bus.get("imu_mount").is_none(), "{bus}");
+        assert_eq!(bus["imu_mount"]["verified"], false, "{bus}");
     }
 
     /// The bus board keeps its old rule: the operator's confirmation, no reading required, the
@@ -2337,6 +2761,8 @@ mod tests {
                 .unwrap()
                 .block_on(run(
                     &port,
+                    "auto",
+                    "legacy",
                     &control_state,
                     Duration::from_millis(20),
                     &control_path,

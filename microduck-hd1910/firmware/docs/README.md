@@ -21,6 +21,7 @@ docs give the reasoning and point at it.
 | | |
 |---|---|
 | [`cheatsheet.md`](robot/cheatsheet.md) | Every `robotctl` command. |
+| [`qinmo-imu.md`](robot/qinmo-imu.md) | One-time Qinmo profile selection, mount revalidation and offline verification. |
 | [`pair-a-gamepad.md`](robot/pair-a-gamepad.md) | Once per pad: pairing mode, `pad pair`, and what to do when it will not bond. |
 | [`udp-pad.md`](robot/udp-pad.md) | A pad on a laptop over the LAN: `[netpad]`, `duckctl udp-pad`, and what the robot does when it goes quiet. |
 | [`cheatsheet-dev.md`](robot/cheatsheet-dev.md) | The commands that need a dev board: branch builds, candidates, dev pushes. |
@@ -44,6 +45,7 @@ implementation details. The current R17 console mapping is documented in the con
 | [`r17-connection-design.md`](design/r17-connection-design.md) | R17 dashboard SSH connection, shared credential, telemetry forwarding and input hotplug lifetime. |
 | [`r17-settings-design.md`](design/r17-settings-design.md) | R17 console defaults, saved per-robot settings and runtime diagnostic/state snapshot ownership. |
 | [`architecture.md`](design/architecture.md) | The service split, the IPC contract, state ownership, safety and authority. |
+| [`pad-mapping-design.md`](design/pad-mapping-design.md) | Physical-controller learning, raw bindings, persistent device profiles, native calibration gate and voice state. |
 | [`robotd-design.md`](design/robotd-design.md) | The control loop: the Dynamixel bus and who owns the port, the model, sensing, observations, policy, safety — and what else hangs off the tick. |
 | [`updater-design.md`](design/updater-design.md) | The update engine: verification, atomic swap, health gate, rollback, release format. |
 | [`policy-channel-design.md`](design/policy-channel-design.md) | Where the ONNX policies come from: the `policies` component, trying someone else's, and what `reset` puts back. |

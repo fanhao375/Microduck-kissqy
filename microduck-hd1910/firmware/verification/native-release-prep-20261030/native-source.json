@@ -1,0 +1,29 @@
+{
+  "schema": "microduck-controller-native-source/1",
+  "source_commit": "665613ac628fdc9b1b71f324809f0c16ce2795f2",
+  "source_tree": "ba62205198b3febdd0ddd109ed26084abf8127c8",
+  "merge_commit": "df2877fc751d62d0170bb4d0b38b0143810c3929",
+  "inputs": [
+    "b5b91c4",
+    "a10fcf7"
+  ],
+  "archive": "native-reviewed-source.tar",
+  "archive_sha256": "19d477da39233009377f6653dff317ba16457534e9e2436545adf40385b02f38",
+  "archive_size": 94177280,
+  "official_version": "0.15.1",
+  "ipc_api_compiled": 42,
+  "mapping_protocol": 1,
+  "target": "aarch64-unknown-linux-gnu.2.31",
+  "rust": "1.99.0",
+  "zig": "0.15.1",
+  "cargo_zigbuild": "0.23.4",
+  "duck_revision": "665613ac628fdc9b1b71f324809f0c16ce2795f2",
+  "duck_build_time": "2026-10-30T23:17:10+09:00",
+  "source_date_epoch": 1793369830,
+  "release_codegen_units": 1,
+  "binary_status": "verified_byte_identical_independent_arm64_builds",
+  "padd_sha256": "dc1c7043a108964583fc09a11e3d6f87a25e259c346f7ce9154e77500a0881ec",
+  "padd_size": 3522648,
+  "robotd_rebuild": false,
+  "mediad_rebuild": false
+}

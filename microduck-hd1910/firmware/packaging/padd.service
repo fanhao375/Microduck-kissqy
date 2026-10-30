@@ -107,6 +107,7 @@ StandardError=journal
 # robotd does it: this process keeps its own primary group, and reaches the robot group as a
 # supplementary one.
 RuntimeDirectory=padd
+StateDirectory=padd
 
 [Install]
 WantedBy=multi-user.target
